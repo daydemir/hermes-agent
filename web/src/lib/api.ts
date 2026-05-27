@@ -18,6 +18,7 @@ export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
 
 import type { DashboardTheme } from "@/themes/types";
+import { getRollyUserSlug } from "@/lib/rollyIdentity";
 
 // Ephemeral session token for protected endpoints.
 // Injected into index.html by the server — never fetched via API.
@@ -42,6 +43,10 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   const token = window.__HERMES_SESSION_TOKEN__;
   if (token) {
     setSessionHeader(headers, token);
+  }
+  const rollyUser = getRollyUserSlug();
+  if (rollyUser && !headers.has("X-Rolly-User")) {
+    headers.set("X-Rolly-User", rollyUser);
   }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
@@ -402,6 +407,7 @@ export interface SessionInfo {
   output_tokens: number;
   preview: string | null;
   parent_session_id?: string | null;
+  user_id?: string | null;
 }
 
 export interface SessionLatestDescendantResponse {

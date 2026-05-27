@@ -76,9 +76,78 @@ import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { api } from "@/lib/api";
+import {
+  getRollyUser,
+  getRollyUserSlug,
+  ROLLY_DASHBOARD_USERS,
+  setRollyUserSlug,
+} from "@/lib/rollyIdentity";
 
 function RootRedirect() {
   return <Navigate to="/sessions" replace />;
+}
+
+function RollyIdentityGate({
+  currentUser,
+  onSelect,
+}: {
+  currentUser: string;
+  onSelect: (slug: string) => void;
+}) {
+  const selected = getRollyUser(currentUser);
+
+  if (selected) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 px-4 backdrop-blur-sm">
+      <div className="w-full max-w-sm border border-current/20 bg-background-base/95 p-5 text-midground shadow-2xl">
+        <Typography className="font-mondwest text-display text-xl uppercase tracking-[0.12em]">
+          Who are you?
+        </Typography>
+        <p className="mt-2 text-sm text-text-secondary">
+          This labels Rolly dashboard sessions. It is not security.
+        </p>
+        <div className="mt-4 grid gap-2">
+          {ROLLY_DASHBOARD_USERS.map((user) => (
+            <Button
+              key={user.slug}
+              onClick={() => onSelect(user.slug)}
+              className="justify-start"
+            >
+              {user.label}{user.admin ? " · admin" : ""}
+            </Button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RollyIdentitySwitcher({
+  currentUser,
+  onSelect,
+}: {
+  currentUser: string;
+  onSelect: (slug: string) => void;
+}) {
+  const user = getRollyUser(currentUser);
+  return (
+    <select
+      aria-label="Rolly dashboard user"
+      className="max-w-[9rem] rounded border border-current/20 bg-transparent px-2 py-1 text-xs text-text-secondary"
+      value={user?.slug ?? ""}
+      onChange={(event) => onSelect(event.target.value)}
+    >
+      <option value="" disabled>Who?</option>
+      {ROLLY_DASHBOARD_USERS.map((candidate) => (
+        <option key={candidate.slug} value={candidate.slug}>
+          {candidate.label}{candidate.admin ? " · admin" : ""}
+        </option>
+      ))}
+    </select>
+  );
 }
 
 function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
@@ -311,6 +380,7 @@ export default function App() {
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [rollyUser, setRollyUser] = useState(() => getRollyUserSlug());
   const closeMobile = useCallback(() => setMobileOpen(false), []);
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
@@ -394,6 +464,13 @@ export default function App() {
 
   const layoutVariant = theme.layoutVariant ?? "standard";
 
+  const selectRollyUser = useCallback((slug: string) => {
+    const selected = setRollyUserSlug(slug);
+    if (!selected) return;
+    setRollyUser(selected);
+    window.location.reload();
+  }, []);
+
   useEffect(() => {
     if (!mobileOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -423,6 +500,7 @@ export default function App() {
       className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black text-text-primary antialiased"
     >
       <SelectionSwitcher />
+      <RollyIdentityGate currentUser={rollyUser} onSelect={selectRollyUser} />
       <Backdrop />
       <PluginSlot name="backdrop" />
 
@@ -457,6 +535,10 @@ export default function App() {
         >
           {t.app.brand}
         </Typography>
+
+        <div className="ml-auto">
+          <RollyIdentitySwitcher currentUser={rollyUser} onSelect={selectRollyUser} />
+        </div>
       </header>
 
       {mobileOpen && (
@@ -578,6 +660,7 @@ export default function App() {
             >
               <div className="flex min-w-0 items-center gap-2">
                 <PluginSlot name="header-right" />
+                <RollyIdentitySwitcher currentUser={rollyUser} onSelect={selectRollyUser} />
                 <ThemeSwitcher dropUp />
                 <LanguageSwitcher dropUp />
               </div>

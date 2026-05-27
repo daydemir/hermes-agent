@@ -149,6 +149,51 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+_ROLLY_DASHBOARD_USERS: frozenset[str] = frozenset({
+    "deniz", "arman", "buket", "metin", "guest",
+})
+_ROLLY_DASHBOARD_ADMINS: frozenset[str] = frozenset({"deniz"})
+
+
+def _normalize_rolly_dashboard_user(value: Optional[str]) -> Optional[str]:
+    user = (value or "").strip().lower()
+    return user if user in _ROLLY_DASHBOARD_USERS else None
+
+
+def _rolly_dashboard_user_from_request(request: Request) -> Optional[str]:
+    return _normalize_rolly_dashboard_user(
+        request.headers.get("X-Rolly-User")
+        or request.cookies.get("rolly_user")
+        or request.query_params.get("user")
+    )
+
+
+def _rolly_dashboard_user_from_ws(ws: WebSocket) -> Optional[str]:
+    return _normalize_rolly_dashboard_user(ws.query_params.get("user"))
+
+
+def _rolly_dashboard_scope(request: Request) -> tuple[Optional[str], bool]:
+    user = _rolly_dashboard_user_from_request(request)
+    admin_all = bool(
+        user in _ROLLY_DASHBOARD_ADMINS
+        and request.query_params.get("scope", "").strip().lower() == "all"
+    )
+    return user, admin_all
+
+
+def _session_belongs_to_dashboard_user(session: Optional[dict], user: Optional[str]) -> bool:
+    if not user or not session:
+        return False
+    return (session.get("user_id") or "") == user
+
+
+def _require_dashboard_session_access(session: Optional[dict], user: Optional[str], admin_all: bool = False) -> None:
+    if admin_all:
+        return
+    if not _session_belongs_to_dashboard_user(session, user):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+
 # Accepted Host header values for loopback binds. DNS rebinding attacks
 # point a victim browser at an attacker-controlled hostname (evil.test)
 # which resolves to 127.0.0.1 after a TTL flip — bypassing same-origin
@@ -774,13 +819,22 @@ async def get_action_status(name: str, lines: int = 200):
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(request: Request, limit: int = 20, offset: int = 0):
     try:
         from hermes_state import SessionDB
+        user, admin_all = _rolly_dashboard_scope(request)
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            # Fetch then filter so dashboard identity separation works without
+            # changing SessionDB's general-purpose API yet. Existing untagged
+            # sessions are migrated to user_id='deniz' in this Rolly runtime.
+            raw_sessions = db.list_sessions_rich(limit=100000, offset=0)
+            if admin_all:
+                visible = raw_sessions
+            else:
+                visible = [s for s in raw_sessions if _session_belongs_to_dashboard_user(s, user)]
+            total = len(visible)
+            sessions = visible[offset:offset + limit]
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
@@ -796,13 +850,14 @@ async def get_sessions(limit: int = 20, offset: int = 0):
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20):
+async def search_sessions(request: Request, q: str = "", limit: int = 20):
     """Full-text search across session message content using FTS5."""
     if not q or not q.strip():
         return {"results": []}
     try:
         from hermes_state import SessionDB
         db = SessionDB()
+        user, admin_all = _rolly_dashboard_scope(request)
         try:
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
@@ -820,6 +875,9 @@ async def search_sessions(q: str = "", limit: int = 20):
             seen: dict = {}
             for m in matches:
                 sid = m["session_id"]
+                session = db.get_session(sid)
+                if not admin_all and not _session_belongs_to_dashboard_user(session, user):
+                    continue
                 if sid not in seen:
                     seen[sid] = {
                         "session_id": sid,
@@ -2461,14 +2519,16 @@ def _session_latest_descendant(session_id: str):
         db.close()
 
 @app.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str):
+async def get_session_detail(request: Request, session_id: str):
     from hermes_state import SessionDB
+    user, admin_all = _rolly_dashboard_scope(request)
     db = SessionDB()
     try:
         sid = db.resolve_session_id(session_id)
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        _require_dashboard_session_access(session, user, admin_all)
         return session
     finally:
         db.close()
@@ -2476,10 +2536,18 @@ async def get_session_detail(session_id: str):
 
 
 @app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
+async def get_session_latest_descendant(request: Request, session_id: str):
+    user, admin_all = _rolly_dashboard_scope(request)
     latest, path = _session_latest_descendant(session_id)
     if not latest:
         raise HTTPException(status_code=404, detail="Session not found")
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        session = db.get_session(latest)
+        _require_dashboard_session_access(session, user, admin_all)
+    finally:
+        db.close()
     return {
         "requested_session_id": path[0] if path else session_id,
         "session_id": latest,
@@ -2488,13 +2556,16 @@ async def get_session_latest_descendant(session_id: str):
     }
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str):
+async def get_session_messages(request: Request, session_id: str):
     from hermes_state import SessionDB
+    user, admin_all = _rolly_dashboard_scope(request)
     db = SessionDB()
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
+        session = db.get_session(sid)
+        _require_dashboard_session_access(session, user, admin_all)
         messages = db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
     finally:
@@ -2502,10 +2573,14 @@ async def get_session_messages(session_id: str):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str):
+async def delete_session_endpoint(request: Request, session_id: str):
     from hermes_state import SessionDB
+    user, admin_all = _rolly_dashboard_scope(request)
     db = SessionDB()
     try:
+        sid = db.resolve_session_id(session_id)
+        session = db.get_session(sid) if sid else None
+        _require_dashboard_session_access(session, user, admin_all)
         if not db.delete_session(session_id):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
@@ -3381,6 +3456,7 @@ _event_lock = asyncio.Lock()
 def _resolve_chat_argv(
     resume: Optional[str] = None,
     sidecar_url: Optional[str] = None,
+    rolly_user: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -3410,6 +3486,10 @@ def _resolve_chat_argv(
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
     env.setdefault("HERMES_TUI_INLINE", "1")
+    if rolly_user:
+        env["HERMES_SESSION_SOURCE"] = "rolly-dashboard"
+        env["HERMES_SESSION_USER_ID"] = rolly_user
+        env["HERMES_SESSION_USER_NAME"] = rolly_user
 
     if resume:
         latest_resume, _latest_path = _session_latest_descendant(resume)
@@ -3491,11 +3571,30 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
+    rolly_user = _rolly_dashboard_user_from_ws(ws)
+    if not rolly_user:
+        await ws.close(code=4403)
+        return
+    if resume and rolly_user:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            sid = db.resolve_session_id(resume)
+            session = db.get_session(sid) if sid else None
+            if not _session_belongs_to_dashboard_user(session, rolly_user):
+                await ws.close(code=4404)
+                return
+        finally:
+            db.close()
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
 
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        argv, cwd, env = _resolve_chat_argv(
+            resume=resume,
+            sidecar_url=sidecar_url,
+            rolly_user=rolly_user,
+        )
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")

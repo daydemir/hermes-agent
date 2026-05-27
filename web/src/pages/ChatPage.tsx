@@ -35,16 +35,19 @@ import { ChatSidebar } from "@/components/ChatSidebar";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
+import { getRollyUserSlug } from "@/lib/rollyIdentity";
 import { PluginSlot } from "@/plugins";
 
 function buildWsUrl(
   token: string,
   resume: string | null,
   channel: string,
+  user: string,
 ): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const qs = new URLSearchParams({ token, channel });
   if (resume) qs.set("resume", resume);
+  if (user) qs.set("user", user);
   return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
 }
 
@@ -156,7 +159,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
-  const channel = useMemo(() => generateChannelId(), [resumeParam]);
+  const rollyUser = getRollyUserSlug();
+  const channel = useMemo(() => generateChannelId(), [resumeParam, rollyUser]);
 
   useEffect(() => {
     if (!resumeParam) return;
@@ -545,7 +549,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     });
 
     // WebSocket
-    const url = buildWsUrl(token, resumeParam, channel);
+    const url = buildWsUrl(token, resumeParam, channel, rollyUser);
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
@@ -581,7 +585,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return;
       }
       if (ev.code === 4403) {
-        setBanner("Chat is only reachable from localhost.");
+        setBanner("Chat requires a selected Rolly dashboard user.");
+        return;
+      }
+      if (ev.code === 4404) {
+        setBanner("That session belongs to another Rolly dashboard user.");
         return;
       }
       if (ev.code === 1011) {
@@ -650,7 +658,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [channel, resumeParam]);
+  }, [channel, resumeParam, rollyUser]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
