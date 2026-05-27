@@ -6450,6 +6450,7 @@ class HermesCLI:
                     self._session_db.create_session(
                         session_id=self.session_id,
                         source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        user_id=os.environ.get("HERMES_SESSION_USER_ID") or None,
                         model=self.model,
                         model_config={
                             "max_iterations": self.max_turns,
@@ -6875,6 +6876,7 @@ class HermesCLI:
             self._session_db.create_session(
                 session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                user_id=os.environ.get("HERMES_SESSION_USER_ID") or None,
                 model=self.model,
                 model_config={
                     "max_iterations": self.max_turns,

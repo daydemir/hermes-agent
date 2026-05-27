@@ -510,11 +510,11 @@ class AIAgent:
         try:
             self._session_db.create_session(
                 session_id=self.session_id,
-                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                source=os.environ.get("HERMES_SESSION_SOURCE") or self.platform or "cli",
                 model=self.model,
                 model_config=self._session_init_model_config,
                 system_prompt=self._cached_system_prompt,
-                user_id=None,
+                user_id=os.environ.get("HERMES_SESSION_USER_ID") or None,
                 parent_session_id=self._parent_session_id,
             )
             self._session_db_created = True
