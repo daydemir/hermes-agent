@@ -97,6 +97,39 @@ class TestRedactKey:
 # ---------------------------------------------------------------------------
 
 
+class TestRollyDashboardIdentityHelpers:
+    def test_dashboard_filters_canonical_user_slugs(self):
+        from hermes_cli.web_server import _session_belongs_to_dashboard_user
+
+        assert _session_belongs_to_dashboard_user({"user_id": "buket"}, "buket")
+        assert _session_belongs_to_dashboard_user({"user_id": "metin"}, "metin")
+        assert _session_belongs_to_dashboard_user({"user_id": "deniz"}, "deniz")
+
+    def test_dashboard_does_not_match_raw_platform_ids(self):
+        from hermes_cli.web_server import _session_belongs_to_dashboard_user
+
+        assert not _session_belongs_to_dashboard_user({"user_id": "8952932425"}, "buket")
+        assert not _session_belongs_to_dashboard_user({"user_id": "8842445456"}, "metin")
+
+    def test_known_telegram_ids_resolve_to_canonical_slugs(self):
+        import json
+        from hermes_constants import get_hermes_home
+        from rolly_identity import _registry, canonical_user_id
+
+        (get_hermes_home() / "rolly-users.json").write_text(json.dumps({
+            "users": [
+                {"slug": "deniz", "display_name": "Deniz", "role": "admin", "accounts": [{"platform": "telegram", "user_id": "7249456219"}]},
+                {"slug": "buket", "display_name": "Buket", "accounts": [{"platform": "telegram", "user_id": "8952932425"}]},
+                {"slug": "metin", "display_name": "Metin", "accounts": [{"platform": "telegram", "user_id": "8842445456"}]},
+            ]
+        }))
+        _registry.cache_clear()
+
+        assert canonical_user_id("telegram", "8952932425") == "buket"
+        assert canonical_user_id("telegram", "8842445456") == "metin"
+        assert canonical_user_id("telegram", "7249456219") == "deniz"
+
+
 class TestWebServerEndpoints:
     """Test the FastAPI REST endpoints using Starlette TestClient."""
 

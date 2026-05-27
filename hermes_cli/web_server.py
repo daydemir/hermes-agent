@@ -149,15 +149,21 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-_ROLLY_DASHBOARD_USERS: frozenset[str] = frozenset({
-    "deniz", "arman", "buket", "metin", "guest",
-})
-_ROLLY_DASHBOARD_ADMINS: frozenset[str] = frozenset({"deniz"})
-
-
 def _normalize_rolly_dashboard_user(value: Optional[str]) -> Optional[str]:
-    user = (value or "").strip().lower()
-    return user if user in _ROLLY_DASHBOARD_USERS else None
+    try:
+        from rolly_identity import normalize_slug
+        return normalize_slug(value)
+    except Exception:
+        user = (value or "").strip().lower()
+        return user if user in {"deniz", "arman", "buket", "metin", "guest"} else None
+
+
+def _rolly_dashboard_admins() -> frozenset[str]:
+    try:
+        from rolly_identity import admin_slugs
+        return admin_slugs()
+    except Exception:
+        return frozenset({"deniz"})
 
 
 def _rolly_dashboard_user_from_request(request: Request) -> Optional[str]:
@@ -175,7 +181,7 @@ def _rolly_dashboard_user_from_ws(ws: WebSocket) -> Optional[str]:
 def _rolly_dashboard_scope(request: Request) -> tuple[Optional[str], bool]:
     user = _rolly_dashboard_user_from_request(request)
     admin_all = bool(
-        user in _ROLLY_DASHBOARD_ADMINS
+        user in _rolly_dashboard_admins()
         and request.query_params.get("scope", "").strip().lower() == "all"
     )
     return user, admin_all
@@ -184,7 +190,7 @@ def _rolly_dashboard_scope(request: Request) -> tuple[Optional[str], bool]:
 def _session_belongs_to_dashboard_user(session: Optional[dict], user: Optional[str]) -> bool:
     if not user or not session:
         return False
-    return (session.get("user_id") or "") == user
+    return (session.get("user_id") or "").strip() == user
 
 
 def _require_dashboard_session_access(session: Optional[dict], user: Optional[str], admin_all: bool = False) -> None:
