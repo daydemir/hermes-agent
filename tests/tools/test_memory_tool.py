@@ -366,6 +366,45 @@ class TestMemoryStorePersistence:
         assert "persistent fact" in store2.memory_entries
         assert "Alice, developer" in store2.user_entries
 
+    def test_shared_memory_private_user_profiles(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        deniz = MemoryStore(user_id="deniz")
+        deniz.load_from_disk()
+        deniz.add("memory", "Shared workflow fact")
+        deniz.add("user", "Deniz prefers short replies")
+
+        arman = MemoryStore(user_id="arman")
+        arman.load_from_disk()
+        arman.add("user", "Arman prefers detailed replies")
+
+        deniz_reloaded = MemoryStore(user_id="deniz")
+        deniz_reloaded.load_from_disk()
+        arman_reloaded = MemoryStore(user_id="arman")
+        arman_reloaded.load_from_disk()
+
+        assert "Shared workflow fact" in deniz_reloaded.memory_entries
+        assert "Shared workflow fact" in arman_reloaded.memory_entries
+        assert "Deniz prefers short replies" in deniz_reloaded.user_entries
+        assert "Deniz prefers short replies" not in arman_reloaded.user_entries
+        assert "Arman prefers detailed replies" in arman_reloaded.user_entries
+        assert "Arman prefers detailed replies" not in deniz_reloaded.user_entries
+        assert (tmp_path / "users" / "deniz" / "USER.md").exists()
+        assert (tmp_path / "users" / "arman" / "USER.md").exists()
+        assert (tmp_path / "MEMORY.md").exists()
+
+    def test_non_slug_user_namespace_is_hashed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store = MemoryStore(user_id="+15551234567")
+        store.load_from_disk()
+        result = store.add("user", "Private preference")
+
+        assert result["success"] is True
+        assert result["user_namespace"].startswith("u_")
+        assert "+15551234567" not in str(store._path_for("user"))
+        assert store._path_for("user").exists()
+
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates

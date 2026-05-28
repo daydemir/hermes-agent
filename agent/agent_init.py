@@ -264,8 +264,10 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
-    agent._user_id = user_id  # Platform user identifier (gateway sessions)
-    agent._user_name = user_name
+    session_env_user_id = os.environ.get("HERMES_SESSION_USER_ID") or None
+    session_env_user_name = os.environ.get("HERMES_SESSION_USER_NAME") or None
+    agent._user_id = user_id or session_env_user_id  # Canonical runtime user identifier when available
+    agent._user_name = user_name or session_env_user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
     agent._chat_type = chat_type
@@ -1072,6 +1074,7 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    user_id=agent._user_id,
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

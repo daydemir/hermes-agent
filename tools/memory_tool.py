@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -122,13 +123,36 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        user_id: Optional[str] = None,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.user_id = str(user_id or "").strip() or None
+        self.user_namespace = self._namespace_for_user_id(self.user_id)
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+
+    @staticmethod
+    def _namespace_for_user_id(user_id: Optional[str]) -> Optional[str]:
+        """Return a filesystem-safe namespace for private USER.md state.
+
+        Known Rolly user IDs are short slugs (``deniz``, ``arman``) and stay
+        readable. Non-slug platform identifiers are hashed so private memory
+        paths do not leak phone numbers, emails, or raw platform IDs.
+        """
+        raw = str(user_id or "").strip().lower()
+        if not raw:
+            return None
+        if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", raw):
+            return raw
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        return f"u_{digest}"
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
@@ -151,8 +175,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.memory_entries = self._read_file(self._path_for("memory"))
+        self.user_entries = self._read_file(self._path_for("user"))
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -243,10 +267,11 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(self, target: str) -> Path:
         mem_dir = get_memory_dir()
         if target == "user":
+            if self.user_namespace:
+                return mem_dir / "users" / self.user_namespace / "USER.md"
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
@@ -270,8 +295,9 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_file(path, self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -469,6 +495,8 @@ class MemoryStore:
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
         }
+        if target == "user" and self.user_namespace:
+            resp["user_namespace"] = self.user_namespace
         if message:
             resp["message"] = message
         return resp
@@ -669,8 +697,8 @@ MEMORY_SCHEMA = {
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'user': who the current user is -- private per-user profile facts such as name, role, preferences, communication style, pet peeves\n"
+        "- 'memory': your shared notes -- environment facts, project conventions, tool quirks, reusable knowledge\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
@@ -686,7 +714,7 @@ MEMORY_SCHEMA = {
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "description": "Which memory store: 'memory' for shared agent notes, 'user' for the current user's private profile."
             },
             "content": {
                 "type": "string",
