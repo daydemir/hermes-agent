@@ -4069,14 +4069,17 @@ class BasePlatformAdapter(ABC):
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
-        canonical_user_id = str(user_id) if user_id else None
+        raw_user_id = str(user_id) if user_id else None
+        canonical_user_id = raw_user_id
         if canonical_user_id:
             try:
                 from rolly_identity import canonical_user_id as _canonical_user_id
                 canonical_user_id = _canonical_user_id(self.platform.value, canonical_user_id)
             except Exception:
                 # Rolly identity is optional for upstream Hermes installs.
-                canonical_user_id = str(user_id)
+                canonical_user_id = raw_user_id
+        if raw_user_id and canonical_user_id != raw_user_id and not user_id_alt:
+            user_id_alt = raw_user_id
         return SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),

@@ -6493,7 +6493,10 @@ class GatewayRunner:
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
-        if self.pairing_store.is_approved(platform_name, user_id):
+        source_user_ids = [user_id]
+        if source.user_id_alt and source.user_id_alt not in source_user_ids:
+            source_user_ids.append(source.user_id_alt)
+        if any(self.pairing_store.is_approved(platform_name, candidate) for candidate in source_user_ids):
             return True
 
         # Check platform-specific and global allowlists
@@ -6566,9 +6569,10 @@ class GatewayRunner:
         if "*" in allowed_ids:
             return True
 
-        check_ids = {user_id}
-        if "@" in user_id:
-            check_ids.add(user_id.split("@")[0])
+        check_ids = set(source_user_ids)
+        for candidate in source_user_ids:
+            if "@" in candidate:
+                check_ids.add(candidate.split("@")[0])
 
         # WhatsApp: resolve phone↔LID aliases from bridge session mapping files
         if source.platform == Platform.WHATSAPP:
@@ -6578,10 +6582,11 @@ class GatewayRunner:
             if normalized_allowed_ids:
                 allowed_ids = normalized_allowed_ids
 
-            check_ids.update(_expand_whatsapp_auth_aliases(user_id))
-            normalized_user_id = _normalize_whatsapp_identifier(user_id)
-            if normalized_user_id:
-                check_ids.add(normalized_user_id)
+            for candidate in source_user_ids:
+                check_ids.update(_expand_whatsapp_auth_aliases(candidate))
+                normalized_user_id = _normalize_whatsapp_identifier(candidate)
+                if normalized_user_id:
+                    check_ids.add(normalized_user_id)
 
         return bool(check_ids & allowed_ids)
 
