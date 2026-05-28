@@ -1659,7 +1659,7 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
-    if workspace_path is None and workspace_kind in {"dir", "worktree"}:
+    if workspace_path is None and workspace_kind == "dir":
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
@@ -3909,9 +3909,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a git worktree at ``workspace_path``.  Not created
-      automatically in v1 -- the kanban-worker skill documents
-      ``git worktree add`` as a worker-side step.  Returns the intended path.
+    - ``worktree``: a git worktree at ``workspace_path``. If no explicit
+      path is stored, the dispatcher creates ``<board-root>/workspaces/worktrees/<id>``
+      from the board's ``default_workdir`` (or the dispatcher's CWD as a
+      last-resort source repo).
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -3947,18 +3948,80 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        if not task.workspace_path:
-            # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
-            )
+        p: Path
+        if task.workspace_path:
+            p = Path(task.workspace_path).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"task {task.id} has non-absolute worktree path "
+                    f"{task.workspace_path!r}; use an absolute path"
+                )
+        else:
+            p = workspaces_root(board=board) / "worktrees" / task.id
+        source_repo = _worktree_source_repo(board=board)
+        branch = _worktree_branch_name(task)
+        _ensure_git_worktree(source_repo, p, branch)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
+
+
+def _worktree_branch_name(task: Task) -> str:
+    """Branch name for auto-created task worktrees."""
+    return (task.branch_name or f"kanban/{task.id}").strip()
+
+
+def _worktree_source_repo(*, board: Optional[str] = None) -> Path:
+    """Return the source checkout used to create per-task worktrees."""
+    board_slug = board if board else get_current_board()
+    board_default = read_board_metadata(board_slug).get("default_workdir")
+    source = Path(str(board_default)).expanduser() if board_default else Path.cwd()
+    if not source.is_absolute():
+        source = source.resolve()
+    return source
+
+
+def _run_git(repo: Path, args: list[str], *, check: bool = True):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _ensure_git_worktree(source_repo: Path, worktree_path: Path, branch: str) -> None:
+    """Create ``worktree_path`` from ``source_repo`` if it is not already a git worktree."""
+    if worktree_path.exists():
+        if (worktree_path / ".git").exists():
+            return
+        try:
+            next(worktree_path.iterdir())
+        except StopIteration:
+            pass
+        else:
+            raise ValueError(
+                f"worktree target {worktree_path} exists and is not an empty directory or git worktree"
+            )
+    try:
+        top = _run_git(source_repo, ["rev-parse", "--show-toplevel"]).stdout.strip()
+    except Exception as exc:
+        raise ValueError(f"cannot create kanban worktree: {source_repo} is not a git checkout") from exc
+    repo = Path(top)
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    branch_exists = _run_git(
+        repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False
+    ).returncode == 0
+    args = ["worktree", "add", str(worktree_path), branch] if branch_exists else [
+        "worktree", "add", "-b", branch, str(worktree_path), "HEAD"
+    ]
+    try:
+        _run_git(repo, args)
+    except Exception as exc:
+        raise RuntimeError(f"failed to create git worktree {worktree_path} from {repo}") from exc
 
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
@@ -4035,6 +4098,20 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+
+# Assignees that are local autonomous coding CLIs rather than Hermes profiles.
+# They still execute through the Kanban dispatcher, but receive a /goal prompt
+# and use the already-resolved per-card workspace as cwd.
+EXTERNAL_KANBAN_AGENT_ASSIGNEES = {"codex", "claude", "claude-code"}
+
+
+def _external_agent_backend(assignee: Optional[str]) -> Optional[str]:
+    lane = (assignee or "").strip().lower()
+    if lane == "codex":
+        return "codex"
+    if lane in {"claude", "claude-code"}:
+        return "claude"
+    return None
 
 # ---------------------------------------------------------------------------
 # Respawn guard constants
@@ -5055,7 +5132,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _external_agent_backend(row["assignee"]) or profile_exists(row["assignee"]):
             return True
     return False
 
@@ -5080,7 +5157,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _external_agent_backend(row["assignee"]) or profile_exists(row["assignee"]):
             return True
     return False
 
@@ -5230,7 +5307,11 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if (
+            profile_exists is not None
+            and not _external_agent_backend(row["assignee"])
+            and not profile_exists(row["assignee"])
+        ):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -5336,7 +5417,11 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if (
+            profile_exists is not None
+            and not _external_agent_backend(row["assignee"])
+            and not profile_exists(row["assignee"])
+        ):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
@@ -5652,6 +5737,33 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+
+def _dev_agent_goal_prompt(task: Task) -> str:
+    """Build the /goal prompt sent to external coding CLIs."""
+    lines = [
+        f"/goal Work kanban task {task.id}: {task.title}",
+        "",
+        "You are running from an already-created per-card git worktree.",
+        "First inspect the task with: hermes kanban show $HERMES_KANBAN_TASK",
+        "Work only inside $HERMES_KANBAN_WORKSPACE / the current directory.",
+        "Verify with concrete commands/tests before reporting success.",
+        "If code changed, leave a review-required kanban comment with changed_files/tests_run/diff_path, then block with review-required instead of completing.",
+    ]
+    if task.body and task.body.strip():
+        lines.extend(["", "Task body:", task.body.strip()])
+    return "\n".join(lines)
+
+
+def _external_agent_cmd(backend: str, prompt: str) -> list[str]:
+    """Return argv for a Kanban-dispatched external coding CLI."""
+    if backend == "codex":
+        exe = os.environ.get("HERMES_KANBAN_CODEX_BIN", "codex")
+        return [exe, "exec", "--full-auto", prompt]
+    if backend == "claude":
+        exe = os.environ.get("HERMES_KANBAN_CLAUDE_BIN", "claude")
+        return [exe, "-p", prompt, "--permission-mode", "acceptEdits"]
+    raise ValueError(f"unknown external kanban agent backend: {backend}")
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -5676,9 +5788,10 @@ def _default_spawn(
 
     from hermes_cli.profiles import normalize_profile_name
 
+    backend = _external_agent_backend(task.assignee)
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = _dev_agent_goal_prompt(task) if backend else f"work kanban task {task.id}"
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -5691,14 +5804,15 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if not backend:
+        try:
+            env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        except FileNotFoundError:
+            # Profile dir doesn't exist — defer resolution to the CLI's
+            # _apply_profile_override() via HERMES_PROFILE (set below).
+            # This only happens in test fixtures where the isolated
+            # HERMES_HOME never had profiles created.
+            pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -5740,48 +5854,36 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
-    cmd = [
-        *_resolve_hermes_argv(),
-        "-p", profile_arg,
-        # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
-        # so they see that profile's shell-hook allowlist instead of the
-        # dispatcher's root allowlist. Pass --accept-hooks explicitly so
-        # profile-local worker sessions still register configured hooks.
-        "--accept-hooks",
-    ]
-    # Auto-load the kanban-worker skill so every dispatched worker
-    # has the pattern library (good summary/metadata shapes, retry
-    # diagnostics, block-reason examples) in its context, even if
-    # the profile hasn't wired it into skills config. The MANDATORY
-    # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
-    # this skill is the deeper reference. Users can point a profile
-    # at a different/additional skill via config if they want —
-    # --skills is additive to the profile's default skill set.
-    #
-    # Only add the flag when the skill actually resolves for the home
-    # the worker runs under: the bundled skill is absent from many
-    # profile-scoped skills dirs, and preloading a missing skill is
-    # fatal at CLI startup. Omitting it is safe — the lifecycle
-    # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
-    if task.skills:
-        for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-    cmd.extend([
-        "chat",
-        "-q", prompt,
-    ])
+    if backend:
+        cmd = _external_agent_cmd(backend, prompt)
+    else:
+        cmd = [
+            *_resolve_hermes_argv(),
+            "-p", profile_arg,
+            # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
+            # so they see that profile's shell-hook allowlist instead of the
+            # dispatcher's root allowlist. Pass --accept-hooks explicitly so
+            # profile-local worker sessions still register configured hooks.
+            "--accept-hooks",
+        ]
+        # Auto-load the kanban-worker skill so every dispatched worker
+        # has the pattern library (good summary/metadata shapes, retry
+        # diagnostics, block-reason examples) in its context, even if
+        # the profile hasn't wired it into skills config. The MANDATORY
+        # lifecycle is already in the system prompt via KANBAN_GUIDANCE.
+        if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+            cmd.extend(["--skills", "kanban-worker"])
+        # Per-task force-loaded skills.
+        if task.skills:
+            for sk in task.skills:
+                if sk and sk != "kanban-worker":
+                    cmd.extend(["--skills", sk])
+        if task.model_override:
+            cmd.extend(["-m", task.model_override])
+        cmd.extend([
+            "chat",
+            "-q", prompt,
+        ])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -5807,6 +5909,10 @@ def _default_spawn(
         )
     except FileNotFoundError:
         log_f.close()
+        if backend:
+            raise RuntimeError(
+                f"`{cmd[0]}` executable not found on PATH for kanban assignee {task.assignee!r}."
+            )
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."

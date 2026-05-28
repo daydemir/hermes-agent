@@ -4419,3 +4419,89 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_worktree_workspace_auto_creates_git_worktree_from_board_default(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (repo / "README.md").write_text("root\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(
+        [
+            "git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "commit", "-m", "init",
+        ],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    kb.write_board_metadata(kb.DEFAULT_BOARD, default_workdir=str(repo))
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="edit feature",
+            workspace_kind="worktree",
+            branch_name="kanban/test-worktree",
+        )
+        task = kb.get_task(conn, tid)
+        assert task.workspace_path is None
+        workspace = kb.resolve_workspace(task, board=kb.DEFAULT_BOARD)
+        assert workspace == kb.workspaces_root(board=kb.DEFAULT_BOARD) / "worktrees" / tid
+        assert (workspace / ".git").exists()
+        assert (workspace / "README.md").read_text() == "root\n"
+        branch = subprocess.run(
+            ["git", "-C", str(workspace), "branch", "--show-current"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        assert branch == "kanban/test-worktree"
+    finally:
+        conn.close()
+
+
+def test_dispatch_treats_codex_assignee_as_spawnable_external_agent(kanban_home):
+    calls = []
+
+    def _spawn(task, workspace, board=None):
+        calls.append((task.assignee, workspace, board))
+        return 12345
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dev task", assignee="codex")
+        res = kb.dispatch_once(conn, spawn_fn=_spawn, board=kb.DEFAULT_BOARD)
+        assert res.spawned and res.spawned[0][0] == tid
+        assert calls and calls[0][0] == "codex"
+        assert tid not in res.skipped_nonspawnable
+    finally:
+        conn.close()
+
+
+def test_external_agent_cmd_uses_goal_prompt_and_cli_backend():
+    task = kb.Task(
+        id="t_abc12345",
+        title="wire button",
+        body="Acceptance: clicking saves the form.",
+        assignee="codex",
+        status="ready",
+        priority=0,
+        created_by="user",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="worktree",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    prompt = kb._dev_agent_goal_prompt(task)
+    cmd = kb._external_agent_cmd("codex", prompt)
+    assert cmd[:3] == ["codex", "exec", "--full-auto"]
+    assert cmd[3].startswith("/goal Work kanban task t_abc12345")
+    assert "Acceptance: clicking saves the form." in cmd[3]
