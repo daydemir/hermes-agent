@@ -868,6 +868,21 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _current_rolly_user_is_admin() -> bool:
+    """Return True when the active gateway user is a Rolly admin."""
+    platform = _get_session_platform()
+    if not platform:
+        return False
+    try:
+        from gateway.session_context import get_session_env
+        from rolly_identity import is_admin
+
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or ""
+        return is_admin(platform, user_id)
+    except Exception:
+        return False
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -1087,6 +1102,12 @@ def check_all_command_guards(command: str, env_type: str,
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        return {"approved": True, "message": None}
+
+    # Rolly admin users (Deniz/Arman) are trusted operators: pre-approve
+    # normal dangerous-command patterns for their gateway sessions, while the
+    # hardline and sudo-stdin blocks above remain non-bypassable.
+    if _current_rolly_user_is_admin():
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")

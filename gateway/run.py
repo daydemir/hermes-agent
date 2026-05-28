@@ -13787,16 +13787,26 @@ class GatewayRunner:
             resolve_gateway_approval, has_blocking_approval,
         )
 
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.approval_expired")
-            return t("gateway.approve.no_pending")
-
-        # Parse args: support "all", "all session", "all always", "session", "always"
+        # Parse args before resolving the target: admins may approve another
+        # user's blocked Rolly session via `/approve <session_key>`.
         args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
         remaining = [a for a in args if a != "all"]
+        scope_words = {"session", "ses", "always", "permanent", "permanently"}
+        target_session_key = session_key
+        try:
+            from rolly_identity import is_admin as _rolly_is_admin
+            _is_admin = _rolly_is_admin(source.platform.value, source.user_id)
+        except Exception:
+            _is_admin = False
+        if _is_admin and remaining and remaining[0] not in scope_words:
+            target_session_key = remaining.pop(0)
+
+        if not has_blocking_approval(target_session_key):
+            if target_session_key in self._pending_approvals:
+                self._pending_approvals.pop(target_session_key)
+                return t("gateway.approval_expired")
+            return t("gateway.approve.no_pending")
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -13805,7 +13815,7 @@ class GatewayRunner:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(target_session_key, choice, resolve_all=resolve_all)
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -13833,16 +13843,25 @@ class GatewayRunner:
             resolve_gateway_approval, has_blocking_approval,
         )
 
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
+        args = event.get_command_args().strip().lower().split()
+        resolve_all = "all" in args
+        target_session_key = session_key
+        try:
+            from rolly_identity import is_admin as _rolly_is_admin
+            _is_admin = _rolly_is_admin(source.platform.value, source.user_id)
+        except Exception:
+            _is_admin = False
+        remaining = [a for a in args if a != "all"]
+        if _is_admin and remaining:
+            target_session_key = remaining[0]
+
+        if not has_blocking_approval(target_session_key):
+            if target_session_key in self._pending_approvals:
+                self._pending_approvals.pop(target_session_key)
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        args = event.get_command_args().strip().lower()
-        resolve_all = "all" in args
-
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        count = resolve_gateway_approval(target_session_key, "deny", resolve_all=resolve_all)
         if not count:
             return t("gateway.deny.no_pending")
 
@@ -16891,6 +16910,47 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+
+                # Rolly policy: non-admin users cannot approve execution-risk
+                # prompts themselves. Route those requests only to Rolly admins
+                # with linked accounts on this platform (currently Deniz; Arman
+                # automatically joins once his Telegram account is linked).
+                try:
+                    from rolly_identity import is_admin as _rolly_is_admin, platform_accounts_for_role
+                    _requester_is_admin = _rolly_is_admin(source.platform.value, source.user_id)
+                    _admin_accounts = platform_accounts_for_role("admin", source.platform.value)
+                except Exception:
+                    _requester_is_admin = True
+                    _admin_accounts = []
+                if not _requester_is_admin and _admin_accounts and _status_adapter is not None:
+                    cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                    requester = source.user_name or source.user_id or "user"
+                    msg = (
+                        f"⚠️ **Rolly approval needed for {requester}:**\n"
+                        f"```\n{cmd_preview}\n```\n"
+                        f"Reason: {desc}\n"
+                        f"Session: `{_approval_session_key}`\n\n"
+                        f"Reply `/approve {_approval_session_key}` to execute once, "
+                        f"`/approve {_approval_session_key} session`, "
+                        f"`/approve {_approval_session_key} always`, or "
+                        f"`/deny {_approval_session_key}`."
+                    )
+                    delivered = False
+                    for account in _admin_accounts:
+                        try:
+                            _admin_send_fut = safe_schedule_threadsafe(
+                                _status_adapter.send(account.user_id, msg, metadata=None),
+                                _loop_for_step,
+                                logger=logger,
+                                log_message="Admin approval text-send scheduling error",
+                            )
+                            if _admin_send_fut is not None:
+                                _admin_result = _admin_send_fut.result(timeout=15)
+                                delivered = delivered or bool(getattr(_admin_result, "success", True))
+                        except Exception as _e:
+                            logger.error("Failed to send admin approval request to %s: %s", account.slug, _e)
+                    if delivered:
+                        return
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids

@@ -24,7 +24,15 @@ class RollyUser:
     role: str = "user"
 
 
+@dataclass(frozen=True)
+class RollyAccount:
+    slug: str
+    platform: str
+    user_id: str
+    role: str = "user"
+
 REGISTRY_PATH = "rolly-users.json"
+
 
 
 def _registry_path() -> Path:
@@ -63,6 +71,37 @@ def admin_slugs() -> frozenset[str]:
     return frozenset(user.slug for user in list_users() if user.role == "admin")
 
 
+def platform_accounts_for_role(role: str, platform: str) -> list[RollyAccount]:
+    """Return linked platform accounts for users with the given Rolly role."""
+    role = str(role or "").strip().lower()
+    platform = str(platform or "").strip().lower()
+    accounts: list[RollyAccount] = []
+    if not role or not platform:
+        return accounts
+    for item in _registry()["users"]:
+        if not isinstance(item, dict):
+            continue
+        item_role = str(item.get("role") or "user").strip().lower()
+        if item_role != role:
+            continue
+        slug = str(item.get("slug") or "").strip().lower()
+        if not slug:
+            continue
+        for account in item.get("accounts", []):
+            if not isinstance(account, dict):
+                continue
+            account_platform = str(account.get("platform") or "").strip().lower()
+            account_user_id = str(account.get("user_id") or "").strip()
+            if account_platform == platform and account_user_id:
+                accounts.append(RollyAccount(
+                    slug=slug,
+                    platform=account_platform,
+                    user_id=account_user_id,
+                    role=item_role,
+                ))
+    return accounts
+
+
 def normalize_slug(value: Optional[str]) -> Optional[str]:
     slug = str(value or "").strip().lower()
     return slug if slug in known_slugs() else None
@@ -99,3 +138,9 @@ def canonical_user_id(platform: str, raw_user_id: Optional[str]) -> Optional[str
     """
     raw = str(raw_user_id or "").strip()
     return resolve_platform_user(platform, raw) or normalize_slug(raw) or (raw or None)
+
+
+def is_admin(platform: str, raw_user_id: Optional[str]) -> bool:
+    """Return True when a platform/raw user resolves to an admin Rolly user."""
+    canonical = canonical_user_id(platform, raw_user_id)
+    return bool(canonical and canonical in admin_slugs())
