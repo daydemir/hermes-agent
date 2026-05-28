@@ -167,6 +167,7 @@
 .hermes-kanban-dot-todo     { background: var(--color-muted-foreground); }
 .hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
 .hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
+.hermes-kanban-dot-doing    { background: #3fb97d; }  /* green */
 .hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
 .hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
 .hermes-kanban-dot-archived { background: var(--color-border); }
@@ -1041,6 +1042,18 @@
   color: #ff9e3b;
   margin-left: 0.25rem;
   cursor: help;
+}
+
+.hermes-kanban-blocked-badge,
+.hermes-kanban-status-badge {
+  font-size: 0.65rem;
+  letter-spacing: 0.03em;
+  margin-left: 0.25rem;
+}
+
+.hermes-kanban-blocked-badge {
+  color: var(--color-destructive, #d14a4a);
+  border-color: rgba(209, 74, 74, 0.35);
 }
 
 /* Attention strip — collapsed state is a thin bar. */

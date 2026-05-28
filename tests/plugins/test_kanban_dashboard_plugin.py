@@ -68,11 +68,9 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # Dashboard presents Rolly's simple lifecycle; internal statuses are still richer.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        assert expected in names, f"missing column {expected}: {names}"
+    assert names == ["todo", "ready", "doing", "done"]
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
@@ -114,29 +112,43 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
-def test_scheduled_tasks_have_their_own_column_not_todo(client):
-    """Scheduled/time-delay tasks must not be silently bucketed into todo."""
+def test_internal_statuses_project_to_simple_rolly_columns(client):
+    """Rolly board hides internal statuses but preserves them on task payloads."""
 
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "wait for indexed data", "assignee": "ops"},
-    ).json()["task"]
-
+    expected = {
+        "triage": "todo",
+        "todo": "todo",
+        "scheduled": "todo",
+        "blocked": "todo",
+        "ready": "ready",
+        "running": "doing",
+        "review": "doing",
+        "done": "done",
+    }
+    task_ids = {}
     conn = kb.connect()
     try:
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'scheduled' WHERE id = ?",
-                (task["id"],),
-            )
+        for status in expected:
+            task_id = kb.create_task(conn, title=f"status {status}")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?",
+                    (status, task_id),
+                )
+            task_ids[status] = task_id
     finally:
         conn.close()
 
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
-    assert any(t["id"] == task["id"] for t in columns["scheduled"])
-    assert not any(t["id"] == task["id"] for t in columns["todo"])
+    assert list(columns) == ["todo", "ready", "doing", "done"]
+    for status, column in expected.items():
+        payload = next(t for t in columns[column] if t["id"] == task_ids[status])
+        assert payload["status"] == status
+        assert payload["display_column"] == column
+    blocked = next(t for t in columns["todo"] if t["id"] == task_ids["blocked"])
+    assert blocked["blocked_exception"] is True
 
 
 def test_tenant_filter(client):
@@ -331,9 +343,11 @@ def test_patch_schedule_then_unblock(client):
     assert r.json()["task"]["status"] == "scheduled"
 
     columns = client.get("/api/plugins/kanban/board").json()["columns"]
-    assert "scheduled" in [c["name"] for c in columns]
-    scheduled = next(c for c in columns if c["name"] == "scheduled")
-    assert any(x["id"] == t["id"] for x in scheduled["tasks"])
+    assert "scheduled" not in [c["name"] for c in columns]
+    todo = next(c for c in columns if c["name"] == "todo")
+    payload = next(x for x in todo["tasks"] if x["id"] == t["id"])
+    assert payload["status"] == "scheduled"
+    assert payload["display_column"] == "todo"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
@@ -458,22 +472,23 @@ def test_patch_invalid_status(client):
     assert r.status_code == 400
 
 
-def test_patch_status_running_rejected(client):
-    """Dashboard PATCH cannot transition a task directly to 'running'.
+@pytest.mark.parametrize("status", ["running", "doing"])
+def test_patch_status_running_rejected(client, status):
+    """Dashboard PATCH cannot transition a task directly into work-in-flight.
 
-    The only legitimate path into 'running' is through the dispatcher's
+    The only legitimate path into internal 'running' is through the dispatcher's
     ``claim_task`` — which atomically creates a ``task_runs`` row,
     claim_lock, expiry, and worker-PID metadata. Allowing a direct set
-    creates orphaned 'running' tasks with no run row or claim, which
-    violate the board's run-history invariants. See issue #19535.
+    creates orphaned tasks with no run row or claim, which violate the
+    board's run-history invariants. See issue #19535.
     """
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "running"},
+        json={"status": status},
     )
     assert r.status_code == 400
-    assert "running" in r.json()["detail"]
+    assert status in r.json()["detail"]
     # Task's status should still be its pre-request value — the direct-set
     # was rejected before any mutation.
     board = client.get("/api/plugins/kanban/board").json()
@@ -594,11 +609,11 @@ def test_dispatch_dry_run(client):
 
 
 # ---------------------------------------------------------------------------
-# Triage column (new v1 status)
+# Triage internal status (shown in Rolly's simple todo column)
 # ---------------------------------------------------------------------------
 
 
-def test_create_triage_lands_in_triage_column(client):
+def test_create_triage_lands_in_todo_column(client):
     r = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "rough idea, spec me", "triage": True},
@@ -608,9 +623,11 @@ def test_create_triage_lands_in_triage_column(client):
     assert task["status"] == "triage"
 
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
-    assert len(triage["tasks"]) == 1
-    assert triage["tasks"][0]["title"] == "rough idea, spec me"
+    todo = next(c for c in r.json()["columns"] if c["name"] == "todo")
+    assert len(todo["tasks"]) == 1
+    assert todo["tasks"][0]["title"] == "rough idea, spec me"
+    assert todo["tasks"][0]["status"] == "triage"
+    assert todo["tasks"][0]["display_column"] == "todo"
 
 
 def test_triage_task_not_promoted_to_ready(client):
@@ -622,9 +639,10 @@ def test_triage_task_not_promoted_to_ready(client):
     # Run the dispatcher — it should NOT promote the triage task.
     client.post("/api/plugins/kanban/dispatch?dry_run=false&max=4")
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
+    todo = next(c for c in r.json()["columns"] if c["name"] == "todo")
     ready = next(c for c in r.json()["columns"] if c["name"] == "ready")
-    assert len(triage["tasks"]) == 1
+    assert len(todo["tasks"]) == 1
+    assert todo["tasks"][0]["status"] == "triage"
     assert len(ready["tasks"]) == 0
 
 

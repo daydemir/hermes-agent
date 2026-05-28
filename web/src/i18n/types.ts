@@ -666,26 +666,8 @@ export interface Translations {
     clickToEdit: string;
     clickToEditAssignee: string;
     emptyAssignee: string;
-    columnLabels: {
-      triage: string;
-      todo: string;
-      scheduled: string;
-      ready: string;
-      running: string;
-      blocked: string;
-      done: string;
-      archived: string;
-    };
-    columnHelp: {
-      triage: string;
-      todo: string;
-      scheduled: string;
-      ready: string;
-      running: string;
-      blocked: string;
-      done: string;
-      archived: string;
-    };
+    columnLabels: Record<string, string>;
+    columnHelp: Record<string, string>;
     confirmDone: string;
     confirmArchive: string;
     confirmBlocked: string;

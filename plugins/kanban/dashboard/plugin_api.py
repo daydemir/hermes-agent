@@ -128,17 +128,26 @@ def _conn(board: Optional[str] = None):
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
-# Columns shown by the dashboard, in left-to-right order. "archived" is
-# available via a filter toggle rather than a visible column.
-#
-# Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
-# ``scheduled`` is a first-class waiting column used for time-based follow-ups;
-# if it is omitted here, the board-level fallback below mis-buckets scheduled
-# tasks into ``todo`` and makes the dashboard look like the Scheduled column
-# disappeared.
-BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
-]
+# Rolly presents a deliberately simple board: todo → ready → doing → done.
+# Internal Hermes Kanban statuses remain richer for dispatcher semantics
+# (scheduled, blocked, review, archived, etc.); this is presentation only.
+BOARD_COLUMNS: list[str] = ["todo", "ready", "doing", "done"]
+
+STATUS_TO_BOARD_COLUMN: dict[str, str] = {
+    "triage": "todo",
+    "todo": "todo",
+    "scheduled": "todo",
+    "blocked": "todo",
+    "ready": "ready",
+    "running": "doing",
+    "review": "doing",
+    "done": "done",
+    "archived": "done",
+}
+
+
+def _board_column_for_status(status: str) -> str:
+    return STATUS_TO_BOARD_COLUMN.get(status, "todo")
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -442,6 +451,9 @@ def get_board(
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
+            d["display_column"] = _board_column_for_status(t.status)
+            if t.status == "blocked":
+                d["blocked_exception"] = True
             diags = diagnostics_per_task.get(t.id)
             if diags:
                 # Full list goes into the payload so the drawer can render
@@ -449,8 +461,9 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
-            columns[col].append(d)
+            col = _board_column_for_status(t.status)
+            if col in columns:
+                columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
         # (priority DESC, created_at ASC), keep as-is.
@@ -673,10 +686,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
+            elif s in ("running", "doing"):
                 raise HTTPException(
                     status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                    detail=f"Cannot set status to {s!r} directly; use the dispatcher/claim path",
                 )
             elif s in ("todo", "triage", "scheduled"):
                 ok = _set_status_direct(conn, task_id, s)

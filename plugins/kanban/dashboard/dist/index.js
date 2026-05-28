@@ -86,27 +86,23 @@
     return body || raw;
   }
 
-  // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  // Order matches Rolly's simplified board projection in plugin_api.py.
+  const COLUMN_ORDER = ["todo", "ready", "doing", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
-    triage: "Triage",
     todo: "Todo",
     ready: "Ready",
-    running: "In Progress",
-    blocked: "Blocked",
+    doing: "Doing",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
-    triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
-    ready: "Dependencies satisfied; assign a profile to dispatch",
-    running: "Claimed by a worker — in-flight",
-    blocked: "Worker asked for human input",
-    done: "Completed",
+    todo: "Ideas and kept work that are not execution-ready yet",
+    ready: "Executable spec exists: goal, context, acceptance, verification",
+    doing: "Claimed by a worker — in-flight",
+    done: "Acceptance verified or abandoned with a reason",
     archived: "Archived",
   };
   const FALLBACK_DESTRUCTIVE = {
@@ -152,11 +148,9 @@
   }
 
   const COLUMN_DOT = {
-    triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
     ready: "hermes-kanban-dot-ready",
-    running: "hermes-kanban-dot-running",
-    blocked: "hermes-kanban-dot-blocked",
+    doing: "hermes-kanban-dot-doing",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -2298,7 +2292,7 @@
     };
 
     const lanes = useMemo(function () {
-      if (!props.laneByProfile || props.column.name !== "running") return null;
+      if (!props.laneByProfile || props.column.name !== "doing") return null;
       const byProfile = {};
       for (const tk of props.column.tasks) {
         const key = tk.assignee || "(unassigned)";
@@ -2514,6 +2508,20 @@
             ),
             h("span", { className: "hermes-kanban-card-id",
                         title: `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, t.id),
+            t.blocked_exception
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-blocked-badge",
+                  title: "Blocked: waiting on human input, access, or a side-effect gate.",
+                }, "BLOCKED")
+              : null,
+            t.status && t.status !== t.display_column
+              ? h(Badge, {
+                  variant: "outline",
+                  className: "hermes-kanban-status-badge",
+                  title: `Internal status: ${t.status}`,
+                }, t.status)
+              : null,
             t.warnings && t.warnings.count > 0
               ? h("span", {
                   className: cn(
