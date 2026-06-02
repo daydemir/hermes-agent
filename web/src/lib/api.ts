@@ -323,10 +323,26 @@ export const api = {
       headers: user ? { "Content-Type": "application/json", "X-Rolly-User": user } : { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
-  getVoiceRoom: (callId: string, since = 0, limit = 200, user?: string) =>
-    fetchJSON<VoiceRoomResponse>(`/api/voice/room?call_id=${encodeURIComponent(callId)}&since=${since}&limit=${limit}`, {
+  getVoiceRoom: (callId: string, since = 0, limit = 200, user?: string, waitMs = 0) => {
+    const qs = new URLSearchParams({ call_id: callId, since: String(since), limit: String(limit) });
+    if (waitMs > 0) qs.set("wait_ms", String(waitMs));
+    return fetchJSON<VoiceRoomResponse>(`/api/voice/room?${qs.toString()}`, {
       headers: user ? { "X-Rolly-User": user } : undefined,
+    });
+  },
+  postVoiceMeetSignal: (body: VoiceMeetSignalRequest, user?: string) =>
+    fetchJSON<{ ok: boolean; signal: VoiceMeetSignal }>("/api/voice/meet/signal", {
+      method: "POST",
+      headers: user ? { "Content-Type": "application/json", "X-Rolly-User": user } : { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
+  getVoiceMeetSignals: (callId: string, since = 0, limit = 200, user?: string, waitMs = 0) => {
+    const qs = new URLSearchParams({ call_id: callId, since: String(since), limit: String(limit) });
+    if (waitMs > 0) qs.set("wait_ms", String(waitMs));
+    return fetchJSON<VoiceMeetSignalsResponse>(`/api/voice/meet/signals?${qs.toString()}`, {
+      headers: user ? { "X-Rolly-User": user } : undefined,
+    });
+  },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
   getModelsAnalytics: (days: number) =>
@@ -794,6 +810,31 @@ export interface VoiceRoomResponse {
   cursor: number;
   participants: VoiceRoomParticipant[];
   events: VoiceRoomEvent[];
+}
+
+export interface VoiceMeetSignalRequest {
+  call_id: string;
+  type: "join" | "leave" | "offer" | "answer" | "ice" | string;
+  payload?: Record<string, unknown>;
+  to_user?: string | null;
+  user?: string;
+}
+
+export interface VoiceMeetSignal {
+  index: number;
+  timestamp: string;
+  call_id: string;
+  from_user: string;
+  to_user?: string | null;
+  type: "join" | "leave" | "offer" | "answer" | "ice" | string;
+  payload: Record<string, unknown>;
+}
+
+export interface VoiceMeetSignalsResponse {
+  ok: boolean;
+  call_id: string;
+  cursor: number;
+  signals: VoiceMeetSignal[];
 }
 
 export interface VoiceToolResponse {

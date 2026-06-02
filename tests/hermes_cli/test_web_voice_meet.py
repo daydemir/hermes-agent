@@ -57,6 +57,10 @@ def test_start_meeting_invite_starts_meet_call_path():
     assert "if (!preserveCallId && !new URLSearchParams(window.location.search).get(\"call_id\"))" in source
     assert "hasMeetInvite ? () => void startCall(\"meet\", true) : startMeetingInvite" in source
     assert "Join meeting" in source
+    assert "startMeetPeerAudio(callIdRef.current, stream)" in source
+    assert "api.postVoiceMeetSignal({ call_id: roomCallId, type: \"join\", user: speaker }" in source
+    assert "api.getVoiceMeetSignals(roomCallId, voiceSignalCursorRef.current, 200, speaker, 10000)" in source
+    assert "new RTCPeerConnection({ iceServers: [{ urls: \"stun:stun.l.google.com:19302\" }] })" in source
     assert "onClick={() => void startCall()}" in source
 
 

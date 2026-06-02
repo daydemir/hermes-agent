@@ -192,6 +192,14 @@ class VoiceMeetInviteRequest(BaseModel):
     user: Optional[str] = None
 
 
+class VoiceMeetSignalRequest(BaseModel):
+    call_id: str
+    type: str
+    payload: Dict[str, Any] = {}
+    to_user: Optional[str] = None
+    user: Optional[str] = None
+
+
 class VoiceTask:
     def __init__(self, task_id: str, call_id: str, user: str, request: str, session_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -466,6 +474,36 @@ def _voice_read_room_state(call_id: str, since: int = 0, limit: int = 200) -> Di
     }
 
 
+async def _voice_wait_for_room_state(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0, min(wait_ms, 30000)) / 1000
+    while True:
+        state = _voice_read_room_state(call_id, since=since, limit=limit)
+        if state["events"] or time.monotonic() >= deadline:
+            return state
+        await asyncio.sleep(0.2)
+
+
+def _voice_room_signal_state(call_id: str, since: int = 0, limit: int = 200, *, user: str | None = None) -> Dict[str, Any]:
+    safe_since = max(0, since)
+    safe_limit = max(1, min(limit, 500))
+    with _VOICE_ROOM_SIGNAL_LOCK:
+        messages = list(_VOICE_ROOM_SIGNALS.get(call_id, []))
+    visible = [
+        msg for msg in messages
+        if int(msg.get("index") or 0) > safe_since and (not msg.get("to_user") or msg.get("to_user") == user or msg.get("from_user") == user)
+    ][:safe_limit]
+    return {"ok": True, "call_id": call_id, "cursor": len(messages), "signals": visible}
+
+
+async def _voice_wait_for_room_signals(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0, *, user: str | None = None) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0, min(wait_ms, 30000)) / 1000
+    while True:
+        state = _voice_room_signal_state(call_id, since=since, limit=limit, user=user)
+        if state["signals"] or time.monotonic() >= deadline:
+            return state
+        await asyncio.sleep(0.2)
+
+
 def _voice_send_post_call_notification(task: VoiceTask) -> bool:
     target = os.getenv("HERMES_VOICE_TELEGRAM_HANDOFF_TARGET", "").strip()
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -526,6 +564,8 @@ _VOICE_TASKS: Dict[str, VoiceTask] = {}
 _VOICE_TASKS_LOCK = threading.Lock()
 _VOICE_CALLS: Dict[str, Dict[str, Any]] = {}
 _VOICE_CALLS_LOCK = threading.Lock()
+_VOICE_ROOM_SIGNALS: Dict[str, list[Dict[str, Any]]] = {}
+_VOICE_ROOM_SIGNAL_LOCK = threading.Lock()
 _VOICE_TASK_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HERMES_VOICE_TASK_WORKERS", "4")), thread_name_prefix="voice-rolly")
 
 
@@ -1147,10 +1187,10 @@ async def create_voice_meet_invite(payload: VoiceMeetInviteRequest, request: Req
         "mode": "meet",
         "call_id": call_id,
         "invite_url": invite_url,
-        "participant_audio_routing": "not_supported",
+        "participant_audio_routing": "peer_audio_signaling",
         "participant_audio_routing_detail": (
-            "Meet invites share a Rolly Voice room id, but participant-to-participant audio bridging "
-            "is not implemented yet; each browser connects to Rolly/OpenAI."
+            "Meet invites share a Rolly Voice room id and use browser peer audio between participants. "
+            "Each browser also keeps its own Rolly/OpenAI realtime connection."
         ),
         "feature_flag": "HERMES_VOICE_MEET_INVITES",
     }
@@ -1228,11 +1268,50 @@ async def save_voice_transcript(payload: VoiceTranscriptEvent, request: Request)
 
 
 @app.get("/api/voice/room")
-async def get_voice_room(call_id: str, since: int = 0, limit: int = 200):
+async def get_voice_room(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0):
     safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id).strip("._")
     if not safe_call_id:
         raise HTTPException(status_code=400, detail="Missing call_id")
+    if wait_ms > 0:
+        return await _voice_wait_for_room_state(safe_call_id, since=since, limit=limit, wait_ms=wait_ms)
     return _voice_read_room_state(safe_call_id, since=since, limit=limit)
+
+
+@app.post("/api/voice/meet/signal")
+async def post_voice_meet_signal(payload: VoiceMeetSignalRequest, request: Request):
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.call_id).strip("._")
+    if not safe_call_id:
+        raise HTTPException(status_code=400, detail="Missing call_id")
+    user = _voice_speaker_label(payload.user or _voice_auth_context(request))
+    signal_type = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.type).strip("._")
+    if signal_type not in {"join", "leave", "offer", "answer", "ice"}:
+        raise HTTPException(status_code=400, detail="Unsupported signal type")
+    with _VOICE_ROOM_SIGNAL_LOCK:
+        messages = _VOICE_ROOM_SIGNALS.setdefault(safe_call_id, [])
+        message = {
+            "index": len(messages) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "call_id": safe_call_id,
+            "from_user": user,
+            "to_user": payload.to_user,
+            "type": signal_type,
+            "payload": payload.payload,
+        }
+        messages.append(message)
+        if len(messages) > 1000:
+            del messages[:-1000]
+    return {"ok": True, "signal": message}
+
+
+@app.get("/api/voice/meet/signals")
+async def get_voice_meet_signals(request: Request, call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0):
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id).strip("._")
+    if not safe_call_id:
+        raise HTTPException(status_code=400, detail="Missing call_id")
+    user = _voice_auth_context(request)
+    if wait_ms > 0:
+        return await _voice_wait_for_room_signals(safe_call_id, since=since, limit=limit, wait_ms=wait_ms, user=user)
+    return _voice_room_signal_state(safe_call_id, since=since, limit=limit, user=user)
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks

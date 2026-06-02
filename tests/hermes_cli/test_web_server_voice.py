@@ -253,6 +253,37 @@ def test_voice_room_returns_participants_and_incremental_events(voice_client):
     assert {row["user"]: row["status"] for row in body["participants"]} == {"deniz": "live", "arman": "left"}
 
 
+def test_voice_meet_signaling_routes_to_room_participants(voice_client):
+    client, web_server = voice_client
+    with web_server._VOICE_ROOM_SIGNAL_LOCK:
+        web_server._VOICE_ROOM_SIGNALS.clear()
+
+    join = client.post(
+        "/api/voice/meet/signal",
+        json={"call_id": "signal/1", "type": "join", "user": "deniz"},
+        headers={"X-Rolly-User": "deniz"},
+    )
+    offer = client.post(
+        "/api/voice/meet/signal",
+        json={"call_id": "signal/1", "type": "offer", "to_user": "arman", "user": "deniz", "payload": {"type": "offer", "sdp": "offer-sdp"}},
+        headers={"X-Rolly-User": "deniz"},
+    )
+
+    assert join.status_code == 200
+    assert offer.status_code == 200
+    assert offer.json()["signal"]["call_id"] == "signal_1"
+
+    arman = client.get("/api/voice/meet/signals?call_id=signal/1&since=0", headers={"X-Rolly-User": "arman"})
+    buket = client.get("/api/voice/meet/signals?call_id=signal/1&since=0", headers={"X-Rolly-User": "buket"})
+
+    assert arman.status_code == 200
+    assert [(signal["type"], signal["from_user"], signal["to_user"]) for signal in arman.json()["signals"]] == [
+        ("join", "deniz", None),
+        ("offer", "deniz", "arman"),
+    ]
+    assert [(signal["type"], signal["to_user"]) for signal in buket.json()["signals"]] == [("join", None)]
+
+
 def test_run_voice_research_uses_cli_bridge(monkeypatch, voice_client):
     _client, web_server = voice_client
     calls = []
@@ -466,8 +497,8 @@ def test_voice_invite_returns_share_url_when_enabled(voice_client, monkeypatch):
     assert body["call_id"] == "voice-call"
     assert "mode=meet" in body["invite_url"]
     assert "call_id=voice-call" in body["invite_url"]
-    assert body["participant_audio_routing"] == "not_supported"
-    assert "participant-to-participant audio bridging is not implemented" in body["participant_audio_routing_detail"]
+    assert body["participant_audio_routing"] == "peer_audio_signaling"
+    assert "browser peer audio" in body["participant_audio_routing_detail"]
 
 
 def test_voice_invite_rejects_ended_call(voice_client, monkeypatch):

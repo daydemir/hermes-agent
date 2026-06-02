@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
-import { api, type VoiceRoomEvent, type VoiceRoomParticipant, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
+import { api, type VoiceMeetSignal, type VoiceRoomEvent, type VoiceRoomParticipant, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
 import { getRollyUser, getRollyUserSlug } from "@/lib/rollyIdentity";
 import { isRollyWakePhrase } from "@/lib/voiceMeet";
 
@@ -116,6 +116,10 @@ export default function VoiceCallPage() {
   const meetInvokedRef = useRef(false);
   const voiceRoomCursorRef = useRef(0);
   const seenVoiceRoomEventsRef = useRef<Set<string>>(new Set());
+  const voiceSignalCursorRef = useRef(0);
+  const meetPeerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const meetRemoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const meetSignalCancelRef = useRef<(() => void) | null>(null);
   const userSpeakingRef = useRef(false);
   const responseActiveRef = useRef(false);
 
@@ -459,6 +463,18 @@ export default function VoiceCallPage() {
       status_at_end: "ending",
       reason,
     });
+    if (activeCallModeRef.current === "meet" && speaker) {
+      void api.postVoiceMeetSignal({ call_id: callIdRef.current, type: "leave", user: speaker }, speaker).catch(() => undefined);
+    }
+    meetSignalCancelRef.current?.();
+    meetSignalCancelRef.current = null;
+    meetPeerConnectionsRef.current.forEach((connection) => connection.close());
+    meetPeerConnectionsRef.current.clear();
+    meetRemoteAudioRef.current.forEach((audio) => {
+      audio.srcObject = null;
+      audio.remove();
+    });
+    meetRemoteAudioRef.current.clear();
     if (dataRef.current) {
       dataRef.current.onerror = null;
       dataRef.current.onmessage = null;
@@ -491,7 +507,111 @@ export default function VoiceCallPage() {
     Promise.allSettled([...pendingTranscriptSavesRef.current]).then(() => setSaveStatus("Call saved"));
     setStatus("idle");
     addLog("system", `Call ended; saved end marker (${(durationMs / 1000).toFixed(1)}s).`);
-  }, [addLog, logs.length, persistTranscript, status, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue, voiceTasks]);
+  }, [addLog, logs.length, persistTranscript, speaker, status, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue, voiceTasks]);
+
+  const startMeetPeerAudio = useCallback(
+    (roomCallId: string, localStream: MediaStream) => {
+      meetSignalCancelRef.current?.();
+      let cancelled = false;
+      meetSignalCancelRef.current = () => {
+        cancelled = true;
+      };
+      const ensurePeerConnection = (remoteUser: string) => {
+        let connection = meetPeerConnectionsRef.current.get(remoteUser);
+        if (connection) return connection;
+        connection = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+        localStream.getAudioTracks().forEach((track) => connection?.addTrack(track, localStream));
+        connection.onicecandidate = (event) => {
+          if (!event.candidate) return;
+          void api.postVoiceMeetSignal(
+            { call_id: roomCallId, type: "ice", to_user: remoteUser, user: speaker, payload: event.candidate.toJSON() as Record<string, unknown> },
+            speaker,
+          ).catch(() => undefined);
+        };
+        connection.ontrack = (event) => {
+          const [remoteStream] = event.streams;
+          if (!remoteStream) return;
+          let audio = meetRemoteAudioRef.current.get(remoteUser);
+          if (!audio) {
+            audio = document.createElement("audio");
+            audio.autoplay = true;
+            audio.setAttribute("playsinline", "true");
+            audio.dataset.rollyMeetPeer = remoteUser;
+            document.body.appendChild(audio);
+            meetRemoteAudioRef.current.set(remoteUser, audio);
+          }
+          audio.srcObject = remoteStream;
+          void audio.play().catch(() => addLog("system", `Remote audio from ${remoteUser} is ready; browser blocked autoplay until the next click.`));
+          addLog("system", `Remote audio connected: ${remoteUser}.`);
+        };
+        connection.onconnectionstatechange = () => {
+          if (connection?.connectionState === "failed") addLog("system", `Remote audio connection failed: ${remoteUser}.`);
+          if (connection?.connectionState === "connected") addLog("system", `Remote audio live: ${remoteUser}.`);
+        };
+        meetPeerConnectionsRef.current.set(remoteUser, connection);
+        return connection;
+      };
+      const sendOffer = async (remoteUser: string) => {
+        const connection = ensurePeerConnection(remoteUser);
+        if (connection.signalingState !== "stable") return;
+        const offer = await connection.createOffer({ offerToReceiveAudio: true });
+        await connection.setLocalDescription(offer);
+        await api.postVoiceMeetSignal({ call_id: roomCallId, type: "offer", to_user: remoteUser, user: speaker, payload: offer as unknown as Record<string, unknown> }, speaker);
+      };
+      const handleSignal = async (signal: VoiceMeetSignal) => {
+        const remoteUser = signal.from_user;
+        if (!remoteUser || remoteUser === speaker) return;
+        if (signal.to_user && signal.to_user !== speaker) return;
+        if (signal.type === "join") {
+          addLog("system", `${remoteUser} is available for peer audio.`);
+          if (speaker < remoteUser) await sendOffer(remoteUser);
+          return;
+        }
+        if (signal.type === "leave") {
+          meetPeerConnectionsRef.current.get(remoteUser)?.close();
+          meetPeerConnectionsRef.current.delete(remoteUser);
+          const audio = meetRemoteAudioRef.current.get(remoteUser);
+          if (audio) {
+            audio.srcObject = null;
+            audio.remove();
+            meetRemoteAudioRef.current.delete(remoteUser);
+          }
+          return;
+        }
+        const connection = ensurePeerConnection(remoteUser);
+        if (signal.type === "offer") {
+          await connection.setRemoteDescription(signal.payload as unknown as RTCSessionDescriptionInit);
+          const answer = await connection.createAnswer();
+          await connection.setLocalDescription(answer);
+          await api.postVoiceMeetSignal({ call_id: roomCallId, type: "answer", to_user: remoteUser, user: speaker, payload: answer as unknown as Record<string, unknown> }, speaker);
+          return;
+        }
+        if (signal.type === "answer") {
+          await connection.setRemoteDescription(signal.payload as unknown as RTCSessionDescriptionInit);
+          return;
+        }
+        if (signal.type === "ice") {
+          await connection.addIceCandidate(signal.payload as RTCIceCandidateInit);
+        }
+      };
+      const pollSignals = async () => {
+        while (!cancelled) {
+          try {
+            const response = await api.getVoiceMeetSignals(roomCallId, voiceSignalCursorRef.current, 200, speaker, 10000);
+            voiceSignalCursorRef.current = response.cursor;
+            for (const signal of response.signals) await handleSignal(signal);
+          } catch (exc) {
+            addLog("system", `Meet peer audio signaling paused: ${exc instanceof Error ? exc.message : String(exc)}`);
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          }
+        }
+      };
+      voiceSignalCursorRef.current = 0;
+      void api.postVoiceMeetSignal({ call_id: roomCallId, type: "join", user: speaker }, speaker).catch(() => undefined);
+      void pollSignals();
+    },
+    [addLog, speaker],
+  );
 
   const sendRealtimeEvent = useCallback((payload: Record<string, unknown>) => {
     const channel = dataRef.current;
@@ -849,6 +969,9 @@ export default function VoiceCallPage() {
     setCallIdDisplay(callIdRef.current);
     callStartedAtRef.current = Date.now();
     if (!preserveCallId) eventSeqRef.current = 0;
+    voiceRoomCursorRef.current = 0;
+    seenVoiceRoomEventsRef.current = new Set();
+    voiceSignalCursorRef.current = 0;
     pendingTranscriptSavesRef.current = [];
     setLastSavePath(null);
     setSaveStatus("Saving call events…");
@@ -901,6 +1024,10 @@ export default function VoiceCallPage() {
       const track = stream.getAudioTracks()[0];
       addLog("system", `Browser mic opened: ${track?.label || "unknown device"}. Watch the mic level; it should move when you talk.`);
       persistTranscript("system", `Browser mic opened: ${track?.label || "unknown device"}.`, "mic_opened");
+      if (callMode === "meet") {
+        startMeetPeerAudio(callIdRef.current, stream);
+        addLog("system", "Meet peer audio signaling started.");
+      }
       setStatus("connecting");
 
       const peer = new RTCPeerConnection();
@@ -948,7 +1075,7 @@ export default function VoiceCallPage() {
       addLog("error", message);
       stopCall("setup_error");
     }
-  }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
+  }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMeetPeerAudio, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
 
   const startMeetingInvite = useCallback(async () => {
     setError(null);
@@ -993,6 +1120,14 @@ export default function VoiceCallPage() {
     return () => {
       dataRef.current?.close();
       peerRef.current?.close();
+      meetSignalCancelRef.current?.();
+      meetPeerConnectionsRef.current.forEach((connection) => connection.close());
+      meetPeerConnectionsRef.current.clear();
+      meetRemoteAudioRef.current.forEach((audio) => {
+        audio.srcObject = null;
+        audio.remove();
+      });
+      meetRemoteAudioRef.current.clear();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       stopWorkingCue(false);
       stopBackgroundCallSupport();
