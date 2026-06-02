@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -14,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_DIR = REPO_ROOT / "web"
 
 
-def test_meet_wake_detection_accepts_direct_rolly_address():
+def test_meet_wake_detection_requires_hey_rolly():
     if not shutil.which("node"):
         pytest.skip("node is not installed")
     if not (WEB_DIR / "node_modules" / "typescript").exists():
@@ -34,8 +33,8 @@ const { isRollyWakePhrase } = module.exports;
 const cases = [
   ['Hey Rolly, summarize this', true],
   ['hey rowley can you hear me', true],
-  ['Rolly, can you hear me?', true],
-  ['Rollie should we ship?', true],
+  ['Rolly, can you hear me?', false],
+  ['Rollie should we ship?', false],
   ['Hey, can you hear me?', false],
   ['we should ask rolly later', false]
 ];
@@ -47,6 +46,15 @@ if (failures.length) {
 """
     result = subprocess.run(["node", "-e", script, str(WEB_DIR)], text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_start_meeting_invite_starts_meet_call_path():
+    source = (WEB_DIR / "src/pages/VoiceCallPage.tsx").read_text(encoding="utf-8")
+
+    assert "const startMeetingInvite = useCallback" in source
+    assert "await startCall(\"meet\")" in source
+    assert "onClick={startMeetingInvite}" in source
+    assert "onClick={() => void startCall()}" in source
 
 
 @pytest.fixture()

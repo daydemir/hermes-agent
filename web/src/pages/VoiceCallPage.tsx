@@ -428,21 +428,6 @@ export default function VoiceCallPage() {
     [addLog, muted, persistTranscript, refreshInputDevices, startMicMonitor, status],
   );
 
-  const createInvite = useCallback(async () => {
-    setError(null);
-    try {
-      const resp = await api.createVoiceMeetInvite({ call_id: callIdRef.current, user: speaker });
-      setMode("meet");
-      setInviteUrl(resp.invite_url);
-      addLog("system", `Meet invite ready: ${resp.invite_url}`);
-      persistTranscript("system", `Meet invite created: ${resp.invite_url}`, "meet_invite_created", { mode: "meet" });
-    } catch (exc) {
-      const message = exc instanceof Error ? exc.message : String(exc);
-      setError(`Meet invite unavailable: ${message}`);
-      addLog("error", `Meet invite unavailable: ${message}`);
-    }
-  }, [addLog, persistTranscript, speaker]);
-
   const stopCall = useCallback((reason = "user") => {
     const endStartedAt = Date.now();
     const durationMs = callStartedAtRef.current === null ? 0 : endStartedAt - callStartedAtRef.current;
@@ -814,7 +799,8 @@ export default function VoiceCallPage() {
     [addLog, finishResponse, flushPendingHandoffs, handleToolCall, mode, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue],
   );
 
-  const startCall = useCallback(async () => {
+  const startCall = useCallback(async (overrideMode?: "solo" | "meet") => {
+    const callMode = overrideMode ?? mode;
     if (!speaker) {
       setError("Pick a dashboard user first, then start the call.");
       addLog("error", "Pick a dashboard user first, then start the call.");
@@ -842,11 +828,11 @@ export default function VoiceCallPage() {
     setVoiceTasks([]);
     handledToolCallsRef.current = new Set();
     meetInvokedRef.current = false;
-    setRollyListenState(mode === "meet" ? "Silent until “Hey Rolly”" : "Always on");
+    setRollyListenState(callMode === "meet" ? "Silent until “Hey Rolly”" : "Always on");
     persistTranscript("system", "Call started.", "call_start", {
       user_agent: navigator.userAgent,
       selected_input_id: selectedInputId || "browser-default",
-      mode,
+      mode: callMode,
     });
     const isCurrentCall = () => callSeqRef.current === callSeq;
     setError(null);
@@ -902,24 +888,24 @@ export default function VoiceCallPage() {
       dataChannel.onopen = () => {
         setStatus("live");
         playVoiceCue("live");
-        const liveMessage = mode === "meet"
+        const liveMessage = callMode === "meet"
           ? "Meet mode live. Rolly is silent until someone says “Hey Rolly.”"
           : "Live. Talk normally; Rolly can answer by voice and call tools.";
         addLog("system", liveMessage);
-        persistTranscript("system", "Realtime data channel live.", "call_live", { mode });
+        persistTranscript("system", "Realtime data channel live.", "call_live", { mode: callMode });
       };
       dataChannel.onmessage = handleRealtimeEvent;
       dataChannel.onerror = () => addLog("error", "Realtime data channel error.");
 
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
-      persistTranscript("system", "WebRTC offer created; requesting Realtime answer.", "webrtc_offer_created", { mode });
+      persistTranscript("system", "WebRTC offer created; requesting Realtime answer.", "webrtc_offer_created", { mode: callMode });
 
-      const answerSdp = await api.createVoiceCall(offer.sdp || "", speaker, mode);
+      const answerSdp = await api.createVoiceCall(offer.sdp || "", speaker, callMode);
       if (!isCurrentCall()) return;
-      persistTranscript("system", "Realtime SDP answer received.", "realtime_answer_received", { mode });
+      persistTranscript("system", "Realtime SDP answer received.", "realtime_answer_received", { mode: callMode });
       await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
-      persistTranscript("system", "Realtime remote description applied.", "webrtc_remote_description_set", { mode });
+      persistTranscript("system", "Realtime remote description applied.", "webrtc_remote_description_set", { mode: callMode });
     } catch (exc) {
       const message = exc instanceof Error ? exc.message : String(exc);
       setError(message);
@@ -928,6 +914,22 @@ export default function VoiceCallPage() {
       stopCall("setup_error");
     }
   }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
+
+  const startMeetingInvite = useCallback(async () => {
+    setError(null);
+    try {
+      const resp = await api.createVoiceMeetInvite({ call_id: callIdRef.current, user: speaker });
+      setMode("meet");
+      setInviteUrl(resp.invite_url);
+      addLog("system", `Meet invite ready: ${resp.invite_url}`);
+      persistTranscript("system", `Meet invite created: ${resp.invite_url}`, "meet_invite_created", { mode: "meet" });
+      await startCall("meet");
+    } catch (exc) {
+      const message = exc instanceof Error ? exc.message : String(exc);
+      setError(`Meet invite unavailable: ${message}`);
+      addLog("error", `Meet invite unavailable: ${message}`);
+    }
+  }, [addLog, persistTranscript, speaker, startCall]);
 
   const toggleMute = useCallback(() => {
     const next = !muted;
@@ -1003,8 +1005,8 @@ export default function VoiceCallPage() {
           </div>
           <div className="flex flex-wrap gap-2">
             {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={enableMicList}>Enable mic list</Button> : null}
-            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={createInvite}>Start meeting / invite</Button> : null}
-            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={startCall} disabled={!speaker}>Start call</Button> : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={startMeetingInvite} disabled={!speaker}>Start meeting / invite</Button> : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => void startCall()} disabled={!speaker}>Start call</Button> : null}
             {live ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
             {live || busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => stopCall()}>End call</Button> : null}
           </div>
