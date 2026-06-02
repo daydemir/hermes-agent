@@ -8,6 +8,8 @@ type CallStatus = "idle" | "requesting" | "connecting" | "live" | "ending" | "er
 
 type LogKind = "system" | "user" | "rolly" | "tool" | "error";
 
+const VOICE_ACTION_BUTTON_CLASS = "leading-tight text-sm tracking-[0.12em] sm:text-base sm:tracking-[0.2em]";
+
 type WakeLockSentinelLike = EventTarget & {
   release: () => Promise<void>;
   released?: boolean;
@@ -444,21 +446,32 @@ export default function VoiceCallPage() {
     }
   }, [addLog, persistTranscript, speaker]);
 
-  const stopCall = useCallback(() => {
+  const stopCall = useCallback((reason = "user") => {
     const endStartedAt = Date.now();
     const durationMs = callStartedAtRef.current === null ? 0 : endStartedAt - callStartedAtRef.current;
     callSeqRef.current += 1;
+    const statusAtEnd = status;
     setStatus((current) => (current === "idle" ? current : "ending"));
     stopWorkingCue(false);
     stopBackgroundCallSupport();
-    persistTranscript("system", "Call ended by user; microphone released.", "call_end", {
+    const endText = reason === "setup_error"
+      ? "Call ended after setup error; microphone released."
+      : "Call ended by user; microphone released.";
+    persistTranscript("system", endText, "call_end", {
       duration_ms: durationMs,
       pending_saves_at_end: pendingTranscriptSavesRef.current.length,
       log_entries: logs.length,
+      status_at_end: statusAtEnd,
+      reason,
     });
     if (dataRef.current) {
       dataRef.current.onerror = null;
+      dataRef.current.onmessage = null;
       dataRef.current.onopen = null;
+    }
+    if (peerRef.current) {
+      peerRef.current.onconnectionstatechange = null;
+      peerRef.current.ontrack = null;
     }
     dataRef.current?.close();
     peerRef.current?.close();
@@ -483,7 +496,7 @@ export default function VoiceCallPage() {
     Promise.allSettled([...pendingTranscriptSavesRef.current]).then(() => setSaveStatus("Call saved"));
     setStatus("idle");
     addLog("system", `Call ended; saved end marker (${(durationMs / 1000).toFixed(1)}s).`);
-  }, [addLog, logs.length, persistTranscript, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue]);
+  }, [addLog, logs.length, persistTranscript, status, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue]);
 
   const sendRealtimeEvent = useCallback((payload: Record<string, unknown>) => {
     const channel = dataRef.current;
@@ -903,16 +916,19 @@ export default function VoiceCallPage() {
 
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
+      persistTranscript("system", "WebRTC offer created; requesting Realtime answer.", "webrtc_offer_created", { mode });
 
       const answerSdp = await api.createVoiceCall(offer.sdp || "", speaker, mode);
       if (!isCurrentCall()) return;
+      persistTranscript("system", "Realtime SDP answer received.", "realtime_answer_received", { mode });
       await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      persistTranscript("system", "Realtime remote description applied.", "webrtc_remote_description_set", { mode });
     } catch (exc) {
       const message = exc instanceof Error ? exc.message : String(exc);
       setError(message);
       setStatus("error");
       addLog("error", message);
-      stopCall();
+      stopCall("setup_error");
     }
   }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
 
@@ -989,11 +1005,11 @@ export default function VoiceCallPage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {!live && !busy ? <Button onClick={enableMicList}>Enable mic list</Button> : null}
-            {!live && !busy ? <Button onClick={createInvite}>Start meeting / invite</Button> : null}
-            {!live && !busy ? <Button onClick={startCall} disabled={!speaker}>Start call</Button> : null}
-            {live ? <Button onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
-            {live || busy ? <Button onClick={stopCall}>End call</Button> : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={enableMicList}>Enable mic list</Button> : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={createInvite}>Start meeting / invite</Button> : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={startCall} disabled={!speaker}>Start call</Button> : null}
+            {live ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
+            {live || busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => stopCall()}>End call</Button> : null}
           </div>
         </div>
         <div className="mt-4 flex flex-wrap gap-2 text-xs uppercase tracking-[0.12em] text-text-secondary">
@@ -1018,10 +1034,10 @@ export default function VoiceCallPage() {
         <div className="mt-3 text-xs uppercase tracking-[0.12em] text-text-secondary">
           <div className="mb-3">USER: {speakerLabel}</div>
           <div className="mb-3 flex gap-2">
-            <Button disabled={live || busy} onClick={() => setMode("solo")}>
+            <Button className={VOICE_ACTION_BUTTON_CLASS} disabled={live || busy} onClick={() => setMode("solo")}>
               1:1 Rolly
             </Button>
-            <Button disabled={live || busy} onClick={() => setMode("meet")}>
+            <Button className={VOICE_ACTION_BUTTON_CLASS} disabled={live || busy} onClick={() => setMode("meet")}>
               Meet: Hey Rolly
             </Button>
           </div>

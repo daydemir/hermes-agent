@@ -238,6 +238,22 @@
     catch (_e) { return null; }
   }
 
+  function readPathTaskId() {
+    try {
+      const match = window.location.pathname.match(/\/kanban\/cards\/([^/?#]+)/);
+      return match ? decodeURIComponent(match[1]) : null;
+    } catch (_e) { return null; }
+  }
+
+  function writeCardPath(taskId) {
+    try {
+      const url = new URL(window.location.href);
+      url.pathname = taskId ? `/kanban/cards/${encodeURIComponent(taskId)}` : "/kanban";
+      url.searchParams.delete("task");
+      window.history.pushState({}, "", url.toString());
+    } catch (_e) { /* ignore */ }
+  }
+
   function writeUrlParams(patch) {
     try {
       const url = new URL(window.location.href);
@@ -521,7 +537,7 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
-    const [selectedTaskId, setSelectedTaskId] = useState(() => readUrlParam("task"));
+    const [selectedTaskId, setSelectedTaskId] = useState(() => readPathTaskId() || readUrlParam("task"));
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
@@ -531,11 +547,11 @@
     const openTask = useCallback(function (taskId) {
       if (!taskId) return;
       setSelectedTaskId(taskId);
-      writeUrlParams({ task: taskId });
+      writeCardPath(taskId);
     }, []);
     const closeTask = useCallback(function () {
       setSelectedTaskId(null);
-      writeUrlParams({ task: null });
+      writeCardPath(null);
     }, []);
     // Per-task event counter incremented whenever the WS stream reports
     // a new event for that task id. TaskDrawer useEffect-depends on its
@@ -551,7 +567,7 @@
 
     useEffect(function () {
       function onPopState() {
-        setSelectedTaskId(readUrlParam("task"));
+        setSelectedTaskId(readPathTaskId() || readUrlParam("task"));
       }
       window.addEventListener("popstate", onPopState);
       return function () { window.removeEventListener("popstate", onPopState); };
@@ -3403,7 +3419,7 @@
         tab("chat", tx(i18n, "rollyChat", "Rolly Chat")),
         tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
       ),
-      activePane === "chat" ? h(RollyChatSection, { task: t }) : null,
+      activePane === "chat" ? h(RollyChatSection, { task: t, boardSlug: props.boardSlug }) : null,
       activePane === "terminal" ? h(CardWorkspaceSection, {
         task: t,
         boardSlug: props.boardSlug,

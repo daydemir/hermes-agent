@@ -600,8 +600,8 @@ def _build_rolly_chat_prompt(task_id: str, title: str | None) -> str:
     )
 
 
-def _tui_shell_command() -> str:
-    """Return a shell command that launches the production Hermes TUI."""
+def _tui_shell_command(*, task_id: str | None = None, board: str | None = None) -> str:
+    """Return a shell command that launches a production, card-scoped Hermes TUI."""
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
@@ -610,6 +610,11 @@ def _tui_shell_command() -> str:
         "HERMES_TUI_INLINE": "1",
         "HERMES_TUI_DISABLE_MOUSE": "1",
     }
+    if task_id:
+        env["HERMES_SESSION_SOURCE"] = f"kanban-card:{task_id}"
+        env["HERMES_KANBAN_TASK"] = task_id
+    if board:
+        env["HERMES_KANBAN_BOARD"] = board
     env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     return f"cd {shlex.quote(str(cwd))} && {env_prefix} " + " ".join(shlex.quote(part) for part in argv)
 
@@ -678,7 +683,7 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
     if not session_exists:
         proc = _run_tmux([
             "new-session", "-d", "-s", session_name, "-n", "rolly-chat", "-c", workspace_path,
-            _tui_shell_command(),
+            _tui_shell_command(task_id=task_id, board=board),
         ])
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "tmux failed").strip()
@@ -690,7 +695,7 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
         seeded_rolly = True
     else:
         if not _tmux_has_window(rolly_target):
-            proc = _run_tmux(["new-window", "-t", session_name, "-n", "rolly-chat", "-c", workspace_path, _tui_shell_command()])
+            proc = _run_tmux(["new-window", "-t", session_name, "-n", "rolly-chat", "-c", workspace_path, _tui_shell_command(task_id=task_id, board=board)])
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "tmux rolly-chat window failed").strip()
                 raise HTTPException(status_code=500, detail=detail[:500])

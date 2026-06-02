@@ -184,7 +184,7 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
         return Result(0)
 
     monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
-    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda: "hermes --tui")
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda **_kwargs: "hermes --tui")
 
     r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
     assert r.status_code == 200, r.text
@@ -201,6 +201,27 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
         "tmux", "new-session", "-d", "-s", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
     ]
     assert calls[2][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())]
+
+
+def test_card_tui_shell_command_sets_card_session_env(client):
+    mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    command = mod._tui_shell_command(task_id="t_card_123", board="/tmp/kanban board.db")
+
+    assert "HERMES_SESSION_SOURCE=kanban-card:t_card_123" in command
+    assert "HERMES_KANBAN_TASK=t_card_123" in command
+    assert "HERMES_KANBAN_BOARD='/tmp/kanban board.db'" in command
+
+
+def test_dashboard_rolly_chat_passes_board_slug_to_tmux_session():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "h(RollyChatSection, { task: t, boardSlug: props.boardSlug })" in js
+    assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug)" in js
+    assert "readPathTaskId() || readUrlParam(\"task\")" in js
+    assert "url.pathname = taskId ? `/kanban/cards/${encodeURIComponent(taskId)}` : \"/kanban\"" in js
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):

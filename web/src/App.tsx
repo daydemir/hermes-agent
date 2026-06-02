@@ -336,6 +336,14 @@ function buildRoutes(
       path: m.tab.path,
       element: <PluginPage name={m.name} />,
     });
+    const pluginBasePath = m.tab.path.replace(/\/$/, "");
+    if (pluginBasePath) {
+      routes.push({
+        key: `plugin:${m.name}:wildcard`,
+        path: `${pluginBasePath}/*`,
+        element: <PluginPage name={m.name} />,
+      });
+    }
   }
 
   for (const m of manifests) {
@@ -389,6 +397,10 @@ export default function App() {
   const isChromelessChatRoute =
     isChatRoute && new URLSearchParams(search).get("embed") === "1";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
+  const [chatHostMounted, setChatHostMounted] = useState(() => isChatRoute);
+  useEffect(() => {
+    if (isChatRoute) setChatHostMounted(true);
+  }, [isChatRoute]);
   const [rollyUser, setRollyUser] = useState(() => getRollyUserSlug());
   const selectRollyUser = useCallback((slug: string) => {
     const selected = setRollyUserSlug(slug);
@@ -795,6 +807,7 @@ export default function App() {
                 </Routes>
 
                 {embeddedChat &&
+                  chatHostMounted &&
                   !chatOverriddenByPlugin &&
                   (pluginsLoading ? (
                     isChatRoute ? (

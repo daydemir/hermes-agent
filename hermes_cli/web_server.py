@@ -863,9 +863,6 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
             },
         ],
         "tool_choice": "auto",
-        "metadata": {
-            "speaking_rate": speaking_rate,
-        },
         "audio": {
             "input": {
                 "transcription": {"model": "gpt-4o-mini-transcribe"},

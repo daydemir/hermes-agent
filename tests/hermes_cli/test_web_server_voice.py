@@ -358,10 +358,8 @@ def test_voice_session_config_reports_speaking_rate_support(voice_client, monkey
     config = web_server._voice_session_config(user="deniz")
 
     assert "slightly faster" in config["instructions"]
-    rate = config["metadata"]["speaking_rate"]
-    assert rate["requested"] == 1.08
-    assert rate["explicit_control_supported"] is False
-    assert rate["provider"] == "openai-realtime-webrtc"
+    assert "configured rate preference 1.08x" in config["instructions"]
+    assert "metadata" not in config
 
 
 def test_voice_invite_requires_feature_flag(voice_client, monkeypatch):
