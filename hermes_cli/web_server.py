@@ -1029,6 +1029,147 @@ async def create_voice_meet_invite(payload: VoiceMeetInviteRequest, request: Req
     }
 
 
+
+
+# ---------------------------------------------------------------------------
+# Rolly Voice Meet signaling (browser peer mesh)
+# ---------------------------------------------------------------------------
+# V1 decision: for the intended 2-4 person family/cofounder calls, a WebRTC
+# peer mesh keeps media end-to-end between browsers and avoids running a media
+# server on the Mac mini. The dashboard server only authenticates participants
+# and relays SDP/ICE signaling over WebSocket. STUN/TURN/SFU can be added when
+# real-world NAT or participant count proves this insufficient; no audio is
+# recorded or proxied here.
+_VOICE_MEET_ROOMS: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_VOICE_MEET_LOCK = asyncio.Lock()
+_VOICE_MEET_MAX_PEERS = int(os.getenv("HERMES_VOICE_MEET_MAX_PEERS", "4"))
+
+
+def _voice_sanitize_call_id(call_id: str | None) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", call_id or "").strip("._")
+
+
+def _voice_meet_public_participant(peer_id: str, participant: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "peer_id": peer_id,
+        "user": participant.get("user") or "unknown dashboard user",
+        "joined_at": participant.get("joined_at"),
+    }
+
+
+async def _voice_meet_send(ws: WebSocket, payload: Dict[str, Any]) -> None:
+    await ws.send_text(json.dumps(payload, separators=(",", ":"), default=str))
+
+
+async def _voice_meet_broadcast(call_id: str, payload: Dict[str, Any], *, exclude_peer_id: str | None = None) -> None:
+    targets: list[WebSocket] = []
+    async with _VOICE_MEET_LOCK:
+        room = _VOICE_MEET_ROOMS.get(call_id) or {}
+        for peer_id, participant in room.items():
+            if peer_id == exclude_peer_id:
+                continue
+            ws = participant.get("ws")
+            if isinstance(ws, WebSocket):
+                targets.append(ws)
+    for target in targets:
+        try:
+            await _voice_meet_send(target, payload)
+        except Exception:
+            pass
+
+
+@app.websocket("/api/voice/meet/ws")
+async def voice_meet_ws(ws: WebSocket) -> None:
+    """Authenticated WebSocket signaling for dashboard Voice Meet peer mesh."""
+    if not _ws_request_is_allowed(ws):
+        await ws.close(code=4403)
+        return
+    if not _ws_auth_ok(ws):
+        await ws.close(code=4401)
+        return
+
+    call_id = _voice_sanitize_call_id(ws.query_params.get("call_id"))
+    if not call_id:
+        await ws.close(code=4400)
+        return
+    if _voice_call_has_ended(call_id):
+        await ws.close(code=4409)
+        return
+
+    user = _voice_speaker_label(ws.query_params.get("user"))
+    peer_id = f"vp_{uuid.uuid4().hex[:12]}"
+    joined_at = datetime.now(timezone.utc).isoformat()
+    await ws.accept()
+
+    async with _VOICE_MEET_LOCK:
+        room = _VOICE_MEET_ROOMS.setdefault(call_id, {})
+        if len(room) >= _VOICE_MEET_MAX_PEERS:
+            await _voice_meet_send(ws, {"type": "error", "error": "room_full", "max_peers": _VOICE_MEET_MAX_PEERS})
+            await ws.close(code=4429)
+            return
+        existing = [_voice_meet_public_participant(pid, p) for pid, p in room.items()]
+        room[peer_id] = {"ws": ws, "user": user, "joined_at": joined_at}
+
+    await _voice_meet_send(
+        ws,
+        {
+            "type": "joined",
+            "call_id": call_id,
+            "peer_id": peer_id,
+            "user": user,
+            "peers": existing,
+            "topology": "mesh",
+            "max_peers": _VOICE_MEET_MAX_PEERS,
+        },
+    )
+    await _voice_meet_broadcast(
+        call_id,
+        {"type": "peer_joined", "peer_id": peer_id, "user": user, "joined_at": joined_at},
+        exclude_peer_id=peer_id,
+    )
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            msg_type = str(message.get("type") or "")
+            target_peer_id = str(message.get("to") or "")
+            if msg_type not in {"offer", "answer", "ice"} or not target_peer_id:
+                continue
+            async with _VOICE_MEET_LOCK:
+                target = (_VOICE_MEET_ROOMS.get(call_id) or {}).get(target_peer_id)
+                target_ws = target.get("ws") if target else None
+            if isinstance(target_ws, WebSocket):
+                await _voice_meet_send(
+                    target_ws,
+                    {
+                        "type": msg_type,
+                        "call_id": call_id,
+                        "from": peer_id,
+                        "user": user,
+                        "payload": message.get("payload"),
+                    },
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        removed = False
+        async with _VOICE_MEET_LOCK:
+            room = _VOICE_MEET_ROOMS.get(call_id)
+            if room and peer_id in room:
+                room.pop(peer_id, None)
+                removed = True
+                if not room:
+                    _VOICE_MEET_ROOMS.pop(call_id, None)
+        if removed:
+            await _voice_meet_broadcast(call_id, {"type": "peer_left", "peer_id": peer_id, "user": user}, exclude_peer_id=peer_id)
+
+
 @app.get("/api/voice/context")
 async def get_voice_context(request: Request, debug: bool = False):
     user = _voice_auth_context(request)

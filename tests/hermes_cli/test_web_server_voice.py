@@ -437,3 +437,57 @@ def test_voice_call_end_marks_task_and_sends_single_post_call_notification(voice
     assert sent == ["vt_done"]
     assert task.to_dict()["call_ended"] is True
     assert task.to_dict()["post_call_notification"]["status"] == "sent"
+
+
+
+def test_voice_meet_websocket_relays_signaling_between_peers(voice_client):
+    client, web_server = voice_client
+    token = web_server._SESSION_TOKEN
+
+    with client.websocket_connect(f"/api/voice/meet/ws?token={token}&call_id=mesh-call&user=deniz") as deniz_ws:
+        deniz_joined = deniz_ws.receive_json()
+        assert deniz_joined["type"] == "joined"
+        assert deniz_joined["peers"] == []
+        deniz_peer = deniz_joined["peer_id"]
+
+        with client.websocket_connect(f"/api/voice/meet/ws?token={token}&call_id=mesh-call&user=arman") as arman_ws:
+            arman_joined = arman_ws.receive_json()
+            assert arman_joined["type"] == "joined"
+            assert arman_joined["topology"] == "mesh"
+            assert arman_joined["peers"] == [{"peer_id": deniz_peer, "user": "deniz", "joined_at": arman_joined["peers"][0]["joined_at"]}]
+            arman_peer = arman_joined["peer_id"]
+
+            deniz_notice = deniz_ws.receive_json()
+            assert deniz_notice["type"] == "peer_joined"
+            assert deniz_notice["peer_id"] == arman_peer
+            assert deniz_notice["user"] == "arman"
+
+            arman_ws.send_json({"type": "offer", "to": deniz_peer, "payload": {"type": "offer", "sdp": "fake-offer"}})
+            relayed = deniz_ws.receive_json()
+            assert relayed == {
+                "type": "offer",
+                "call_id": "mesh-call",
+                "from": arman_peer,
+                "user": "arman",
+                "payload": {"type": "offer", "sdp": "fake-offer"},
+            }
+
+            deniz_ws.send_json({"type": "answer", "to": arman_peer, "payload": {"type": "answer", "sdp": "fake-answer"}})
+            relayed_answer = arman_ws.receive_json()
+            assert relayed_answer["type"] == "answer"
+            assert relayed_answer["from"] == deniz_peer
+            assert relayed_answer["payload"]["sdp"] == "fake-answer"
+
+
+def test_voice_meet_websocket_requires_auth(_isolate_hermes_home):
+    try:
+        from starlette.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi/starlette not installed")
+
+    import hermes_cli.web_server as web_server
+
+    client = TestClient(web_server.app)
+    with pytest.raises(Exception):
+        with client.websocket_connect("/api/voice/meet/ws?call_id=no-auth&user=deniz"):
+            pass

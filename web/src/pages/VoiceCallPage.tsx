@@ -1,13 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
-import { api, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
+import { HERMES_BASE_PATH, api, buildWsAuthParam, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
 import { getRollyUser, getRollyUserSlug } from "@/lib/rollyIdentity";
 import { isRollyWakePhrase } from "@/lib/voiceMeet";
 
 type CallStatus = "idle" | "requesting" | "connecting" | "live" | "ending" | "error";
 
 type LogKind = "system" | "user" | "rolly" | "tool" | "error";
+
+interface MeetParticipant {
+  peer_id: string;
+  user: string;
+  joined_at?: string;
+}
+
+type MeetSignal =
+  | { type: "joined"; peer_id: string; peers?: MeetParticipant[]; topology?: string; max_peers?: number }
+  | { type: "peer_joined"; peer_id: string; user?: string; joined_at?: string }
+  | { type: "peer_left"; peer_id: string; user?: string }
+  | { type: "offer" | "answer"; from: string; user?: string; payload: RTCSessionDescriptionInit }
+  | { type: "ice"; from: string; user?: string; payload: RTCIceCandidateInit | null }
+  | { type: "error"; error?: string; max_peers?: number };
 
 const VOICE_ACTION_BUTTON_CLASS = "leading-tight text-sm tracking-[0.12em] sm:text-base sm:tracking-[0.2em]";
 
@@ -69,9 +83,17 @@ export default function VoiceCallPage() {
   ]);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataRef = useRef<RTCDataChannel | null>(null);
+  const meetWsRef = useRef<WebSocket | null>(null);
+  const meetPeerIdRef = useRef<string | null>(null);
+  const meetPeersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const meetAudioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const meetAudioContextRef = useRef<AudioContext | null>(null);
+  const meetMixedDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const meetLocalSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const meetRollySourceRefs = useRef<MediaStreamAudioSourceNode[]>([]);
   const cueAudioContextRef = useRef<AudioContext | null>(null);
   const backgroundAudioContextRef = useRef<AudioContext | null>(null);
   const backgroundOscillatorRef = useRef<OscillatorNode | null>(null);
@@ -96,6 +118,7 @@ export default function VoiceCallPage() {
   const [inviteUrl, setInviteUrl] = useState<string | null>(null);
   const [invitePending, setInvitePending] = useState(false);
   const [voiceTasks, setVoiceTasks] = useState<VoiceTaskResponse[]>([]);
+  const [meetParticipants, setMeetParticipants] = useState<MeetParticipant[]>([]);
   const [rollyListenState, setRollyListenState] = useState("Always on");
   const handledToolCallsRef = useRef<Set<string>>(new Set());
   const activeCallModeRef = useRef<"solo" | "meet">("solo");
@@ -421,6 +444,27 @@ export default function VoiceCallPage() {
     [addLog, muted, persistTranscript, refreshInputDevices, startMicMonitor, status],
   );
 
+  const stopMeetSignaling = useCallback(() => {
+    meetWsRef.current?.close();
+    meetWsRef.current = null;
+    meetPeerIdRef.current = null;
+    meetPeersRef.current.forEach((pc) => pc.close());
+    meetPeersRef.current.clear();
+    meetAudioElsRef.current.forEach((el) => {
+      if (el.srcObject instanceof MediaStream) el.srcObject.getTracks().forEach((track) => track.stop());
+      el.remove();
+    });
+    meetAudioElsRef.current.clear();
+    meetLocalSourceRef.current?.disconnect();
+    meetLocalSourceRef.current = null;
+    meetRollySourceRefs.current.forEach((source) => source.disconnect());
+    meetRollySourceRefs.current = [];
+    void meetAudioContextRef.current?.close().catch(() => undefined);
+    meetAudioContextRef.current = null;
+    meetMixedDestinationRef.current = null;
+    setMeetParticipants([]);
+  }, []);
+
   const stopCall = useCallback((reason = "user") => {
     const endStartedAt = Date.now();
     const durationMs = callStartedAtRef.current === null ? 0 : endStartedAt - callStartedAtRef.current;
@@ -429,6 +473,7 @@ export default function VoiceCallPage() {
     setStatus((current) => (current === "idle" ? current : "ending"));
     stopWorkingCue(false);
     stopBackgroundCallSupport();
+    stopMeetSignaling();
     const endText = reason === "setup_error"
       ? "Call ended after setup error; microphone released."
       : "Call ended by user; microphone released.";
@@ -471,7 +516,7 @@ export default function VoiceCallPage() {
     Promise.allSettled([...pendingTranscriptSavesRef.current]).then(() => setSaveStatus("Call saved"));
     setStatus("idle");
     addLog("system", `Call ended; saved end marker (${(durationMs / 1000).toFixed(1)}s).`);
-  }, [addLog, logs.length, persistTranscript, status, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue]);
+  }, [addLog, logs.length, persistTranscript, status, stopBackgroundCallSupport, stopMeetSignaling, stopMicMonitor, stopWorkingCue]);
 
   const sendRealtimeEvent = useCallback((payload: Record<string, unknown>) => {
     const channel = dataRef.current;
@@ -797,6 +842,166 @@ export default function VoiceCallPage() {
     [addLog, finishResponse, flushPendingHandoffs, handleToolCall, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue],
   );
 
+  const ensureMeetMixedStream = useCallback((localStream: MediaStream): MediaStream | null => {
+    const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return null;
+    if (!meetAudioContextRef.current || meetAudioContextRef.current.state === "closed") {
+      meetAudioContextRef.current = new AudioContextCtor();
+    }
+    const context = meetAudioContextRef.current;
+    void context.resume().catch(() => undefined);
+    if (!meetMixedDestinationRef.current) {
+      meetMixedDestinationRef.current = context.createMediaStreamDestination();
+    }
+    meetLocalSourceRef.current?.disconnect();
+    meetLocalSourceRef.current = context.createMediaStreamSource(localStream);
+    meetLocalSourceRef.current.connect(meetMixedDestinationRef.current);
+    return meetMixedDestinationRef.current.stream;
+  }, []);
+
+  const addRollyAudioToMeet = useCallback((stream: MediaStream) => {
+    const context = meetAudioContextRef.current;
+    const destination = meetMixedDestinationRef.current;
+    if (!context || !destination || activeCallModeRef.current !== "meet") return;
+    try {
+      const source = context.createMediaStreamSource(stream);
+      source.connect(destination);
+      meetRollySourceRefs.current.push(source);
+      addLog("system", "Rolly audio is being shared into the Meet mesh.");
+    } catch (exc) {
+      addLog("error", `Could not share Rolly audio into Meet mesh: ${exc instanceof Error ? exc.message : String(exc)}`);
+    }
+  }, [addLog]);
+
+  const sendMeetSignal = useCallback((payload: Record<string, unknown>) => {
+    const ws = meetWsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  }, []);
+
+  const closeMeetPeer = useCallback((peerId: string) => {
+    meetPeersRef.current.get(peerId)?.close();
+    meetPeersRef.current.delete(peerId);
+    const audio = meetAudioElsRef.current.get(peerId);
+    if (audio) {
+      if (audio.srcObject instanceof MediaStream) audio.srcObject.getTracks().forEach((track) => track.stop());
+      audio.remove();
+    }
+    meetAudioElsRef.current.delete(peerId);
+    setMeetParticipants((prev) => prev.filter((p) => p.peer_id !== peerId));
+  }, []);
+
+  const getOrCreateMeetPeer = useCallback((peerId: string, user = "unknown") => {
+    const existing = meetPeersRef.current.get(peerId);
+    if (existing) return existing;
+    const mixedStream = meetMixedDestinationRef.current?.stream;
+    if (!mixedStream) throw new Error("Meet mixed audio stream is not ready.");
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    meetPeersRef.current.set(peerId, pc);
+    mixedStream.getAudioTracks().forEach((track) => pc.addTrack(track, mixedStream));
+    pc.onicecandidate = (event) => {
+      sendMeetSignal({ type: "ice", to: peerId, payload: event.candidate ? event.candidate.toJSON() : null });
+    };
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
+      let audio = meetAudioElsRef.current.get(peerId);
+      if (!audio) {
+        audio = document.createElement("audio");
+        audio.autoplay = true;
+        audio.setAttribute("playsinline", "true");
+        audio.dataset.voiceMeetPeer = peerId;
+        document.body.appendChild(audio);
+        meetAudioElsRef.current.set(peerId, audio);
+      }
+      audio.srcObject = stream;
+      void audio.play().catch(() => undefined);
+    };
+    pc.onconnectionstatechange = () => {
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        addLog("system", `Meet peer ${user} ${pc.connectionState}.`);
+      }
+    };
+    return pc;
+  }, [addLog, sendMeetSignal]);
+
+  const startMeetOffer = useCallback(async (peerId: string, user = "unknown") => {
+    const pc = getOrCreateMeetPeer(peerId, user);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendMeetSignal({ type: "offer", to: peerId, payload: offer });
+  }, [getOrCreateMeetPeer, sendMeetSignal]);
+
+  const handleMeetSignal = useCallback(async (message: MeetSignal) => {
+    if (message.type === "joined") {
+      meetPeerIdRef.current = message.peer_id;
+      const peers = message.peers ?? [];
+      setMeetParticipants(peers);
+      addLog("system", `Meet signaling live (${message.topology ?? "mesh"}); ${peers.length + 1}/${message.max_peers ?? 4} participants.`);
+      for (const peer of peers) await startMeetOffer(peer.peer_id, peer.user);
+      return;
+    }
+    if (message.type === "peer_joined") {
+      if (message.peer_id !== meetPeerIdRef.current) {
+        setMeetParticipants((prev) => [...prev.filter((p) => p.peer_id !== message.peer_id), { peer_id: message.peer_id, user: message.user || "unknown", joined_at: message.joined_at }]);
+        addLog("system", `${message.user || "Someone"} joined the Meet.`);
+      }
+      return;
+    }
+    if (message.type === "peer_left") {
+      addLog("system", `${message.user || "Someone"} left the Meet.`);
+      closeMeetPeer(message.peer_id);
+      return;
+    }
+    if (message.type === "error") {
+      addLog("error", `Meet signaling error: ${message.error || "unknown"}`);
+      return;
+    }
+    if (message.from === meetPeerIdRef.current) return;
+    if (message.type === "offer") {
+      const pc = getOrCreateMeetPeer(message.from, message.user);
+      await pc.setRemoteDescription(message.payload);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sendMeetSignal({ type: "answer", to: message.from, payload: answer });
+      return;
+    }
+    if (message.type === "answer") {
+      const pc = meetPeersRef.current.get(message.from);
+      if (pc) await pc.setRemoteDescription(message.payload);
+      return;
+    }
+    if (message.type === "ice") {
+      const pc = meetPeersRef.current.get(message.from);
+      if (pc && message.payload) await pc.addIceCandidate(message.payload);
+    }
+  }, [addLog, closeMeetPeer, getOrCreateMeetPeer, sendMeetSignal, startMeetOffer]);
+
+  const startMeetSignaling = useCallback(async (localStream: MediaStream) => {
+    const mixedStream = ensureMeetMixedStream(localStream);
+    if (!mixedStream) {
+      addLog("error", "Meet peer audio unavailable: browser AudioContext is not available.");
+      return;
+    }
+    const [authName, authValue] = await buildWsAuthParam();
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const qs = new URLSearchParams({ [authName]: authValue, call_id: callIdRef.current, user: speaker });
+    const ws = new WebSocket(`${proto}//${window.location.host}${HERMES_BASE_PATH}/api/voice/meet/ws?${qs.toString()}`);
+    meetWsRef.current = ws;
+    ws.onmessage = (event) => {
+      try {
+        void handleMeetSignal(JSON.parse(event.data) as MeetSignal);
+      } catch {
+        // Ignore malformed signaling frames; media keeps flowing on existing peers.
+      }
+    };
+    ws.onclose = (event) => {
+      if (event.code !== 1000 && status !== "ending" && status !== "idle") {
+        addLog("error", `Meet signaling disconnected (${event.code || "closed"}).`);
+      }
+    };
+    ws.onerror = () => addLog("error", "Meet signaling WebSocket error.");
+  }, [addLog, ensureMeetMixedStream, handleMeetSignal, speaker, status]);
+
   const startCall = useCallback(async (overrideMode?: "solo" | "meet") => {
     const callMode = overrideMode ?? mode;
     activeCallModeRef.current = callMode;
@@ -855,6 +1060,7 @@ export default function VoiceCallPage() {
       streamRef.current = stream;
       startMicMonitor(stream);
       await startBackgroundCallSupport();
+      if (callMode === "meet") await startMeetSignaling(stream);
       if (!isCurrentCall()) {
         stopBackgroundCallSupport();
         stopMicMonitor();
@@ -878,7 +1084,9 @@ export default function VoiceCallPage() {
 
       peer.ontrack = (event) => {
         if (!audioRef.current) return;
-        audioRef.current.srcObject = event.streams[0];
+        const remoteStream = event.streams[0];
+        audioRef.current.srcObject = remoteStream;
+        if (remoteStream) addRollyAudioToMeet(remoteStream);
       };
       stream.getAudioTracks().forEach((track) => peer.addTrack(track, stream));
 
@@ -912,7 +1120,7 @@ export default function VoiceCallPage() {
       addLog("error", message);
       stopCall("setup_error");
     }
-  }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
+  }, [addLog, addRollyAudioToMeet, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMeetSignaling, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue]);
 
   const startMeetingInvite = useCallback(async () => {
     setError(null);
@@ -950,6 +1158,7 @@ export default function VoiceCallPage() {
     return () => {
       dataRef.current?.close();
       peerRef.current?.close();
+      stopMeetSignaling();
       streamRef.current?.getTracks().forEach((track) => track.stop());
       stopWorkingCue(false);
       stopBackgroundCallSupport();
@@ -957,7 +1166,7 @@ export default function VoiceCallPage() {
       cueAudioContextRef.current = null;
       stopMicMonitor();
     };
-  }, [stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue]);
+  }, [stopBackgroundCallSupport, stopMeetSignaling, stopMicMonitor, stopWorkingCue]);
   useEffect(() => {
     void refreshInputDevices().catch(() => undefined);
     navigator.mediaDevices?.addEventListener?.("devicechange", refreshInputDevices);
@@ -1030,6 +1239,7 @@ export default function VoiceCallPage() {
           {activeTool ? <span className="border border-current/20 px-2 py-1">Tool: {activeTool}</span> : null}
           {activeWorkCount > 0 ? <span className="border border-current/20 px-2 py-1">Working: {activeWorkCount}</span> : null}
           {pendingHandoffs > 0 ? <span className="border border-current/20 px-2 py-1">Queued handoffs: {pendingHandoffs}</span> : null}
+          {mode === "meet" ? <span className="border border-current/20 px-2 py-1">Meet peers: {meetParticipants.length + (live ? 1 : 0)}</span> : null}
           <span className="border border-current/20 px-2 py-1">Provider: OpenAI Realtime WebRTC</span>
           <span className="border border-current/20 px-2 py-1">Tools: fast context + full Rolly</span>
           {lastSavePath ? <span className="border border-current/20 px-2 py-1 normal-case">Transcript: {lastSavePath}</span> : null}
@@ -1124,6 +1334,7 @@ export default function VoiceCallPage() {
           <div className="mt-3 space-y-3">
             <div>Transcript: {lastSavePath || "not saved yet"}</div>
             <div>Queued tasks: {voiceTasks.length || "none"}</div>
+            <div>Meet peers: {meetParticipants.map((p) => p.user).join(", ") || "none"}</div>
             <div>Speaking pace: slightly faster style instruction; explicit provider rate unsupported.</div>
           </div>
           <Typography className="mt-5 font-mondwest text-display text-lg uppercase tracking-[0.12em] text-midground">
