@@ -116,6 +116,16 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
     term.unicode.activeVersion = "11";
     term.loadAddon(new WebLinksAddon());
     term.open(host);
+
+    const wheelHandler = (ev: WheelEvent) => {
+      if (!termRef.current) return;
+      const lineHeight = Math.max(1, Number(term.options.fontSize || 12) * Number(term.options.lineHeight || 1));
+      const lines = Math.max(1, Math.ceil(Math.abs(ev.deltaY) / lineHeight));
+      term.scrollLines(ev.deltaY > 0 ? lines : -lines);
+      ev.preventDefault();
+    };
+    host.addEventListener("wheel", wheelHandler, { passive: false });
+
     if (tierWidthPx(host) >= 768) {
       try {
         const webgl = new WebglAddon();
@@ -193,6 +203,7 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       ro.disconnect();
+      host.removeEventListener("wheel", wheelHandler);
       window.removeEventListener("resize", scheduleSync);
       if (raf) cancelAnimationFrame(raf);
       wsRef.current?.close();

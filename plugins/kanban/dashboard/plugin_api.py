@@ -580,11 +580,17 @@ def _run_tmux(args: list[str], *, timeout: int = 15) -> subprocess.CompletedProc
 
 
 def _tmux_has_session(session_name: str) -> bool:
-    return _run_tmux(["has-session", "-t", session_name], timeout=5).returncode == 0
+    try:
+        return _run_tmux(["has-session", "-t", session_name], timeout=5).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 def _tmux_has_window(target: str) -> bool:
-    return _run_tmux(["list-windows", "-t", target], timeout=5).returncode == 0
+    try:
+        return _run_tmux(["list-windows", "-t", target], timeout=5).returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 def _tmux_target(session_name: str, window_name: str) -> str:
@@ -655,6 +661,7 @@ def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
         raise HTTPException(status_code=400, detail=str(exc))
     session_name = f"card-{task_id}".replace("_", "-")
     command = f"tmux new-session -A -s {shlex.quote(session_name)} -c {shlex.quote(launch['workspace_path'])}"
+    session_exists = _tmux_has_session(session_name)
     return {
         "task_id": launch["task_id"],
         "title": (card_context.get("task") or {}).get("title"),
@@ -663,8 +670,12 @@ def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
         "command": command,
         "mode": "card-tmux-two-window",
         "session_name": session_name,
+        "session_exists": session_exists,
         "rolly_target": _tmux_target(session_name, "rolly-chat"),
-        "terminal_target": _tmux_target(session_name, "terminal"),
+        # Browser card terminal attaches to the whole session so tmux is the
+        # source of truth; users switch windows with ctrl-b n/p/etc.
+        "terminal_target": session_name,
+        "terminal_window_target": _tmux_target(session_name, "terminal"),
     }
 
 
@@ -675,7 +686,7 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
     session_name = str(context["session_name"])
     workspace_path = str(context["workspace_path"])
     rolly_target = str(context["rolly_target"])
-    terminal_target = str(context["terminal_target"])
+    terminal_target = str(context["terminal_window_target"])
     prompt = str(context["prompt"])
 
     session_exists = _tmux_has_session(session_name)
@@ -688,10 +699,11 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "tmux failed").strip()
             raise HTTPException(status_code=500, detail=detail[:500])
-        proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", workspace_path])
+        proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", "/Users/rolly"])
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "tmux new-window failed").strip()
             raise HTTPException(status_code=500, detail=detail[:500])
+        _run_tmux(["select-window", "-t", rolly_target], timeout=5)
         seeded_rolly = True
     else:
         if not _tmux_has_window(rolly_target):
@@ -701,7 +713,7 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
                 raise HTTPException(status_code=500, detail=detail[:500])
             seeded_rolly = True
         if not _tmux_has_window(terminal_target):
-            proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", workspace_path])
+            proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", "/Users/rolly"])
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "tmux terminal window failed").strip()
                 raise HTTPException(status_code=500, detail=detail[:500])
@@ -709,7 +721,7 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
     if seeded_rolly:
         time.sleep(1.2)
         try:
-            _seed_tmux_window(rolly_target, _build_rolly_chat_prompt(task_id, context.get("title")))
+            _seed_tmux_window(rolly_target, prompt)
         except Exception as exc:
             log.warning("failed to seed Rolly card chat prompt for %s: %s", task_id, exc)
 
@@ -721,7 +733,10 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
         "rolly_attach_command": f"tmux attach-session -t {shlex.quote(rolly_target)}",
         "terminal_attach_command": f"tmux attach-session -t {shlex.quote(terminal_target)}",
         "rolly_terminal_url": f"/api/pty?pty_mode=tmux&tmux_session={urllib.parse.quote(rolly_target)}",
-        "terminal_url": f"/api/pty?pty_mode=tmux&tmux_session={urllib.parse.quote(terminal_target)}",
+        "terminal_url": f"/api/pty?pty_mode=tmux&tmux_session={urllib.parse.quote(session_name)}",
+        "terminal_target": session_name,
+        "terminal_window_target": terminal_target,
+        "session_exists": True,
         "prompt": prompt,
     }
 

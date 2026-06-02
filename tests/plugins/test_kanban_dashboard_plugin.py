@@ -192,15 +192,18 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
     assert data["started"] is True
     assert data["session_name"] == expected_session
     assert data["rolly_target"] == f"{expected_session}:rolly-chat"
-    assert data["terminal_target"] == f"{expected_session}:terminal"
-    assert data["terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}%3Aterminal"
+    assert data["terminal_target"] == expected_session
+    assert data["terminal_window_target"] == f"{expected_session}:terminal"
+    assert data["terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}"
     assert data["rolly_terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}%3Arolly-chat"
     assert data["attach_command"] == f"tmux attach-session -t {expected_session}"
     assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
-    assert calls[1][0] == [
+    assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
+    assert calls[2][0] == [
         "tmux", "new-session", "-d", "-s", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
     ]
-    assert calls[2][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())]
+    assert calls[3][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", "/Users/rolly"]
+    assert calls[4][0] == ["tmux", "select-window", "-t", f"{expected_session}:rolly-chat"]
 
 
 def test_card_tui_shell_command_sets_card_session_env(client):
@@ -218,8 +221,11 @@ def test_dashboard_rolly_chat_passes_board_slug_to_tmux_session():
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
     js = bundle.read_text()
 
-    assert "h(RollyChatSection, { task: t, boardSlug: props.boardSlug })" in js
+    assert "h(CardPromptActions, { task: t, boardSlug: props.boardSlug })" in js
     assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug)" in js
+    assert "setTerminalReady(!!(d && d.session_exists))" in js
+    assert "copyCardPrompt" in js
+    assert "h(RollyChatSection, { task: t, boardSlug: props.boardSlug })" not in js
     assert "readPathTaskId() || readUrlParam(\"task\")" in js
     assert "url.pathname = taskId ? `/kanban/cards/${encodeURIComponent(taskId)}` : \"/kanban\"" in js
 

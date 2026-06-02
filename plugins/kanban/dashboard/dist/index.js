@@ -3229,6 +3229,51 @@
     );
   }
 
+  function CardPromptActions(props) {
+    const { t: i18n } = useI18n();
+    const task = props.task;
+    const [payload, setPayload] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [err, setErr] = useState(null);
+    const [copied, setCopied] = useState(false);
+    const hasLaunchWorkspace = !!(task && (task.workspace_path || task.workspace_kind === "scratch"));
+    const loadPrompt = function () {
+      if (!task || busy || !hasLaunchWorkspace) return;
+      setBusy(true);
+      setErr(null);
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug))
+        .then(function (d) { setPayload(d); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    };
+    useEffect(function () { loadPrompt(); }, [task && task.id, props.boardSlug]);
+    const copyPrompt = function () {
+      const doCopy = function (p) {
+        copyTextToClipboard(p.prompt || "", function () {
+          setCopied(true);
+          setTimeout(function () { setCopied(false); }, 2000);
+        });
+      };
+      if (payload && payload.prompt) return doCopy(payload);
+      if (!task || busy || !hasLaunchWorkspace) return;
+      setBusy(true);
+      setErr(null);
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug))
+        .then(function (d) { setPayload(d); doCopy(d); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    };
+    return h("div", { className: "flex flex-wrap items-center gap-2 mb-3" },
+      h(Button, {
+        size: "sm",
+        variant: "outline",
+        disabled: busy || !hasLaunchWorkspace,
+        onClick: copyPrompt,
+      }, copied ? tx(i18n, "copied", "Copied") : tx(i18n, "copyCardPrompt", "Copy card prompt")),
+      err ? h("span", { className: "text-xs text-destructive" }, err) : null,
+    );
+  }
+
   function CardWorkspaceSection(props) {
     const { t: i18n } = useI18n();
     const task = props.task;
@@ -3245,7 +3290,11 @@
       setBusy(true);
       setErr(null);
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug))
-        .then(function (d) { setPayload(d); })
+        .then(function (d) {
+          setPayload(d);
+          setTerminalReady(!!(d && d.session_exists));
+          if (d && d.session_exists) setTerminalNonce(function (n) { return n + 1; });
+        })
         .catch(function (e) { setErr(parseApiErrorMessage(e)); })
         .finally(function () { setBusy(false); });
     };
@@ -3267,12 +3316,17 @@
       setTimeout(function () { setCopied(null); }, 2000);
     };
 
+    useEffect(function () {
+      if (!task) return;
+      loadContext();
+    }, [task && task.id, props.boardSlug]);
+
     return h("div", { className: "hermes-kanban-section" },
       h("div", { className: "hermes-kanban-section-head" },
         tx(i18n, "cardWorkspace", "Card workspace")),
       h("div", { className: "text-xs text-muted-foreground mb-2" },
         tx(i18n, "cardWorkspaceHint",
-          "Start a card-scoped tmux session in the browser. Copy the prompt, then paste it into Claude Code when ready.")),
+          "Create or attach to this card's tmux session. Use tmux keys like ctrl-b n to switch between Rolly Chat and the shell.")),
       !hasLaunchWorkspace ? h("div", { className: "text-xs text-destructive mb-2" },
         tx(i18n, "cardWorkspaceNoWorkspace",
           "Set a concrete workspace_path before launching Claude Code.")) : null,
@@ -3287,8 +3341,8 @@
           onClick: startTerminal,
         }, busy
           ? tx(i18n, "starting", "Starting…")
-          : (terminalReady ? tx(i18n, "restartTerminal", "Reconnect terminal")
-                         : tx(i18n, "startTerminal", "Start card tmux"))),
+          : (terminalReady ? tx(i18n, "reconnectTerminal", "Reconnect tmux session")
+                         : tx(i18n, "createTmuxSession", "Create tmux session"))),
         h(Button, {
           size: "sm",
           variant: "outline",
@@ -3358,7 +3412,7 @@
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
-    const [activePane, setActivePane] = useState("chat");
+    const [activePane, setActivePane] = useState("terminal");
     const tab = function (key, label) {
       return h("button", {
         key,
@@ -3414,16 +3468,16 @@
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
       }),
+      h(CardPromptActions, { task: t, boardSlug: props.boardSlug }),
       h("div", { className: "hermes-kanban-workspace-tabs", role: "tablist" },
         tab("details", tx(i18n, "details", "Details")),
-        tab("chat", tx(i18n, "rollyChat", "Rolly Chat")),
         tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
       ),
-      activePane === "chat" ? h(RollyChatSection, { task: t, boardSlug: props.boardSlug }) : null,
-      activePane === "terminal" ? h(CardWorkspaceSection, {
-        task: t,
-        boardSlug: props.boardSlug,
-      }) : null,
+      h("div", { style: { display: activePane === "terminal" ? "block" : "none" } },
+        h(CardWorkspaceSection, {
+          task: t,
+          boardSlug: props.boardSlug,
+        })),
       activePane === "details" ? h(React.Fragment, null,
       h(DiagnosticsSection, {
         task: t,
