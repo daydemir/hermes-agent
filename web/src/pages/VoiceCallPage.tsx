@@ -44,6 +44,10 @@ function formatElapsed(ms: number | null): string {
   return `+${(ms / 1000).toFixed(1)}s`;
 }
 
+function isRealtimeSpeechEvent(entry: LogEntry): boolean {
+  return entry.text === "Realtime API heard speech start." || entry.text === "Realtime API heard speech stop." || entry.text === "Realtime API committed mic audio.";
+}
+
 export default function VoiceCallPage() {
   const [status, setStatus] = useState<CallStatus>("idle");
   const [muted, setMuted] = useState(false);
@@ -53,6 +57,7 @@ export default function VoiceCallPage() {
   const [selectedInputId, setSelectedInputId] = useState("");
   const [speaker, setSpeaker] = useState(() => getRollyUserSlug());
   const [error, setError] = useState<string | null>(null);
+  const [verboseEvents, setVerboseEvents] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([
     {
       id: logId(),
@@ -977,7 +982,7 @@ export default function VoiceCallPage() {
   const busy = status === "requesting" || status === "connecting" || status === "ending";
   const speakerLabel = getRollyUser(speaker)?.label ?? "No dashboard user selected";
   const transcriptLogs = logs.filter((entry) => entry.kind === "user" || entry.kind === "rolly");
-  const eventLogs = logs.filter((entry) => entry.kind !== "user" && entry.kind !== "rolly");
+  const eventLogs = logs.filter((entry) => entry.kind !== "user" && entry.kind !== "rolly" && (verboseEvents || !isRealtimeSpeechEvent(entry)));
 
   return (
     <main className="flex h-full min-h-0 flex-col gap-4 overflow-auto p-4 lg:p-6">
@@ -996,6 +1001,9 @@ export default function VoiceCallPage() {
             {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={startMeetingInvite} disabled={!speaker}>Start meeting / invite</Button> : null}
             {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => void startCall()} disabled={!speaker}>Start call</Button> : null}
             {live ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
+            <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => setVerboseEvents((value) => !value)}>
+              Verbose: {verboseEvents ? "on" : "off"}
+            </Button>
             {live || busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => stopCall()}>End call</Button> : null}
           </div>
         </div>
@@ -1057,46 +1065,46 @@ export default function VoiceCallPage() {
         {error ? <p className="mt-3 text-sm text-red-300">{error}</p> : null}
       </section>
 
-      <section className="grid min-h-[24rem] gap-4 xl:grid-cols-[1fr_1fr_22rem]">
-        <div className="min-h-0 border border-current/20 bg-black/30 p-4">
+      <section className="grid min-h-[24rem] gap-3 xl:grid-cols-[1fr_1fr_20rem]">
+        <div className="min-h-0 border border-current/20 bg-black/30 p-3">
           <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
             Live transcript
           </Typography>
-          <div className="mt-3 flex max-h-[60vh] flex-col gap-2 overflow-auto pr-1 text-sm">
+          <div className="mt-2 flex max-h-[60vh] flex-col gap-1 overflow-auto pr-1 text-sm">
             {(transcriptLogs.length ? transcriptLogs : [{ id: "empty-transcript", kind: "system" as LogKind, text: "No spoken transcript yet.", timestamp: new Date().toISOString(), elapsedMs: null }]).map((entry) => (
-              <div key={entry.id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={entry.id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {entry.kind} · {formatClock(entry.timestamp)} · {formatElapsed(entry.elapsedMs)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{entry.text}</div>
+                <div className="whitespace-pre-wrap leading-snug">{entry.text}</div>
               </div>
             ))}
           </div>
         </div>
-        <div className="min-h-0 border border-current/20 bg-black/30 p-4">
+        <div className="min-h-0 border border-current/20 bg-black/30 p-3">
           <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
             Events + work
           </Typography>
-          <div className="mt-3 flex max-h-[60vh] flex-col gap-2 overflow-auto pr-1 text-sm">
+          <div className="mt-2 flex max-h-[60vh] flex-col gap-1 overflow-auto pr-1 text-sm">
             {eventLogs.map((entry) => (
-              <div key={entry.id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={entry.id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {entry.kind} · {formatClock(entry.timestamp)} · {formatElapsed(entry.elapsedMs)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{entry.text}</div>
+                <div className="whitespace-pre-wrap leading-snug">{entry.text}</div>
               </div>
             ))}
             {voiceTasks.map((task) => (
-              <div key={task.task_id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={task.task_id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {task.task_id} · {task.status} · {formatClock(task.updated_at)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{task.progress?.[task.progress.length - 1]?.message || task.request}</div>
+                <div className="whitespace-pre-wrap leading-snug">{task.progress?.[task.progress.length - 1]?.message || task.request}</div>
               </div>
             ))}
           </div>
         </div>
-        <aside className="border border-current/20 bg-background-base/50 p-4 text-sm text-text-secondary">
+        <aside className="border border-current/20 bg-background-base/50 px-3 py-2 text-sm text-text-secondary">
           <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em] text-midground">
             Pinned
           </Typography>

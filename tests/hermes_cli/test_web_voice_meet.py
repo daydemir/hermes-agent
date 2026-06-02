@@ -78,6 +78,17 @@ def test_start_call_owns_mic_permission_and_live_mic_switching():
     assert "replaceTrack(nextTrack)" in source
 
 
+def test_voice_page_filters_realtime_noise_until_verbose_and_uses_compact_rows():
+    source = (WEB_DIR / "src/pages/VoiceCallPage.tsx").read_text(encoding="utf-8")
+
+    assert "const [verboseEvents, setVerboseEvents] = useState(false)" in source
+    assert "isRealtimeSpeechEvent" in source
+    assert "verboseEvents || !isRealtimeSpeechEvent(entry)" in source
+    assert "Verbose: {verboseEvents ? \"on\" : \"off\"}" in source
+    assert "bg-background-base/50 px-2 py-1" in source
+    assert "bg-background-base/50 p-3" not in source
+
+
 @pytest.fixture()
 def voice_client(monkeypatch, _isolate_hermes_home):
     try:
