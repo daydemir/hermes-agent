@@ -35,6 +35,24 @@ function eventText(event: unknown): string | null {
   return typeof direct === "string" && direct.trim() ? direct.trim() : null;
 }
 
+function isSecretEntryControlOnly(text: string): boolean {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\u001b\[[0-9;]*m/g, "").trim())
+    .filter(Boolean);
+  return lines.length > 0 && lines.every((line) => /^(?:⏭\s*)?Secret entry skipped$/i.test(line));
+}
+
+function usableVoiceTaskOutput(task: VoiceTaskResponse): string {
+  const result = (task.result || "").trim();
+  if (result && !isSecretEntryControlOnly(result)) return result;
+  if (task.status === "complete") {
+    const request = task.request ? ` for: ${task.request}` : "";
+    return `Background Rolly task completed but produced no usable voice result${request}. It appears to have been blocked by a secret-entry prompt/control message, so there is no answer to summarize.`;
+  }
+  return `Background Rolly task ${task.status}: ${task.error || "no error detail"}`;
+}
+
 function formatClock(timestamp: string): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -584,14 +602,14 @@ export default function VoiceCallPage() {
             persistTranscript("tool", latest, "delegation_progress", { task_id: taskId, status: task.status });
           }
           if (task.status === "complete") {
-            const output = task.result || "Background Rolly task completed.";
+            const output = usableVoiceTaskOutput(task);
             addLog("tool", `${taskId} complete\n${output.slice(0, 700)}`);
             persistTranscript("tool", output, "delegation_result", { task_id: taskId, session_id: task.session_id });
             queueOrSendToolOutput(`handoff:${taskId}`, output, taskId);
             return;
           }
           if (task.status === "failed" || task.status === "cancelled") {
-            const output = `Background Rolly task ${task.status}: ${task.error || "no error detail"}`;
+            const output = usableVoiceTaskOutput(task);
             addLog("error", output);
             persistTranscript("tool", output, "delegation_error", { task_id: taskId, session_id: task.session_id });
             queueOrSendToolOutput(`handoff:${taskId}`, output, taskId);

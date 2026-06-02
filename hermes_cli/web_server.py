@@ -508,7 +508,8 @@ def _voice_task_worker(task_id: str) -> None:
         task.mark("running", "Rolly is working in the background.")
     _voice_task_event(task, "delegation_started", "Rolly background task started.")
     try:
-        result = _run_voice_research(task.request, user=task.user, source="dashboard-voice-background", parent_call_id=task.call_id)
+        raw_result = _run_voice_research(task.request, user=task.user, source="dashboard-voice-background", parent_call_id=task.call_id)
+        result = _voice_require_usable_result(raw_result)
         with _VOICE_TASKS_LOCK:
             task.mark("complete", "Rolly background task completed.", result=result)
         _voice_task_event(task, "delegation_result", result, {"status": "complete"})
@@ -532,11 +533,38 @@ def _voice_start_background_task(call_id: str, request_text: str, user: str) -> 
     return task
 
 
+_VOICE_SECRET_CONTROL_RESULT_ERROR = "Rolly CLI produced only secret-entry control messages; no usable voice result was available."
+_VOICE_SECRET_CONTROL_RE = re.compile(r"(?:⏭\s*)?Secret entry skipped", re.IGNORECASE)
+_VOICE_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _voice_bound_text(text: str, limit: int) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _voice_strip_control_text(text: str) -> str:
+    """Remove non-answer CLI callback/control lines from voice-visible text."""
+    cleaned_lines: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = _VOICE_ANSI_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        if line.startswith("session_id:"):
+            continue
+        if _VOICE_SECRET_CONTROL_RE.fullmatch(line):
+            continue
+        cleaned_lines.append(raw_line.strip())
+    return "\n".join(cleaned_lines).strip()
+
+
+def _voice_require_usable_result(text: str) -> str:
+    usable = _voice_strip_control_text(text)
+    if usable:
+        return usable
+    raise RuntimeError(_VOICE_SECRET_CONTROL_RESULT_ERROR)
 
 
 def _voice_read_markdown(path: Path, limit: int) -> str:
@@ -805,6 +833,7 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
             "Prefer fast lookup tools (context_lookup, memory_lookup, kanban_lookup, brain_lookup, session_lookup) for context. "
             "Use rolly_background for long or action-oriented work; it queues real background Rolly work and returns a task id. "
             "When rolly_background is queued, tell the user you will jump back in with the result if this call is still live; do not claim there is no live push channel. "
+            "If a background result/error says secret-entry control messages were skipped or that no usable voice result was available, do not quote the placeholder; say the background run was blocked before producing a usable answer and mention the original requested action. "
             "During active work, interpret user follow-ups as steer by default; clear stop/cancel means cancel intent, and 'when done' means queue. "
             "Never call a tool twice for the same user intent. Summarize tool results conversationally and ask at most one brief follow-up."
         ),
@@ -986,8 +1015,7 @@ def _run_voice_research(question: str, user: str | None = None, *, source: str =
         detail = (proc.stderr or output or f"exit {proc.returncode}").strip()
         raise RuntimeError(f"Rolly CLI tool failed: {detail[:700]}")
     # ``hermes chat -q`` prints a session_id line before the final answer.
-    lines = [line for line in output.splitlines() if not line.startswith("session_id:")]
-    return "\n".join(lines).strip() or output
+    return _voice_require_usable_result(output)
 
 
 @app.post("/api/voice/session")

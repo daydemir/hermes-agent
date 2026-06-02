@@ -250,6 +250,51 @@ def test_run_voice_research_uses_cli_bridge(monkeypatch, voice_client):
     assert calls[0][1]["timeout"] == 90
 
 
+def test_run_voice_research_rejects_secret_entry_placeholder_output(monkeypatch, voice_client):
+    _client, web_server = voice_client
+
+    def fake_run(_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout="session_id: abc\n  ⏭ Secret entry skipped\n\n  ⏭ Secret entry skipped\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_server._run_voice_research("ordinary request", user="deniz")
+
+    message = str(exc_info.value)
+    assert message == "Rolly CLI produced only secret-entry control messages; no usable voice result was available."
+    assert "⏭" not in message
+
+
+def test_voice_task_worker_marks_secret_placeholder_as_failed(monkeypatch, voice_client):
+    _client, web_server = voice_client
+    events = []
+    notifications = []
+    task = web_server.VoiceTask("vt_secret", "call-secret", "deniz", "ordinary request", "voice_task_vt_secret")
+    with web_server._VOICE_TASKS_LOCK:
+        web_server._VOICE_TASKS[task.task_id] = task
+
+    monkeypatch.setattr(
+        web_server,
+        "_run_voice_research",
+        lambda *_args, **_kwargs: "  ⏭ Secret entry skipped\n\n  ⏭ Secret entry skipped",
+    )
+    monkeypatch.setattr(web_server, "_voice_task_event", lambda task, event_type, text, metadata=None: events.append((event_type, text, metadata)))
+    monkeypatch.setattr(web_server, "_voice_maybe_notify_post_call", lambda task, status: notifications.append((task.task_id, status)))
+
+    web_server._voice_task_worker(task.task_id)
+
+    assert task.status == "failed"
+    assert task.result is None
+    assert task.error == "Rolly CLI produced only secret-entry control messages; no usable voice result was available."
+    assert any(event_type == "delegation_error" for event_type, _text, _metadata in events)
+    assert notifications == [("vt_secret", "failed")]
+
+
 def test_run_voice_research_background_timeout_is_longer_and_concise(monkeypatch, voice_client):
     _client, web_server = voice_client
 
