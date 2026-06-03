@@ -1,5 +1,6 @@
 """Tests for dashboard voice-call prototype endpoints."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -366,6 +367,7 @@ def test_voice_background_tool_starts_real_task_contract(voice_client, monkeypat
     assert resp.status_code == 200
     body = resp.json()
     assert body["tool_name"] == "rolly_background"
+    assert body["result"] == "Queued background Rolly task vt_test. The voice UI will inject the result back into this live call when it is ready."
     assert body["data"]["task_id"] == "vt_test"
     assert body["data"]["status"] == "queued"
     assert started[0].call_id == "voice-call"
@@ -523,6 +525,49 @@ def test_voice_invite_rejects_ended_call(voice_client, monkeypatch):
     )
 
     assert resp.status_code == 409
+
+
+def test_voice_call_end_preserves_detached_runner_result_state(voice_client, monkeypatch):
+    client, web_server = voice_client
+    sent = []
+    task = web_server.VoiceTask("vt_race", "call-race", "deniz", "do work", "voice_task_vt_race")
+    with web_server._VOICE_TASKS_LOCK:
+        web_server._VOICE_TASKS.clear()
+        web_server._VOICE_TASKS[task.task_id] = task
+    web_server._voice_write_task_state(task)
+
+    runner_state = task.to_dict()
+    runner_state.update(
+        {
+            "status": "complete",
+            "progress": runner_state["progress"]
+            + [{"timestamp": "2026-06-03T18:49:00+00:00", "event_type": "complete", "message": "Rolly background task completed."}],
+            "result": "finished answer",
+            "error": None,
+            "updated_at": "2026-06-03T18:49:00+00:00",
+        }
+    )
+    web_server._voice_task_state_path(task.task_id).write_text(json.dumps(runner_state), encoding="utf-8")
+    monkeypatch.setattr(web_server, "_voice_send_post_call_notification", lambda task: sent.append((task.task_id, task.status, task.result)) or True)
+
+    end_resp = client.post(
+        "/api/voice/transcript",
+        json={
+            "call_id": "call-race",
+            "role": "system",
+            "text": "ended",
+            "event_type": "call_end",
+            "user": "deniz",
+            "timestamp": "2026-06-03T18:50:00+00:00",
+        },
+    )
+    assert end_resp.status_code == 200
+
+    persisted = json.loads(web_server._voice_task_state_path(task.task_id).read_text(encoding="utf-8"))
+    assert persisted["status"] == "complete"
+    assert persisted["result"] == "finished answer"
+    assert persisted["call_ended"] is True
+    assert sent == [("vt_race", "complete", "finished answer")]
 
 
 def test_voice_call_end_marks_task_and_sends_single_post_call_notification(voice_client, monkeypatch):

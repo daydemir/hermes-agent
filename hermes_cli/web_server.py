@@ -263,10 +263,63 @@ def _voice_task_state_path(task_id: str) -> Path:
     return _voice_tasks_root() / f"{safe}.json"
 
 
+def _voice_task_status_rank(status: str | None) -> int:
+    value = (status or "queued").strip().lower()
+    if value in {"complete", "failed", "cancelled"}:
+        return 3
+    if value == "running":
+        return 2
+    if value == "queued":
+        return 1
+    return 0
+
+
+def _voice_merge_existing_task_state(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve detached-runner progress when the dashboard writes stale state.
+
+    Background voice tasks are run by a separate process that writes the same
+    JSON state file as the dashboard.  The dashboard keeps an in-memory
+    ``VoiceTask`` object from queue time; later UI events such as call_end, or
+    the parent process writing runner_pid after spawn, can otherwise overwrite a
+    runner-written running/complete/failed state with stale queued/null data.
+    """
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    if not isinstance(existing, dict) or existing.get("task_id") != data.get("task_id"):
+        return data
+
+    existing_rank = _voice_task_status_rank(str(existing.get("status") or ""))
+    incoming_rank = _voice_task_status_rank(str(data.get("status") or ""))
+    if existing_rank > incoming_rank:
+        for key in ("status", "progress", "result", "error", "updated_at"):
+            if key in existing:
+                data[key] = existing[key]
+
+    # Keep durable metadata from either writer.  These fields are monotonic or
+    # operational and should not be lost while preserving runner output above.
+    data["call_ended"] = bool(data.get("call_ended")) or bool(existing.get("call_ended"))
+    if data.get("runner_pid") is None and existing.get("runner_pid") is not None:
+        data["runner_pid"] = existing.get("runner_pid")
+    if not data.get("created_at") and existing.get("created_at"):
+        data["created_at"] = existing.get("created_at")
+
+    existing_notification = existing.get("post_call_notification")
+    incoming_notification = data.get("post_call_notification")
+    if isinstance(existing_notification, dict) and isinstance(incoming_notification, dict):
+        existing_status = str(existing_notification.get("status") or "")
+        incoming_status = str(incoming_notification.get("status") or "")
+        if incoming_status in {"not_needed", ""} and existing_status not in {"", "not_needed"}:
+            data["post_call_notification"] = existing_notification
+    return data
+
+
 def _voice_write_task_state(task: VoiceTask) -> None:
     path = _voice_task_state_path(task.task_id)
+    data = _voice_merge_existing_task_state(path, task.to_dict())
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(task.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
 
 
@@ -424,10 +477,16 @@ def _voice_update_call_state(event: VoiceTranscriptEvent, user: str) -> None:
     if event.event_type == "call_end":
         ended_tasks: list[VoiceTask] = []
         with _VOICE_TASKS_LOCK:
-            for task in _VOICE_TASKS.values():
+            for task_id, task in list(_VOICE_TASKS.items()):
                 if task.call_id == event.call_id:
+                    # Detached runners may have advanced the on-disk state while
+                    # the dashboard still holds the original queued object.
+                    # Rehydrate before marking call_ended so final results are
+                    # not hidden from task state or post-call handoff logic.
+                    task = _voice_read_task_state(task_id) or task
                     task.call_ended = True
                     task.updated_at = now
+                    _VOICE_TASKS[task_id] = task
                     _voice_write_task_state(task)
                     ended_tasks.append(task)
         for task in ended_tasks:
@@ -913,7 +972,7 @@ def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> 
             raise HTTPException(status_code=400, detail="Missing call_id")
         task = _voice_start_background_task(payload.call_id, request_text, _voice_speaker_label(user))
         return _voice_tool_result(
-            f"Queued background Rolly task {task.task_id}. The voice UI will inject the result back into this live call when it is ready; briefly tell the user you will jump back in if the call is still live.",
+            f"Queued background Rolly task {task.task_id}. The voice UI will inject the result back into this live call when it is ready.",
             tool_name=name,
             data=task.to_dict(),
         )
