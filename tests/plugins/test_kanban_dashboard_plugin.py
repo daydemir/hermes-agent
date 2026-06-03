@@ -204,7 +204,7 @@ def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     r = client.get(f"/api/plugins/kanban/tasks/{task_id}/claude-context")
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["mode"] == "card-tmux-two-window"
+    assert data["mode"] == "card-tmux-single-window"
     assert data["task_id"] == task_id
     assert data["workspace_path"] == str(workspace.resolve())
     expected_session = "card-" + task_id.replace("_", "-")
@@ -235,7 +235,7 @@ def test_claude_context_endpoint_defaults_scratch_workspace_to_home(client):
     assert data["session_name"] == expected_session
 
 
-def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkeypatch):
+def test_tmux_session_endpoint_starts_single_card_window(client, tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     r = client.post(
@@ -260,78 +260,106 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
         return Result(0)
 
     monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
-    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda **_kwargs: "hermes --tui")
 
     r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["started"] is True
-    assert data["seeded_rolly"] is False
+    assert data["mode"] == "card-tmux-single-window"
     assert data["session_name"] == expected_session
-    assert data["rolly_target"] == f"{expected_session}:rolly-chat"
     assert data["terminal_target"] == expected_session
-    assert data["terminal_window_target"] == f"{expected_session}:terminal"
     assert data["terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}"
-    assert data["rolly_terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}%3Arolly-chat"
     assert data["attach_command"] == f"tmux attach-session -t {expected_session}"
+    # The two-window model is gone: no rolly-chat window, no second terminal.
+    assert "rolly_target" not in data
+    assert "terminal_window_target" not in data
     assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
     assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
+    # Exactly ONE window is created, rooted at the card workspace.
     assert calls[2][0] == [
-        "tmux", "new-session", "-d", "-s", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
+        "tmux", "new-session", "-d", "-s", expected_session, "-n", "terminal", "-c", str(workspace.resolve()),
     ]
-    assert calls[3][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", "/Users/rolly"]
-    assert calls[4][0] == ["tmux", "select-window", "-t", f"{expected_session}:rolly-chat"]
-    assert not any(c[0][1:2] == ["paste-buffer"] for c in calls)
+    assert len(calls) == 3
+    assert not any(c[0][1] == "new-window" for c in calls)
+    assert not any(c[0][1] == "select-window" for c in calls)
+    assert not any("rolly-chat" in str(c[0]) for c in calls)
 
 
-def test_tmux_session_endpoint_repairs_stale_rolly_chat_window(client, tmp_path, monkeypatch):
+def test_tmux_session_endpoint_reconnect_is_idempotent_when_window_present(client, tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "Repair chat", "workspace_kind": "dir", "workspace_path": str(workspace)},
+        json={"title": "Reconnect", "workspace_kind": "dir", "workspace_path": str(workspace)},
     )
     assert r.status_code == 200, r.text
     task_id = r.json()["task"]["id"]
     expected_session = "card-" + task_id.replace("_", "-")
     calls = []
-    killed_stale = False
 
     class Result:
-        def __init__(self, returncode=0, stdout="", stderr=""):
+        def __init__(self, returncode=0, stdout=""):
             self.returncode = returncode
             self.stdout = stdout
-            self.stderr = stderr
+            self.stderr = ""
 
     def fake_run(args, **kwargs):
-        nonlocal killed_stale
         calls.append((args, kwargs))
         if args[:2] == ["tmux", "has-session"]:
-            return Result(0)
+            return Result(0)  # session already exists
         if args[:2] == ["tmux", "list-windows"]:
-            target = args[3]
-            if target.endswith(":rolly-chat"):
-                return Result(1 if killed_stale else 0)
-            if target.endswith(":terminal"):
-                return Result(0)
-        if args[:2] == ["tmux", "display-message"]:
-            return Result(0, stdout="zsh\t0\n")
-        if args[:2] == ["tmux", "kill-window"]:
-            killed_stale = True
-            return Result(0)
+            return Result(0, stdout="terminal\n")  # the one window is alive
         return Result(0)
 
     monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
-    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda **_kwargs: "hermes --tui")
+
     r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["started"] is False
-    assert data["seeded_rolly"] is False
-    assert ["tmux", "kill-window", "-t", f"{expected_session}:rolly-chat"] in [c[0] for c in calls]
-    assert [
-        "tmux", "new-window", "-t", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
-    ] in [c[0] for c in calls]
+    assert data["terminal_target"] == expected_session
+    # Reconnecting to a healthy session creates nothing — no extra windows.
+    assert not any(c[0][1] == "new-session" for c in calls)
+    assert not any(c[0][1] == "new-window" for c in calls)
+
+
+def test_tmux_session_endpoint_recreates_missing_terminal_window(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Repair", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[:2] == ["tmux", "has-session"]:
+            return Result(0)  # session exists ...
+        if args[:2] == ["tmux", "list-windows"]:
+            return Result(0, stdout="")  # ... but the 'terminal' window is gone
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["started"] is False
+    # Exactly one window is (re)created, still named 'terminal' at the workspace.
+    assert ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())] in [
+        c[0] for c in calls
+    ]
+    assert not any(c[0][1] == "new-session" for c in calls)
 
 
 def test_tmux_session_endpoint_kills_card_tmux_session(client, tmp_path, monkeypatch):
@@ -367,16 +395,6 @@ def test_tmux_session_endpoint_kills_card_tmux_session(client, tmp_path, monkeyp
     assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
     assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
     assert calls[2][0] == ["tmux", "kill-session", "-t", expected_session]
-
-
-def test_card_tui_shell_command_sets_card_session_env(client):
-    mod = sys.modules["hermes_dashboard_plugin_kanban_test"]
-
-    command = mod._tui_shell_command(task_id="t_card_123", board="/tmp/kanban board.db")
-
-    assert "HERMES_SESSION_SOURCE=kanban-card:t_card_123" in command
-    assert "HERMES_KANBAN_TASK=t_card_123" in command
-    assert "HERMES_KANBAN_BOARD='/tmp/kanban board.db'" in command
 
 
 def test_dashboard_rolly_chat_passes_board_slug_to_tmux_session():
@@ -446,6 +464,40 @@ def test_legacy_statuses_bucket_into_triage(client):
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
     assert list(columns) == ["triage", "ready", "done"]
     assert any(t["id"] == task["id"] for t in columns["triage"])
+
+
+def test_complete_triage_card_via_patch(client):
+    """Clicking "Complete" on a triage card must close it (regression).
+
+    The card sits in the leftmost (triage) column; the dashboard PATCHes
+    ``status=done`` with the result/summary box. This used to 409 because
+    ``complete_task`` only accepted running/ready/blocked, so the card
+    never moved — the user's "I fill in the box but it won't complete".
+    """
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "wont fix this"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'triage' WHERE id = ?", (task["id"],),
+            )
+    finally:
+        conn.close()
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "result": "Won't fix", "summary": "wont fix"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "done"
+
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
+    done = next(c for c in r.json()["columns"] if c["name"] == "done")
+    assert task["id"] in {t["id"] for t in done["tasks"]}
 
 
 def test_tenant_filter(client):

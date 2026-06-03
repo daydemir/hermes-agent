@@ -86,6 +86,9 @@ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { resolvePageTitle } from "@/lib/resolve-page-title";
+import { setRouteContext } from "@/lib/pageContext";
+import { RollyAssistantSidebar } from "@/components/RollyAssistantSidebar";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
 import {
@@ -497,10 +500,24 @@ export default function App() {
     [manifests],
   );
 
+  // Publish the route layer of the page-context bus so the global Rolly
+  // assistant sidebar knows which page the user is on. Plugins (e.g. Kanban)
+  // layer richer entity context on top via the SDK; see lib/pageContext.ts.
+  useEffect(() => {
+    setRouteContext({
+      route: normalizedPath,
+      title: resolvePageTitle(normalizedPath, t, pluginTabMeta),
+    });
+  }, [normalizedPath, t, pluginTabMeta]);
+
   const layoutVariant = theme.layoutVariant ?? "standard";
   const sidebarWidth = isDesktopCollapsed ? "4.2rem" : "19.2rem";
   const rootStyle = {
     "--hermes-sidebar-width": sidebarWidth,
+    // The global Rolly assistant sidebar pushes content left (non-modal) by
+    // setting --hermes-assistant-pad on the document element when expanded.
+    paddingRight: "var(--hermes-assistant-pad, 0px)",
+    transition: "padding-right 200ms ease",
   } as CSSProperties;
 
   useEffect(() => {
@@ -851,6 +868,10 @@ export default function App() {
       </div>
 
       <PluginSlot name="overlay" />
+
+      {/* Global, page-aware Rolly assistant. Desktop-only: on narrow viewports a
+          fixed side panel would crowd the dashboard. Persists across routes. */}
+      {!isMobile && <RollyAssistantSidebar />}
     </div>
   );
 }

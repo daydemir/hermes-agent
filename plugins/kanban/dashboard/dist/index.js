@@ -755,6 +755,68 @@
       });
     }, [boardData, tenantFilter, assigneeFilter, search]);
 
+    // Publish the visible Kanban entity to the global Rolly assistant sidebar so
+    // it is page-aware: an open card (with its compact summary), or the board +
+    // active filters when nothing is selected. The board task dicts already
+    // carry compact per-card fields, so this is never a raw database dump.
+    const lastEntityCtxRef = useRef("");
+    useEffect(function () {
+      const pc = SDK.pageContext;
+      if (!pc || !pc.setEntityContext) return;
+      const filters = {};
+      if (tenantFilter) filters.tenant = tenantFilter;
+      if (assigneeFilter) filters.assignee = assigneeFilter;
+      if (search && search.trim()) filters.search = search.trim();
+      if (board) filters.board = board;
+      let ctx;
+      if (!selectedTaskId) {
+        ctx = {
+          route: "/kanban",
+          plugin: "kanban",
+          entity_type: "board",
+          title: "Kanban board" + (board ? " · " + board : ""),
+          selected_filters: filters,
+          actions_available: ["open_card", "create_card"],
+        };
+      } else {
+        let task = null;
+        if (filteredBoard && filteredBoard.columns) {
+          for (const col of filteredBoard.columns) {
+            const found = (col.tasks || []).find(function (x) { return x.id === selectedTaskId; });
+            if (found) { task = found; break; }
+          }
+        }
+        ctx = {
+          route: "/kanban",
+          plugin: "kanban",
+          entity_type: "card",
+          entity_id: selectedTaskId,
+          title: task ? (task.title || selectedTaskId) : selectedTaskId,
+          summary: task ? (task.latest_summary || (task.body ? String(task.body).slice(0, 280) : undefined)) : undefined,
+          status: task ? task.status : undefined,
+          assignee: task ? task.assignee : undefined,
+          priority: task ? task.priority : undefined,
+          tenant: task ? task.tenant : undefined,
+          workspace_path: task ? task.workspace_path : undefined,
+          selected_filters: filters,
+          actions_available: ["add_comment", "update_body", "update_acceptance", "update_status", "open_card", "copy_cc_prompt"],
+        };
+      }
+      // filteredBoard churns on every board event; only publish when the
+      // context the sidebar would see actually changed.
+      const serialized = JSON.stringify(ctx);
+      if (serialized === lastEntityCtxRef.current) return;
+      lastEntityCtxRef.current = serialized;
+      pc.setEntityContext(ctx);
+    }, [selectedTaskId, filteredBoard, board, tenantFilter, assigneeFilter, search]);
+
+    useEffect(function () {
+      return function () {
+        const pc = SDK.pageContext;
+        if (pc && pc.setEntityContext) pc.setEntityContext(null);
+      };
+    }, []);
+
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
       const confirmMsg = getDestructiveConfirm(t, newStatus);
@@ -3523,54 +3585,6 @@
         h("div", { className: "text-xs font-medium" }, tx(i18n, "prompt", "Prompt")),
         h("pre", { className: "hermes-kanban-codeblock text-xs whitespace-pre-wrap" }, payload.prompt || ""),
       ) : null,
-    );
-  }
-
-  function RollyChatSection(props) {
-    const { t: i18n } = useI18n();
-    const task = props.task;
-    const [payload, setPayload] = useState(null);
-    const [err, setErr] = useState(null);
-    const [copied, setCopied] = useState(false);
-
-    const copyRollyPrompt = function () {
-      const prompt = (payload && payload.rolly_prompt) || "";
-      copyTextToClipboard(prompt, function () {
-        setCopied(true);
-        setTimeout(function () { setCopied(false); }, 2000);
-      });
-    };
-
-    useEffect(function () {
-      if (!task) return;
-      var cancelled = false;
-      setErr(null);
-      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug), { method: "POST" })
-        .then(function (d) { if (!cancelled) setPayload(d); })
-        .catch(function (e) { if (!cancelled) setErr(parseApiErrorMessage(e)); });
-      return function () { cancelled = true; };
-    }, [task && task.id, props.boardSlug]);
-
-    return h("div", { className: "hermes-kanban-card-chat" },
-      h("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-2" },
-        h("div", { className: "text-xs text-muted-foreground" },
-          tx(i18n, "rollyChatHint", "Card-scoped Rolly chat. Use this to discuss or drive this card.")),
-        h(Button, {
-          size: "sm",
-          variant: "outline",
-          disabled: !payload || !payload.rolly_prompt,
-          onClick: copyRollyPrompt,
-        }, copied ? tx(i18n, "copied", "Copied") : tx(i18n, "copyRollyPrompt", "Copy Rolly prompt")),
-      ),
-      err ? h("div", { className: "text-xs text-destructive mb-2" }, err) : null,
-      payload && payload.rolly_target && PtyTerminalPane ? h(PtyTerminalPane, {
-        key: payload.rolly_target,
-        title: `Rolly chat for ${task.id}`,
-        className: "hermes-kanban-card-chat-frame",
-        tmuxTarget: payload.rolly_target,
-        autoFocus: true,
-      }) : h("div", { className: "hermes-kanban-card-chat-frame hermes-kanban-card-terminal-placeholder" },
-        tx(i18n, "starting", "Starting…")),
     );
   }
 

@@ -623,43 +623,15 @@ def _tmux_has_session(session_name: str) -> bool:
         return False
 
 
-def _tmux_has_window(target: str) -> bool:
+def _tmux_session_has_window(session_name: str, window_name: str) -> bool:
+    """True if *session_name* currently has a window named *window_name*."""
     try:
-        return _run_tmux(["list-windows", "-t", target], timeout=5).returncode == 0
+        proc = _run_tmux(["list-windows", "-t", session_name, "-F", "#{window_name}"], timeout=5)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
-
-
-def _tmux_pane_command(target: str) -> tuple[str, bool] | None:
-    """Return the active pane command/dead state for a tmux window target."""
-    try:
-        proc = _run_tmux([
-            "display-message", "-p", "-t", target,
-            "#{pane_current_command}\t#{pane_dead}",
-        ], timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
     if proc.returncode != 0:
-        return None
-    command, _, dead = (proc.stdout or "").strip().partition("\t")
-    return command, dead == "1"
-
-
-def _tmux_window_has_live_rolly_chat(target: str) -> bool:
-    pane = _tmux_pane_command(target)
-    if not pane:
         return False
-    command, dead = pane
-    if dead:
-        return False
-    # The card-scoped Hermes TUI is a production node process. Keep the
-    # accepted set slightly wider for local/dev launches, but reject shells so
-    # stale/manual tmux windows get repaired instead of treated as Rolly chat.
-    return command in {"node", "npm", "hermes", "python", "python3"}
-
-
-def _tmux_target(session_name: str, window_name: str) -> str:
-    return f"{session_name}:{window_name}"
+    return window_name in (proc.stdout or "").split()
 
 
 def _build_rolly_chat_prompt(task_id: str, title: str | None, board: str | None = None) -> str:
@@ -675,25 +647,6 @@ def _build_rolly_chat_prompt(task_id: str, title: str | None, board: str | None 
         "Use that lookup as the source of truth; do not treat this prompt as the card's success criteria. "
         "After orienting yourself, help with this card only unless Deniz asks otherwise."
     )
-
-
-def _tui_shell_command(*, task_id: str | None = None, board: str | None = None) -> str:
-    """Return a shell command that launches a production, card-scoped Hermes TUI."""
-    from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
-
-    argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
-    env = {
-        "NODE_ENV": "production",
-        "HERMES_TUI_INLINE": "1",
-        "HERMES_TUI_DISABLE_MOUSE": "1",
-    }
-    if task_id:
-        env["HERMES_SESSION_SOURCE"] = f"kanban-card:{task_id}"
-        env["HERMES_KANBAN_TASK"] = task_id
-    if board:
-        env["HERMES_KANBAN_BOARD"] = board
-    env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
-    return f"cd {shlex.quote(str(cwd))} && {env_prefix} " + " ".join(shlex.quote(part) for part in argv)
 
 
 @router.get("/tasks/{task_id}/claude-context")
@@ -718,70 +671,53 @@ def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
         "prompt": launch["prompt"],
         "rolly_prompt": _build_rolly_chat_prompt(task_id, title, board),
         "command": command,
-        "mode": "card-tmux-two-window",
+        "mode": "card-tmux-single-window",
         "session_name": session_name,
         "session_exists": session_exists,
-        "rolly_target": _tmux_target(session_name, "rolly-chat"),
-        # Browser card terminal attaches to the whole session so tmux is the
-        # source of truth; users switch windows with ctrl-b n/p/etc.
+        # One window per card: the Terminal/CC shell. Card-scoped Rolly chat now
+        # lives in the global dashboard assistant sidebar, so the browser pane
+        # attaches to the single-window session directly.
         "terminal_target": session_name,
-        "terminal_window_target": _tmux_target(session_name, "terminal"),
     }
 
 
 @router.post("/tasks/{task_id}/tmux-session")
 def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
-    """Start/reuse a card-scoped tmux session with Rolly chat + terminal windows."""
+    """Start/reuse a single-window, card-scoped tmux session (Terminal / CC).
+
+    The card workspace gets exactly ONE tmux window — the execution/CC shell,
+    rooted at the card's workspace. Card-scoped Rolly chat moved to the global
+    dashboard assistant sidebar, so we no longer spawn a second TUI window.
+    """
     context = get_task_claude_context(task_id, board=board)
     session_name = str(context["session_name"])
     workspace_path = str(context["workspace_path"])
-    rolly_target = str(context["rolly_target"])
-    terminal_target = str(context["terminal_window_target"])
 
     session_exists = _tmux_has_session(session_name)
-    seeded_rolly = False
     if not session_exists:
         proc = _run_tmux([
-            "new-session", "-d", "-s", session_name, "-n", "rolly-chat", "-c", workspace_path,
-            _tui_shell_command(task_id=task_id, board=board),
+            "new-session", "-d", "-s", session_name, "-n", "terminal", "-c", workspace_path,
         ])
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "tmux failed").strip()
             raise HTTPException(status_code=500, detail=detail[:500])
-        proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", "/Users/rolly"])
+    elif not _tmux_session_has_window(session_name, "terminal"):
+        # Defensive: the session is alive but its single 'terminal' window is
+        # gone (shouldn't happen — tmux kills a session when its last window
+        # exits — but keeps reconnect idempotent so the browser can always
+        # attach). Recreate exactly the one window, still rooted at the card.
+        proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", workspace_path])
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "tmux new-window failed").strip()
             raise HTTPException(status_code=500, detail=detail[:500])
-        _run_tmux(["select-window", "-t", rolly_target], timeout=5)
-    else:
-        if _tmux_has_window(rolly_target) and not _tmux_window_has_live_rolly_chat(rolly_target):
-            proc = _run_tmux(["kill-window", "-t", rolly_target], timeout=5)
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "tmux kill stale rolly-chat window failed").strip()
-                raise HTTPException(status_code=500, detail=detail[:500])
-        if not _tmux_has_window(rolly_target):
-            proc = _run_tmux(["new-window", "-t", session_name, "-n", "rolly-chat", "-c", workspace_path, _tui_shell_command(task_id=task_id, board=board)])
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "tmux rolly-chat window failed").strip()
-                raise HTTPException(status_code=500, detail=detail[:500])
-            _run_tmux(["select-window", "-t", rolly_target], timeout=5)
-        if not _tmux_has_window(terminal_target):
-            proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", "/Users/rolly"])
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "tmux terminal window failed").strip()
-                raise HTTPException(status_code=500, detail=detail[:500])
 
     return {
         **context,
         "started": not session_exists,
-        "seeded_rolly": seeded_rolly,
         "attach_command": f"tmux attach-session -t {shlex.quote(session_name)}",
-        "rolly_attach_command": f"tmux attach-session -t {shlex.quote(rolly_target)}",
-        "terminal_attach_command": f"tmux attach-session -t {shlex.quote(terminal_target)}",
-        "rolly_terminal_url": f"/api/pty?pty_mode=tmux&tmux_session={urllib.parse.quote(rolly_target)}",
+        "terminal_attach_command": f"tmux attach-session -t {shlex.quote(session_name)}",
         "terminal_url": f"/api/pty?pty_mode=tmux&tmux_session={urllib.parse.quote(session_name)}",
         "terminal_target": session_name,
-        "terminal_window_target": terminal_target,
         "session_exists": True,
         "prompt": context.get("prompt", ""),
     }

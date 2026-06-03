@@ -19,6 +19,7 @@ import React, {
 } from "react";
 import { api, fetchJSON } from "@/lib/api";
 import { cn, timeAgo, isoTimeAgo } from "@/lib/utils";
+import { setEntityContext, getPageContext } from "@/lib/pageContext";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
@@ -146,6 +147,11 @@ export function exposePluginSDK() {
 
     // Utilities
     utils: { cn, timeAgo, isoTimeAgo },
+
+    // Page-context bus — plugins publish the entity in view (e.g. an open
+    // Kanban card) so the global Rolly assistant sidebar is page-aware. Pass
+    // null to clear on close/unmount. See web/src/lib/pageContext.ts.
+    pageContext: { setEntityContext, getPageContext },
 
     // Hooks
     useI18n,
