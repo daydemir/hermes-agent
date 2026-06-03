@@ -542,18 +542,37 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # via the process env before launch so the child Chrome inherits it.
             for k, v in chrome_env.items():
                 os.environ[k] = v
-            browser = pw.chromium.launch(
-                headless=not headed,
-                args=chrome_args,
-            )
+            # Google Meet rejects Playwright's bundled "Chrome for Testing"
+            # build as an unsupported browser ("You can't join this video
+            # call"). Drive the real installed Google Chrome via
+            # channel="chrome"; fall back to bundled chromium if absent.
+            channel = os.environ.get("HERMES_MEET_CHROME_CHANNEL", "chrome").strip()
+            using_real_chrome = False
+            if channel and channel.lower() not in {"chromium", "none", ""}:
+                try:
+                    browser = pw.chromium.launch(
+                        channel=channel, headless=not headed, args=chrome_args
+                    )
+                    using_real_chrome = True
+                except Exception as e:
+                    state.set(
+                        error=f"Chrome channel '{channel}' unavailable ({e}); "
+                        "using bundled chromium"
+                    )
+                    browser = pw.chromium.launch(headless=not headed, args=chrome_args)
+            else:
+                browser = pw.chromium.launch(headless=not headed, args=chrome_args)
             context_args = {
                 "viewport": {"width": 1280, "height": 800},
-                "user_agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
                 "permissions": ["microphone", "camera"],
             }
+            # Only spoof a UA on the bundled chromium; real Chrome already
+            # sends a current, Meet-supported user agent.
+            if not using_real_chrome:
+                context_args["user_agent"] = (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
             if auth_state and Path(auth_state).is_file():
                 context_args["storage_state"] = auth_state
             context = browser.new_context(**context_args)

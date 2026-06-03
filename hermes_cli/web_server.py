@@ -490,9 +490,14 @@ def _voice_room_signal_state(call_id: str, since: int = 0, limit: int = 200, *, 
     safe_limit = max(1, min(limit, 500))
     with _VOICE_ROOM_SIGNAL_LOCK:
         messages = list(_VOICE_ROOM_SIGNALS.get(call_id, []))
+    # A peer must never re-read its OWN offer/answer/ice/join (no from_user==user
+    # clause): self-echo plus a cursor reset would replay completed exchanges as
+    # live glare/offer storms for late joiners and reconnects. Clients seed their
+    # cursor from the index returned by their join POST, so they only ever see
+    # signals that arrived after they joined.
     visible = [
         msg for msg in messages
-        if int(msg.get("index") or 0) > safe_since and (not msg.get("to_user") or msg.get("to_user") == user or msg.get("from_user") == user)
+        if int(msg.get("index") or 0) > safe_since and (not msg.get("to_user") or msg.get("to_user") == user)
     ][:safe_limit]
     return {"ok": True, "call_id": call_id, "cursor": len(messages), "signals": visible}
 
@@ -1196,6 +1201,44 @@ async def create_voice_meet_invite(payload: VoiceMeetInviteRequest, request: Req
         ),
         "feature_flag": "HERMES_VOICE_MEET_INVITES",
     }
+
+
+@app.get("/api/voice/ice")
+async def get_voice_ice(_request: Request):
+    """ICE server config for the dashboard Meet-mode peer mesh.
+
+    Always advertises a public STUN server. When a TURN relay is configured via
+    env (``HERMES_VOICE_TURN_URLS`` + ``HERMES_VOICE_TURN_USERNAME`` +
+    ``HERMES_VOICE_TURN_CREDENTIAL``) it is appended so the browser can relay
+    human<->human audio. On a Tailscale-only deployment the browser mDNS
+    obfuscates the host candidate, so when a TURN entry exists AND
+    ``HERMES_VOICE_ICE_RELAY_ONLY`` is set we also hand back
+    ``ice_transport_policy: "relay"`` to force all mesh media through the relay
+    both peers can reach. The relay policy is emitted ONLY when a TURN entry is
+    present, so a misconfigured/missing TURN degrades to STUN instead of
+    bricking the call. This applies to the mesh only; the OpenAI Realtime peer
+    keeps its default policy.
+    """
+    ice: List[Dict[str, Any]] = [{"urls": "stun:stun.l.google.com:19302"}]
+    extra_stun = os.environ.get("HERMES_VOICE_STUN_URLS", "").strip()
+    if extra_stun:
+        ice.append({"urls": [u.strip() for u in extra_stun.split(",") if u.strip()]})
+    turn_urls = os.environ.get("HERMES_VOICE_TURN_URLS", "").strip()
+    turn_user = os.environ.get("HERMES_VOICE_TURN_USERNAME", "").strip()
+    turn_cred = os.environ.get("HERMES_VOICE_TURN_CREDENTIAL", "").strip()
+    has_turn = bool(turn_urls and turn_user and turn_cred)
+    if has_turn:
+        ice.append(
+            {
+                "urls": [u.strip() for u in turn_urls.split(",") if u.strip()],
+                "username": turn_user,
+                "credential": turn_cred,
+            }
+        )
+    out: Dict[str, Any] = {"ok": True, "ice_servers": ice}
+    if has_turn and env_var_enabled("HERMES_VOICE_ICE_RELAY_ONLY", default=False):
+        out["ice_transport_policy"] = "relay"
+    return out
 
 
 @app.get("/api/voice/context")

@@ -145,6 +145,32 @@ BOARD_COLUMNS: list[str] = ["triage", "ready", "done"]
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+def _rolly_user_assignee_slugs() -> list[str]:
+    """Return configured Rolly human slugs usable as card assignees.
+
+    This is intentionally optional: upstream Hermes installs do not have
+    ``rolly-users.json``. When present in the Hermes root, it lets the
+    dashboard offer Deniz/Arman/etc. as owners even before they have any
+    cards on the board.
+    """
+    path = kanban_db.kanban_home() / "rolly-users.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(users, list):
+        return []
+    slugs: list[str] = []
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        slug = str(user.get("slug") or "").strip().lower()
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs
+
+
 def _task_dict(
     task: kanban_db.Task,
     *,
@@ -482,14 +508,25 @@ def get_board(
                 "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
             )
         ]
-        # List of distinct assignees for the lane-by-profile sub-grouping.
-        assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
-        ]
+        # Known assignee options: real task assignees plus optional Rolly
+        # human slugs from the local user registry. This keeps the picker
+        # useful before someone has already claimed a first card. ``users``
+        # is the stricter system-user list used by card assignment dropdowns;
+        # when absent on upstream installs, the UI falls back to assignees.
+        users = _rolly_user_assignee_slugs()
+        assignees = []
+        seen_assignees: set[str] = set()
+        for a in users:
+            seen_assignees.add(a)
+            assignees.append(a)
+        for r in conn.execute(
+            "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
+            "AND status != 'archived' ORDER BY assignee"
+        ):
+            a = r["assignee"]
+            if a and a not in seen_assignees:
+                seen_assignees.add(a)
+                assignees.append(a)
 
         return {
             "columns": [
@@ -497,6 +534,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "users": users,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -592,16 +630,50 @@ def _tmux_has_window(target: str) -> bool:
         return False
 
 
+def _tmux_pane_command(target: str) -> tuple[str, bool] | None:
+    """Return the active pane command/dead state for a tmux window target."""
+    try:
+        proc = _run_tmux([
+            "display-message", "-p", "-t", target,
+            "#{pane_current_command}\t#{pane_dead}",
+        ], timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    command, _, dead = (proc.stdout or "").strip().partition("\t")
+    return command, dead == "1"
+
+
+def _tmux_window_has_live_rolly_chat(target: str) -> bool:
+    pane = _tmux_pane_command(target)
+    if not pane:
+        return False
+    command, dead = pane
+    if dead:
+        return False
+    # The card-scoped Hermes TUI is a production node process. Keep the
+    # accepted set slightly wider for local/dev launches, but reject shells so
+    # stale/manual tmux windows get repaired instead of treated as Rolly chat.
+    return command in {"node", "npm", "hermes", "python", "python3"}
+
+
 def _tmux_target(session_name: str, window_name: str) -> str:
     return f"{session_name}:{window_name}"
 
 
-def _build_rolly_chat_prompt(task_id: str, title: str | None) -> str:
+def _build_rolly_chat_prompt(task_id: str, title: str | None, board: str | None = None) -> str:
     title_line = f"Title: {title}" if title else "Title: (unknown)"
+    board_line = f"Board: {board}" if board else "Board: default"
     return (
-        f"You are Rolly Chat inside Kanban card {task_id}. {title_line}. "
-        "This conversation is specifically about this card. Start by briefly orienting yourself "
-        "to the card, then ask what Deniz wants to do next unless the next message already gives direction."
+        "You are Rolly, talking with Deniz about a specific Kanban card.\n"
+        f"Card id: {task_id}\n"
+        f"{title_line}\n"
+        f"{board_line}\n"
+        "First, look up the card by id to load the current body, acceptance criteria, links, "
+        "workspace, status, and latest summary before giving advice or taking action. "
+        "Use that lookup as the source of truth; do not treat this prompt as the card's success criteria. "
+        "After orienting yourself, help with this card only unless Deniz asks otherwise."
     )
 
 
@@ -624,29 +696,6 @@ def _tui_shell_command(*, task_id: str | None = None, board: str | None = None) 
     return f"cd {shlex.quote(str(cwd))} && {env_prefix} " + " ".join(shlex.quote(part) for part in argv)
 
 
-def _seed_tmux_window(target: str, text: str) -> None:
-    """Paste text into a tmux pane and submit it once."""
-    import tempfile
-
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fh:
-        fh.write(text)
-        path = fh.name
-    try:
-        buffer_name = f"seed-{target.replace(':', '-')}"
-        proc = _run_tmux(["load-buffer", "-b", buffer_name, path], timeout=5)
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or "tmux load-buffer failed").strip())
-        proc = _run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", target], timeout=5)
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or proc.stdout or "tmux paste-buffer failed").strip())
-        _run_tmux(["send-keys", "-t", target, "Enter"], timeout=5)
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-
-
 @router.get("/tasks/{task_id}/claude-context")
 def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
     """Return a copy-paste Claude Code launch prompt for a card workspace."""
@@ -661,11 +710,13 @@ def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
     session_name = f"card-{task_id}".replace("_", "-")
     command = f"tmux new-session -A -s {shlex.quote(session_name)} -c {shlex.quote(launch['workspace_path'])}"
     session_exists = _tmux_has_session(session_name)
+    title = (card_context.get("task") or {}).get("title")
     return {
         "task_id": launch["task_id"],
-        "title": (card_context.get("task") or {}).get("title"),
+        "title": title,
         "workspace_path": launch["workspace_path"],
         "prompt": launch["prompt"],
+        "rolly_prompt": _build_rolly_chat_prompt(task_id, title, board),
         "command": command,
         "mode": "card-tmux-two-window",
         "session_name": session_name,
@@ -686,7 +737,6 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
     workspace_path = str(context["workspace_path"])
     rolly_target = str(context["rolly_target"])
     terminal_target = str(context["terminal_window_target"])
-    prompt = str(context["prompt"])
 
     session_exists = _tmux_has_session(session_name)
     seeded_rolly = False
@@ -703,26 +753,23 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
             detail = (proc.stderr or proc.stdout or "tmux new-window failed").strip()
             raise HTTPException(status_code=500, detail=detail[:500])
         _run_tmux(["select-window", "-t", rolly_target], timeout=5)
-        seeded_rolly = True
     else:
+        if _tmux_has_window(rolly_target) and not _tmux_window_has_live_rolly_chat(rolly_target):
+            proc = _run_tmux(["kill-window", "-t", rolly_target], timeout=5)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "tmux kill stale rolly-chat window failed").strip()
+                raise HTTPException(status_code=500, detail=detail[:500])
         if not _tmux_has_window(rolly_target):
             proc = _run_tmux(["new-window", "-t", session_name, "-n", "rolly-chat", "-c", workspace_path, _tui_shell_command(task_id=task_id, board=board)])
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "tmux rolly-chat window failed").strip()
                 raise HTTPException(status_code=500, detail=detail[:500])
-            seeded_rolly = True
+            _run_tmux(["select-window", "-t", rolly_target], timeout=5)
         if not _tmux_has_window(terminal_target):
             proc = _run_tmux(["new-window", "-t", session_name, "-n", "terminal", "-c", "/Users/rolly"])
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "tmux terminal window failed").strip()
                 raise HTTPException(status_code=500, detail=detail[:500])
-
-    if seeded_rolly:
-        time.sleep(1.2)
-        try:
-            _seed_tmux_window(rolly_target, prompt)
-        except Exception as exc:
-            log.warning("failed to seed Rolly card chat prompt for %s: %s", task_id, exc)
 
     return {
         **context,
@@ -736,7 +783,38 @@ def start_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
         "terminal_target": session_name,
         "terminal_window_target": terminal_target,
         "session_exists": True,
-        "prompt": prompt,
+        "prompt": context.get("prompt", ""),
+    }
+
+
+@router.delete("/tasks/{task_id}/tmux-session")
+def kill_task_tmux_session(task_id: str, board: Optional[str] = Query(None)):
+    """Kill the card-scoped tmux session after manual work is complete."""
+    context = get_task_claude_context(task_id, board=board)
+    session_name = str(context["session_name"])
+
+    if not _tmux_has_session(session_name):
+        return {
+            **context,
+            "killed": False,
+            "session_exists": False,
+        }
+
+    try:
+        proc = _run_tmux(["kill-session", "-t", session_name], timeout=10)
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="tmux not found")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="tmux kill-session timed out")
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "tmux kill-session failed").strip()
+        raise HTTPException(status_code=500, detail=detail[:500])
+
+    return {
+        **context,
+        "killed": True,
+        "session_exists": False,
     }
 
 
@@ -2182,9 +2260,19 @@ def _board_counts(slug: str) -> dict[str, int]:
 
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
-    """Return every board on disk with task counts and the active slug."""
+    """Return the dashboard-visible boards with task counts and the active slug.
+
+    The dashboard is intentionally rolly-only now: the legacy ``default``
+    board may still exist for back-compat / direct API access, but it should
+    not appear as a selectable option in the UI.
+    """
     boards = kanban_db.list_boards(include_archived=include_archived)
-    current = kanban_db.get_current_board()
+    rolly_only = [b for b in boards if b["slug"] == "rolly"]
+    if rolly_only:
+        boards = rolly_only
+        current = "rolly"
+    else:
+        current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])

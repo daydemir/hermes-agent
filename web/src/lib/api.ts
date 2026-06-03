@@ -343,6 +343,10 @@ export const api = {
       headers: user ? { "X-Rolly-User": user } : undefined,
     });
   },
+  getVoiceIce: (user?: string) =>
+    fetchJSON<VoiceIceResponse>("/api/voice/ice", {
+      headers: user ? { "X-Rolly-User": user } : undefined,
+    }),
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
   getModelsAnalytics: (days: number) =>
@@ -835,6 +839,19 @@ export interface VoiceMeetSignalsResponse {
   call_id: string;
   cursor: number;
   signals: VoiceMeetSignal[];
+}
+
+export interface VoiceIceServer {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
+export interface VoiceIceResponse {
+  ok: boolean;
+  ice_servers: VoiceIceServer[];
+  /** Present only when a TURN relay is configured and relay-only is forced. */
+  ice_transport_policy?: "relay" | "all";
 }
 
 export interface VoiceToolResponse {

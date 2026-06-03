@@ -112,6 +112,31 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_assignees_include_rolly_user_registry(client, kanban_home):
+    (kanban_home / "rolly-users.json").write_text(
+        '{"users":[{"slug":"deniz"},{"slug":"arman"}]}',
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["assignees"] == ["deniz", "arman"]
+    assert data["users"] == ["deniz", "arman"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Owned card", "assignee": "deniz"},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["assignees"] == ["deniz", "arman"]
+    assert data["users"] == ["deniz", "arman"]
+
+
 def test_completed_tasks_hidden_by_default_but_available_in_history(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "finish me", "priority": 4})
     assert r.status_code == 200, r.text
@@ -187,6 +212,10 @@ def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     assert data["session_name"] == expected_session
     assert "Implement card workspace" in data["prompt"]
     assert "manual Claude Code" in data["prompt"]
+    assert f"Card id: {task_id}" in data["rolly_prompt"]
+    assert "Title: Implement card workspace" in data["rolly_prompt"]
+    assert "First, look up the card by id" in data["rolly_prompt"]
+    assert "do not treat this prompt as the card's success criteria" in data["rolly_prompt"]
 
 
 def test_claude_context_endpoint_defaults_scratch_workspace_to_home(client):
@@ -237,6 +266,7 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["started"] is True
+    assert data["seeded_rolly"] is False
     assert data["session_name"] == expected_session
     assert data["rolly_target"] == f"{expected_session}:rolly-chat"
     assert data["terminal_target"] == expected_session
@@ -251,6 +281,92 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
     ]
     assert calls[3][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", "/Users/rolly"]
     assert calls[4][0] == ["tmux", "select-window", "-t", f"{expected_session}:rolly-chat"]
+    assert not any(c[0][1:2] == ["paste-buffer"] for c in calls)
+
+
+def test_tmux_session_endpoint_repairs_stale_rolly_chat_window(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Repair chat", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+    killed_stale = False
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, **kwargs):
+        nonlocal killed_stale
+        calls.append((args, kwargs))
+        if args[:2] == ["tmux", "has-session"]:
+            return Result(0)
+        if args[:2] == ["tmux", "list-windows"]:
+            target = args[3]
+            if target.endswith(":rolly-chat"):
+                return Result(1 if killed_stale else 0)
+            if target.endswith(":terminal"):
+                return Result(0)
+        if args[:2] == ["tmux", "display-message"]:
+            return Result(0, stdout="zsh\t0\n")
+        if args[:2] == ["tmux", "kill-window"]:
+            killed_stale = True
+            return Result(0)
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda **_kwargs: "hermes --tui")
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["started"] is False
+    assert data["seeded_rolly"] is False
+    assert ["tmux", "kill-window", "-t", f"{expected_session}:rolly-chat"] in [c[0] for c in calls]
+    assert [
+        "tmux", "new-window", "-t", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
+    ] in [c[0] for c in calls]
+
+
+def test_tmux_session_endpoint_kills_card_tmux_session(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Done work", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["killed"] is True
+    assert data["session_exists"] is False
+    assert data["session_name"] == expected_session
+    assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
+    assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
+    assert calls[2][0] == ["tmux", "kill-session", "-t", expected_session]
 
 
 def test_card_tui_shell_command_sets_card_session_env(client):
@@ -268,9 +384,15 @@ def test_dashboard_rolly_chat_passes_board_slug_to_tmux_session():
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
     js = bundle.read_text()
 
-    assert "h(CardPromptActions, { task: t, boardSlug: props.boardSlug })" in js
+    assert "function CardWorkspaceSection" in js
+    assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug)" in js
     assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug)" in js
     assert "setTerminalReady(!!(d && d.session_exists))" in js
+    assert "method: \"DELETE\"" in js
+    assert "killTmuxSession" in js
+    assert "copyRollyPrompt" in js
+    assert "copyTextToClipboard((p && p.rolly_prompt) || \"\"" in js
+    assert "payload.rolly_prompt" in js
     assert "copyCardPrompt" in js
     assert "h(RollyChatSection, { task: t, boardSlug: props.boardSlug })" not in js
     assert "readPathTaskId() || readUrlParam(\"task\")" in js
@@ -341,11 +463,10 @@ def test_tenant_filter(client):
 
 
 def test_board_query_param_default_overrides_current_board_pointer(client):
-    """Dashboard ``?board=default`` must win even if the CLI's current-board
-    pointer targets a non-default board.
+    """Dashboard ``?board=default`` must still work for direct API access.
 
-    Regression: selecting the Default board in the dashboard must not fall
-    through to whichever board ``hermes kanban boards switch`` last pinned.
+    The dashboard UI no longer surfaces Default as a selectable board, but the
+    backend route should remain able to read it explicitly for back-compat.
     """
     default_task = client.post(
         "/api/plugins/kanban/tasks",
@@ -396,6 +517,20 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "onChange: function (e)" in js
     assert "selectChangeHandler(props.setTenantFilter)" in js
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
+
+
+def test_dashboard_card_assignment_uses_system_user_dropdown():
+    """Card assignment controls should pick system users from a dropdown."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "? boardData.users" in js
+    assert "System user to assign" in js
+    assert "Assign this card to a system user" in js
+    assert "selectChangeHandler(setV)" in js
+    assert "emptyAssignee" not in js
 
 
 def test_dashboard_card_detail_is_fullscreen_not_sidebar():

@@ -1086,7 +1086,6 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
         h(AttentionStrip, {
           boardData,
           onOpen: openTask,
@@ -1130,6 +1129,9 @@
           },
         }) : h(BoardColumns, {
           board: filteredBoard,
+          assignees: ((boardData && boardData.users) || []).length > 0
+            ? boardData.users
+            : ((boardData && boardData.assignees) || []),
           laneByProfile,
           selectedIds,
           failedIds,
@@ -1153,7 +1155,9 @@
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
-          assignees: (boardData && boardData.assignees) || [],
+          assignees: ((boardData && boardData.users) || []).length > 0
+            ? boardData.users
+            : ((boardData && boardData.assignees) || []),
           eventTick: taskEventTick[selectedTaskId] || 0,
         }) : null,
       ),
@@ -2066,6 +2070,7 @@
   function BoardToolbar(props) {
     const { t } = useI18n();
     const tenants = (props.board && props.board.tenants) || [];
+    const showTenantFilter = tenants.length > 1 || !!props.tenantFilter;
     const assignees = (props.board && props.board.assignees) || [];
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "hermes-kanban-view-tabs" },
@@ -2088,7 +2093,7 @@
           className: "w-56 h-8",
         }),
       ),
-      h("div", { className: "flex flex-col gap-1",
+      showTenantFilter ? h("div", { className: "flex flex-col gap-1",
                  title: "Tenants are free-form tags on a task (e.g. customer, project, team). Set them via the task drawer or kanban_create." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "tenant", "Tenant")),
         h(Select, Object.assign({
@@ -2100,7 +2105,7 @@
             return h(SelectOption, { key: tn, value: tn }, tn);
           }),
         ),
-      ),
+      ) : null,
       h("div", { className: "flex flex-col gap-1",
                  title: "Filter by assigned Hermes profile. Profiles are the named agent identities that claim and work on tasks." },
         h(Label, { className: "text-xs text-muted-foreground" }, tx(t, "assignee", "Assignee")),
@@ -2131,11 +2136,6 @@
         tx(t, "lanesByProfile", "Lanes by profile"),
       ),
       h("div", { className: "flex-1" }),
-      h(Button, {
-        onClick: props.onNudgeDispatch,
-        size: "sm",
-        title: "Wake the dispatcher to claim ready tasks now instead of waiting for the next tick. Use this after adding tasks if you want them picked up immediately.",
-      }, tx(t, "nudgeDispatcher", "Nudge dispatcher")),
       h(Button, {
         onClick: props.onRefresh,
         size: "sm",
@@ -2174,7 +2174,7 @@
       h(Button, {
         onClick: function () { props.onApply({ status: "ready" }); },
         size: "sm",
-        title: "Move selected tasks to Ready. Ready tasks are picked up by the dispatcher on the next tick.",
+        title: "Move selected tasks to Ready. Ready cards are prepared for manual execution.",
       }, "→ ready"),
       h(Button, {
         onClick: function () {
@@ -2408,6 +2408,7 @@
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          assignees: props.assignees || [],
         });
       }),
       h(TrashDropZone, {
@@ -2516,6 +2517,7 @@
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
+        assignees: props.assignees || [],
         onSubmit: function (body) {
           props.onCreate(body).then(function () { setShowCreate(false); });
         },
@@ -2694,7 +2696,7 @@
               : null,
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority",
-                           title: `Priority ${t.priority}. Higher-priority tasks are claimed first by the dispatcher.` }, `P${t.priority}`)
+                           title: `Priority ${t.priority}. Higher-priority cards appear earlier in the priority list.` }, `P${t.priority}`)
               : null,
             t.tenant
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
@@ -2713,7 +2715,7 @@
               ? h(Badge, {
                   variant: "outline",
                   className: "hermes-kanban-needs-assignee",
-                  title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile."),
+                  title: tx(i18n, "needsAssigneeHint", "Dependencies are satisfied; assign a profile when you are ready to run this manually."),
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
           ),
@@ -2725,7 +2727,7 @@
                             title: `Assigned to Hermes profile @${t.assignee}` }, "@", t.assignee)
               : h("span", { className: "hermes-kanban-unassigned",
                             title: needsAssignee
-                              ? tx(i18n, "needsAssigneeHint", "Dependencies are satisfied, but the dispatcher skips this task until you assign a profile.")
+                              ? tx(i18n, "needsAssigneeHint", "Dependencies are satisfied; assign a profile when you are ready to run this manually.")
                               : "No profile assigned." },
                   tx(i18n, "unassigned", "unassigned")),
             t.comment_count > 0
@@ -2831,28 +2833,27 @@
         rows: 2,
       }),
       h("div", { className: "flex gap-2" },
-        h(Input, {
+        h(Select, Object.assign({
           value: assignee,
-          onChange: function (e) { setAssignee(e.target.value); },
-          placeholder: props.columnName === "triage"
-            ? tx(t, "specifier", "specifier")
-            : tx(t, "assigneePlaceholder", "assignee"),
           className: "h-7 text-xs flex-1",
           title: props.columnName === "triage"
-            ? "Hermes profile that will spec this task (default: the dispatcher's configured specifier). Leave blank to let the dispatcher pick."
-            : "Hermes profile to assign. Leave blank and the dispatcher will pick from available profiles when the task is Ready.",
-          style: { textTransform: "none" },
-          autoCapitalize: "none",
-          autoCorrect: "off",
-          spellCheck: false,
-        }),
+            ? "System user that will spec this task. Leave blank to keep the card unassigned for manual selection."
+            : "System user to assign. Leave blank to keep the card unassigned for manual selection.",
+        }, selectChangeHandler(setAssignee)),
+          h(SelectOption, { value: "" }, props.columnName === "triage"
+            ? tx(t, "specifier", "— specifier —")
+            : tx(t, "assigneePlaceholder", "— assignee —")),
+          (props.assignees || []).map(function (a) {
+            return h(SelectOption, { key: a, value: a }, a);
+          }),
+        ),
         h(Input, {
           type: "number",
           value: priority,
           onChange: function (e) { setPriority(e.target.value); },
           placeholder: "pri",
           className: "h-7 text-xs w-16",
-          title: "Priority. Higher-priority tasks are claimed first by the dispatcher. 0 = default.",
+          title: "Priority. Higher-priority cards appear earlier in the priority list. 0 = default.",
         }),
       ),
       h(Input, {
@@ -3406,9 +3407,49 @@
         .catch(function (e) { setErr(parseApiErrorMessage(e)); })
         .finally(function () { setBusy(false); });
     };
+    const killTerminal = function () {
+      if (!task || busy || !terminalReady) return;
+      if (typeof window !== "undefined" && window.confirm && !window.confirm(tx(i18n, "confirmKillTmuxSession", "Kill this card's tmux session?"))) return;
+      setBusy(true);
+      setErr(null);
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug), { method: "DELETE" })
+        .then(function (d) {
+          setPayload(function (prev) { return Object.assign({}, prev || {}, d || {}, { session_exists: false }); });
+          setTerminalReady(false);
+          setTerminalNonce(function (n) { return n + 1; });
+        })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    };
     const markCopied = function (key) {
       setCopied(key);
       setTimeout(function () { setCopied(null); }, 2000);
+    };
+    const copyPrompt = function () {
+      const doCopy = function (p) {
+        copyTextToClipboard((p && p.prompt) || "", function () { markCopied("prompt"); });
+      };
+      if (payload && payload.prompt) return doCopy(payload);
+      if (!task || busy || !hasLaunchWorkspace) return;
+      setBusy(true);
+      setErr(null);
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug))
+        .then(function (d) { setPayload(d); doCopy(d); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    };
+    const copyRollyPrompt = function () {
+      const doCopy = function (p) {
+        copyTextToClipboard((p && p.rolly_prompt) || "", function () { markCopied("rolly_prompt"); });
+      };
+      if (payload && payload.rolly_prompt) return doCopy(payload);
+      if (!task || busy || !hasLaunchWorkspace) return;
+      setBusy(true);
+      setErr(null);
+      SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug))
+        .then(function (d) { setPayload(d); doCopy(d); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
     };
 
     useEffect(function () {
@@ -3416,42 +3457,57 @@
       loadContext();
     }, [task && task.id, props.boardSlug]);
 
-    return h("div", { className: "hermes-kanban-section" },
-      h("div", { className: "hermes-kanban-section-head" },
-        tx(i18n, "cardWorkspace", "Card workspace")),
-      h("div", { className: "text-xs text-muted-foreground mb-2" },
-        tx(i18n, "cardWorkspaceHint",
-          "Create or attach to this card's tmux session. Use tmux keys like ctrl-b n to switch between Rolly Chat and the shell.")),
-      !hasLaunchWorkspace ? h("div", { className: "text-xs text-destructive mb-2" },
+    return h("div", { className: "hermes-kanban-section hermes-kanban-terminal-workspace" },
+      !hasLaunchWorkspace ? h("div", { className: "hermes-kanban-compact-warning text-xs text-destructive" },
         tx(i18n, "cardWorkspaceNoWorkspace",
-          "Set a concrete workspace_path before launching Claude Code.")) : null,
-      task && !task.workspace_path && task.workspace_kind === "scratch" ? h("div", { className: "text-xs text-muted-foreground mb-2" },
+          "Set workspace_path to launch.")) : null,
+      task && !task.workspace_path && task.workspace_kind === "scratch" ? h("div", { className: "hermes-kanban-compact-warning text-xs text-muted-foreground" },
         tx(i18n, "cardWorkspaceScratchHome",
-          "Scratch card: terminal starts in /Users/rolly; cd manually as needed.")) : null,
-      h("div", { className: "flex flex-wrap items-center gap-2 mb-2" },
-        h(Button, {
-          size: "sm",
-          variant: "outline",
-          disabled: busy || !hasLaunchWorkspace,
-          onClick: startTerminal,
-        }, busy
-          ? tx(i18n, "starting", "Starting…")
-          : (terminalReady ? tx(i18n, "reconnectTerminal", "Reconnect tmux session")
-                         : tx(i18n, "createTmuxSession", "Create tmux session"))),
-        h(Button, {
-          size: "sm",
-          variant: "outline",
-          disabled: busy || !hasLaunchWorkspace,
-          onClick: loadContext,
-        }, payload ? tx(i18n, "refreshPrompt", "Refresh prompt")
-                   : tx(i18n, "preparePrompt", "Prepare prompt")),
-        payload ? h(Button, {
-          size: "sm",
-          variant: "outline",
-          onClick: function () { copyTextToClipboard(payload.prompt, function () { markCopied("prompt"); }); },
-        }, copied === "prompt" ? tx(i18n, "copied", "Copied") : tx(i18n, "copyPrompt", "Copy prompt")) : null,
+          "Scratch: starts in /Users/rolly.")) : null,
+      h("div", { className: "hermes-kanban-terminal-actions" },
+        h("div", { className: "hermes-kanban-terminal-actions-main" },
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            className: "hermes-kanban-terminal-action-primary",
+            disabled: busy || !hasLaunchWorkspace,
+            onClick: startTerminal,
+          }, busy
+            ? tx(i18n, "starting", "Starting…")
+            : (terminalReady ? tx(i18n, "reconnectTerminal", "Reconnect tmux session")
+                           : tx(i18n, "createTmuxSession", "Create tmux session"))),
+        ),
+        h("div", { className: "hermes-kanban-terminal-actions-secondary" },
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            disabled: busy || !hasLaunchWorkspace,
+            onClick: loadContext,
+          }, payload ? tx(i18n, "refreshPrompt", "Refresh prompt")
+                     : tx(i18n, "preparePrompt", "Prepare prompt")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            disabled: busy || !hasLaunchWorkspace,
+            onClick: copyPrompt,
+          }, copied === "prompt" ? tx(i18n, "copied", "Copied") : tx(i18n, "copyCardPrompt", "Copy card prompt")),
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            disabled: busy || !hasLaunchWorkspace,
+            onClick: copyRollyPrompt,
+          }, copied === "rolly_prompt" ? tx(i18n, "copied", "Copied") : tx(i18n, "copyRollyPrompt", "Copy Rolly prompt")),
+        ),
+        terminalReady ? h("div", { className: "hermes-kanban-terminal-actions-danger" },
+          h(Button, {
+            size: "sm",
+            variant: "outline",
+            className: "hermes-kanban-terminal-action-danger",
+            disabled: busy,
+            onClick: killTerminal,
+          }, tx(i18n, "killTmuxSession", "Kill tmux session"))) : null,
       ),
-      err ? h("div", { className: "text-xs text-destructive mb-2" }, err) : null,
+      err ? h("div", { className: "text-xs text-destructive" }, err) : null,
       terminalReady && payload && payload.terminal_target && PtyTerminalPane ? h(PtyTerminalPane, {
         key: `${payload.terminal_target}:${terminalNonce}`,
         title: `Terminal for ${task.id}`,
@@ -3459,7 +3515,8 @@
         tmuxTarget: payload.terminal_target,
         autoFocus: true,
       }) : null,
-      payload ? h("div", { className: "space-y-2" },
+      payload ? h("details", { className: "hermes-kanban-terminal-context" },
+        h("summary", { className: "hermes-kanban-section-head" }, tx(i18n, "promptContext", "Prompt context")),
         h(MetaRow, { label: tx(i18n, "mode", "Mode"), value: payload.mode || "browser-tmux-plus-copy-prompt" }),
         h(MetaRow, { label: tx(i18n, "workspace", "Workspace"), value: payload.workspace_path || "" }),
         payload.attach_command ? h(MetaRow, { label: tx(i18n, "attach", "Attach"), value: payload.attach_command }) : null,
@@ -3474,6 +3531,15 @@
     const task = props.task;
     const [payload, setPayload] = useState(null);
     const [err, setErr] = useState(null);
+    const [copied, setCopied] = useState(false);
+
+    const copyRollyPrompt = function () {
+      const prompt = (payload && payload.rolly_prompt) || "";
+      copyTextToClipboard(prompt, function () {
+        setCopied(true);
+        setTimeout(function () { setCopied(false); }, 2000);
+      });
+    };
 
     useEffect(function () {
       if (!task) return;
@@ -3486,8 +3552,16 @@
     }, [task && task.id, props.boardSlug]);
 
     return h("div", { className: "hermes-kanban-card-chat" },
-      h("div", { className: "text-xs text-muted-foreground mb-2" },
-        tx(i18n, "rollyChatHint", "Card-scoped Rolly chat. Use this to discuss or drive this card.")),
+      h("div", { className: "flex flex-wrap items-center justify-between gap-2 mb-2" },
+        h("div", { className: "text-xs text-muted-foreground" },
+          tx(i18n, "rollyChatHint", "Card-scoped Rolly chat. Use this to discuss or drive this card.")),
+        h(Button, {
+          size: "sm",
+          variant: "outline",
+          disabled: !payload || !payload.rolly_prompt,
+          onClick: copyRollyPrompt,
+        }, copied ? tx(i18n, "copied", "Copied") : tx(i18n, "copyRollyPrompt", "Copy Rolly prompt")),
+      ),
       err ? h("div", { className: "text-xs text-destructive mb-2" }, err) : null,
       payload && payload.rolly_target && PtyTerminalPane ? h(PtyTerminalPane, {
         key: payload.rolly_target,
@@ -3508,6 +3582,12 @@
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
     const [activePane, setActivePane] = useState("terminal");
+    const chip = function (label, value, title) {
+      if (value == null || value === "") return null;
+      return h("span", { className: "hermes-kanban-card-chip", title: title || `${label}: ${value}` },
+        label ? h("span", { className: "hermes-kanban-card-chip-label" }, label) : null,
+        h("span", { className: "hermes-kanban-card-chip-value" }, String(value)));
+    };
     const tab = function (key, label) {
       return h("button", {
         key,
@@ -3520,25 +3600,56 @@
     };
 
     return h("div", { className: "hermes-kanban-drawer-body" },
-      h("div", { className: "hermes-kanban-drawer-title" },
-        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
-        props.editing
-          ? h(TitleEditor, {
-              initial: t.title || "",
-              onSave: function (newTitle) {
-                return props.onPatch({ title: newTitle }).then(function () { props.setEditing(false); });
-              },
-              onCancel: function () { props.setEditing(false); },
-            })
-          : h("span", {
-              className: "hermes-kanban-drawer-title-text",
-              title: tx(i18n, "clickToEdit", "Click to edit"),
-              onClick: function () { props.setEditing(true); },
-            }, t.title || tx(i18n, "untitled", "(untitled)")),
+      h("div", { className: "hermes-kanban-card-chrome" },
+        h("div", { className: "hermes-kanban-card-top-row" },
+          h("div", { className: "hermes-kanban-card-chrome-main" },
+          h("div", { className: "hermes-kanban-drawer-title hermes-kanban-drawer-title--compact" },
+            h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[t.status]) }),
+            props.editing
+              ? h(TitleEditor, {
+                  initial: t.title || "",
+                  onSave: function (newTitle) {
+                    return props.onPatch({ title: newTitle }).then(function () { props.setEditing(false); });
+                  },
+                  onCancel: function () { props.setEditing(false); },
+                })
+              : h("span", {
+                  className: "hermes-kanban-drawer-title-text hermes-kanban-drawer-title-text--compact",
+                  title: tx(i18n, "clickToEdit", "Click to edit"),
+                  onClick: function () { props.setEditing(true); },
+                }, t.title || tx(i18n, "untitled", "(untitled)")),
+          ),
+          h("div", { className: "hermes-kanban-card-chips" },
+            chip(null, t.status, tx(i18n, "status", "Status") + ": " + t.status),
+            chip("@", t.assignee || tx(i18n, "unassigned", "unassigned"), tx(i18n, "assignee", "Assignee") + ": " + (t.assignee || tx(i18n, "unassigned", "unassigned"))),
+            chip("P", t.priority, tx(i18n, "priority", "Priority") + ": " + t.priority),
+            t.tenant ? chip(null, t.tenant, tx(i18n, "tenant", "Tenant") + ": " + t.tenant) : null,
+            chip(null, t.workspace_path || t.workspace_kind, tx(i18n, "workspace", "Workspace") + ": " + `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`),
+          ),
+        ),
+        h("div", { className: "hermes-kanban-card-lifecycle" },
+          h(StatusActions, {
+            task: t,
+            onPatch: props.onPatch,
+            onSpecify: props.onSpecify,
+            onDecompose: props.onDecompose,
+          }))),
+        h("div", { className: "hermes-kanban-card-nav-row" },
+          h("div", { className: "hermes-kanban-workspace-tabs", role: "tablist" },
+            tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
+            tab("details", tx(i18n, "details", "Details")),
+          )),
       ),
+      h("div", { style: { display: activePane === "terminal" ? "block" : "none" } },
+        h(CardWorkspaceSection, {
+          task: t,
+          boardSlug: props.boardSlug,
+        })),
+      activePane === "details" ? h(React.Fragment, null,
       h("div", { className: "hermes-kanban-drawer-meta" },
+        h(MetaRow, { label: tx(i18n, "id", "ID"), value: t.id }),
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
-        h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
+        h(AssigneeEditor, { task: t, assignees: props.assignees || [], onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
         h(MetaRow, {
@@ -3557,23 +3668,6 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
-      h(StatusActions, {
-        task: t,
-        onPatch: props.onPatch,
-        onSpecify: props.onSpecify,
-        onDecompose: props.onDecompose,
-      }),
-      h(CardPromptActions, { task: t, boardSlug: props.boardSlug }),
-      h("div", { className: "hermes-kanban-workspace-tabs", role: "tablist" },
-        tab("details", tx(i18n, "details", "Details")),
-        tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
-      ),
-      h("div", { style: { display: activePane === "terminal" ? "block" : "none" } },
-        h(CardWorkspaceSection, {
-          task: t,
-          boardSlug: props.boardSlug,
-        })),
-      activePane === "details" ? h(React.Fragment, null,
       h(DiagnosticsSection, {
         task: t,
         boardSlug: props.boardSlug,
@@ -3841,7 +3935,12 @@
     const { t } = useI18n();
     const [editing, setEditing] = useState(false);
     const [v, setV] = useState(props.task.assignee || "");
+    const assignees = props.assignees || [];
     useEffect(function () { setV(props.task.assignee || ""); }, [props.task.assignee]);
+    const saveValue = function (nextValue) {
+      const finalValue = (nextValue == null ? v : nextValue).trim();
+      return props.onPatch({ assignee: finalValue || "" }).then(function () { setEditing(false); });
+    };
     if (!editing) {
       return h("div", { className: "hermes-kanban-meta-row" },
         h("span", { className: "hermes-kanban-meta-label" }, tx(t, "assignee", "Assignee")),
@@ -3852,25 +3951,31 @@
         }, props.task.assignee || tx(t, "unassigned", "unassigned")),
       );
     }
-    const save = function () {
-      props.onPatch({ assignee: v.trim() || "" }).then(function () { setEditing(false); });
-    };
+    const save = function () { saveValue(v); };
     return h("div", { className: "hermes-kanban-meta-row" },
       h("span", { className: "hermes-kanban-meta-label" }, tx(t, "assignee", "Assignee")),
-      h(Input, {
-        value: v, autoFocus: true,
-        onChange: function (e) { setV(e.target.value); },
-        onKeyDown: function (e) {
-          if (e.key === "Enter") { e.preventDefault(); save(); }
-          if (e.key === "Escape") setEditing(false);
-        },
-        placeholder: tx(t, "emptyAssignee", "(empty = unassign)"),
-        className: "h-7 text-xs flex-1",
-        style: { textTransform: "none" },
-        autoCapitalize: "none",
-        autoCorrect: "off",
-        spellCheck: false,
-      }),
+      h("div", { className: "flex gap-1 flex-1" },
+        h(Select, Object.assign({
+          value: v,
+          autoFocus: true,
+          className: "h-7 text-xs flex-1",
+          title: "Assign this card to a system user, or choose unassigned.",
+          onKeyDown: function (e) {
+            if (e.key === "Enter") { e.preventDefault(); save(); }
+            if (e.key === "Escape") setEditing(false);
+          },
+        }, selectChangeHandler(setV)),
+          h(SelectOption, { value: "" }, tx(t, "unassigned", "unassigned")),
+          assignees.map(function (a) {
+            return h(SelectOption, { key: a, value: a }, a);
+          }),
+        ),
+        h(Button, { onClick: save, size: "sm" }, tx(t, "save", "Save")),
+        h(Button, {
+          onClick: function () { setV(props.task.assignee || ""); setEditing(false); },
+          size: "sm",
+        }, tx(t, "cancel", "Cancel")),
+      ),
     );
   }
 
@@ -4049,11 +4154,13 @@
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
     const [decomposeMsg, setDecomposeMsg] = useState(null);
-    const b = function (label, patch, enabled, confirmMsg) {
+    const b = function (label, patch, enabled, confirmMsg, className) {
       return h(Button, {
         onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
         disabled: enabled === false,
         size: "sm",
+        variant: "outline",
+        className,
       }, label);
     };
 
@@ -4089,6 +4196,7 @@
             });
           },
           disabled: specifyBusy,
+          className: "hermes-kanban-lifecycle-tool",
           size: "sm",
         }, specifyBusy ? "Specifying…" : "✨ Specify")
       : null;
@@ -4136,6 +4244,7 @@
             });
           },
           disabled: decomposeBusy,
+          className: "hermes-kanban-lifecycle-tool",
           size: "sm",
         }, decomposeBusy ? "Decomposing…" : "⚗ Decompose")
       : null;
@@ -4144,11 +4253,12 @@
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
         decomposeButton,
-        b("→ triage",  { status: "triage" },   task.status !== "triage"),
-        b("→ ready",   { status: "ready" },    task.status !== "ready"),
+        b("→ triage",  { status: "triage" },   task.status !== "triage", null, "hermes-kanban-lifecycle-ghost"),
+        b("→ ready",   { status: "ready" },    task.status !== "ready", null, "hermes-kanban-lifecycle-ghost"),
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status !== "done" && task.status !== "archived",
-          getDestructiveConfirm(t, "done")),
+          getDestructiveConfirm(t, "done"),
+          "hermes-kanban-lifecycle-complete"),
       ),
       specifyMsg ? h("div", {
         className: specifyMsg.ok
