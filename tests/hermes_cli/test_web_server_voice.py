@@ -175,9 +175,38 @@ def test_voice_lookup_tools_return_explicit_no_match_text(voice_client, monkeypa
     sessions = client.post("/api/voice/tool", json={"name": "session_lookup", "arguments": {"query": "recent mix message"}})
 
     assert kanban.status_code == 200
-    assert kanban.json()["result"] == "Kanban: no matching results found for query: blocked mix card."
+    assert kanban.json()["result"] == "Kanban: no quick match for: blocked mix card. Next useful step: queue the suggested background follow-up if this needs a real answer now."
+    assert kanban.json()["data"]["status"] == "no_match"
+    assert kanban.json()["data"]["actions"][0]["type"] == "rolly_background"
     assert sessions.status_code == 200
-    assert sessions.json()["result"] == "Sessions: no matching results found for query: recent mix message."
+    assert sessions.json()["result"] == "Sessions: no quick match for: recent mix message. Next useful step: queue the suggested background follow-up if this needs a real answer now."
+    assert sessions.json()["data"]["status"] == "no_match"
+
+
+def test_voice_kanban_lookup_returns_top_active_cards_for_generic_query(voice_client):
+    client, web_server = voice_client
+    web_server.kanban_db.init_db()
+    conn = web_server.kanban_db.connect()
+    try:
+        card_id = web_server.kanban_db.create_task(
+            conn,
+            title="Fix Rolly Voice quick lookup",
+            body="Make quick lookup actionable during calls.",
+            assignee="default",
+            priority=7,
+            initial_status="running",
+        )
+    finally:
+        conn.close()
+
+    resp = client.post("/api/voice/tool", json={"name": "kanban_lookup", "arguments": {"query": "top current cards"}})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert card_id in body["result"]
+    assert "Fix Rolly Voice quick lookup" in body["result"]
+    assert body["data"]["status"] == "answered"
+    assert body["data"]["matches"] >= 1
 
 
 def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):

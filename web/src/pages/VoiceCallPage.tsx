@@ -820,12 +820,16 @@ export default function VoiceCallPage() {
         const result = await api.runVoiceTool({ name, arguments: args, call_id: callIdRef.current, realtime_call_id: callId, idempotency_key: idempotencyKey } satisfies VoiceToolRequest, speaker);
         const durationMs = Date.now() - startedAt;
         const output = result.ok ? result.result : `Tool failed: ${result.error ?? "unknown error"}`;
+        const lookupStatus = typeof result.data?.status === "string" ? result.data.status : "";
+        const lookupMatches = typeof result.data?.matches === "number" ? result.data.matches : null;
+        const logSuffix = lookupStatus ? `\nstatus: ${lookupStatus}${lookupMatches !== null ? `; matches: ${lookupMatches}` : ""}` : "";
         markWorkFinished(`tool:${toolKey}`, false);
-        addLog(result.ok ? "tool" : "error", `${name} finished in ${(durationMs / 1000).toFixed(1)}s\n${output.slice(0, 700)}`);
+        addLog(result.ok ? "tool" : "error", `${name} finished in ${(durationMs / 1000).toFixed(1)}s${logSuffix}\n${output.slice(0, 700)}`);
         persistTranscript("tool", output, result.ok ? "tool_result" : "tool_error", {
           realtime_call_id: callId,
           tool_name: name,
           duration_ms: durationMs,
+          result_data: result.data ?? {},
         });
         sendRealtimeEvent({
           type: "conversation.item.create",

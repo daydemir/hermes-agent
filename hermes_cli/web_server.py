@@ -703,6 +703,40 @@ def _voice_bound_text(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
+_VOICE_LOOKUP_STOPWORDS = {
+    "active", "also", "and", "are", "card", "cards", "check", "current", "for", "from", "have", "include",
+    "items", "list", "lookup", "now", "quick", "right", "search", "show", "status", "the", "top", "what", "with",
+}
+
+
+def _voice_lookup_terms(query: str | None) -> list[str]:
+    return [
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_-]{3,}", query or "")
+        if token.lower() not in _VOICE_LOOKUP_STOPWORDS
+    ]
+
+
+def _voice_lookup_action(source: str, query: str | None) -> Dict[str, Any]:
+    clean_query = _voice_bound_text(query or "current call question", 220)
+    return {
+        "type": "rolly_background",
+        "label": f"Queue a real {source} follow-up",
+        "request": f"Use full Rolly tools to answer this live voice-call lookup from {source}: {clean_query}. Return a concise grounded answer with IDs/paths/provenance if available.",
+    }
+
+
+def _voice_lookup_data(source: str, query: str | None, *, status: str, matches: int = 0, actions: list[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    return {
+        "kind": "voice_lookup",
+        "source": source,
+        "query": query or "",
+        "status": status,
+        "matches": matches,
+        "actions": actions or [],
+    }
+
+
 def _voice_read_markdown(path: Path, limit: int) -> str:
     try:
         return _voice_bound_text(path.read_text(encoding="utf-8", errors="ignore"), limit)
@@ -726,7 +760,7 @@ def _voice_brain_lookup_text(query: str | None = None, limit: int = 1800) -> str
     root = Path(os.getenv("ROLLY_BRAIN_ROOT", "/Users/rolly/rolly-brain")) / "wiki"
     if not root.exists():
         return ""
-    terms = [t.lower() for t in re.findall(r"[A-Za-z0-9_-]{3,}", query or "")]
+    terms = _voice_lookup_terms(query)
     candidates = sorted(root.rglob("*.md"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:200]
     hits: list[str] = []
     scored: list[tuple[int, Path, str]] = []
@@ -764,13 +798,20 @@ def _voice_kanban_digest(query: str | None = None, limit: int = 2200) -> str:
         con.close()
     except sqlite3.Error:
         return ""
-    terms = [t.lower() for t in re.findall(r"[A-Za-z0-9_-]{3,}", query or "")]
-    lines: list[str] = []
+    terms = _voice_lookup_terms(query)
+    scored_rows: list[tuple[int, Any]] = []
     for row in rows:
         body = row["body"] or ""
         haystack = f"{row['id']} {row['title']} {row['status']} {row['assignee'] or ''} {body}".lower()
-        if terms and not all(term in haystack for term in terms[:4]):
+        score = sum(1 for term in terms if term in haystack)
+        if terms and score == 0:
             continue
+        scored_rows.append((score, row))
+    if terms:
+        scored_rows.sort(key=lambda item: (item[0], item[1]["priority"] or 0), reverse=True)
+    lines: list[str] = []
+    for _score, row in scored_rows:
+        body = row["body"] or ""
         preview = _voice_bound_text(body, 220)
         assignee = f" @{row['assignee']}" if row["assignee"] else ""
         lines.append(f"{row['id']} [{row['status']}]{assignee}: {row['title']} — {preview}".rstrip(" —"))
@@ -786,16 +827,18 @@ def _voice_recent_sessions(query: str | None = None, limit: int = 1600) -> str:
     try:
         con = sqlite3.connect(str(db_path))
         con.row_factory = sqlite3.Row
-        if query:
+        terms = _voice_lookup_terms(query)
+        if terms:
+            where = " OR ".join("content LIKE ?" for _ in terms[:5])
             rows = con.execute(
-                """
+                f"""
                 SELECT session_id, role, content, timestamp
                 FROM messages
-                WHERE content LIKE ? AND role IN ('user','assistant')
+                WHERE role IN ('user','assistant') AND ({where})
                 ORDER BY timestamp DESC
                 LIMIT 8
                 """,
-                (f"%{query}%",),
+                tuple(f"%{term}%" for term in terms[:5]),
             ).fetchall()
         else:
             rows = con.execute(
@@ -843,8 +886,8 @@ def _voice_tool_result(text: str, *, tool_name: str, data: Dict[str, Any] | None
 
 
 def _voice_lookup_no_match(source: str, query: str | None) -> str:
-    suffix = f" for query: {query}" if query else ""
-    return f"{source}: no matching results found{suffix}."
+    suffix = f" for: {query}" if query else ""
+    return f"{source}: no quick match{suffix}. Next useful step: queue the suggested background follow-up if this needs a real answer now."
 
 
 def _voice_tool_cache_key(payload: VoiceToolRequest, user: str | None = None) -> str | None:
@@ -873,33 +916,51 @@ def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> 
         query = str(args.get("query") or "").strip()
         if not query:
             raise HTTPException(status_code=400, detail="Missing query")
-        return _voice_tool_result(_voice_brain_lookup_text(query), tool_name=name)
+        result = _voice_brain_lookup_text(query)
+        data = _voice_lookup_data("Brain", query, status="answered" if result else "no_match", matches=1 if result else 0, actions=[] if result else [_voice_lookup_action("Brain", query)])
+        return _voice_tool_result(result or _voice_lookup_no_match("Brain", query), tool_name=name, data=data)
     if name == "kanban_lookup":
         query = str(args.get("query") or "").strip() or None
         result = _voice_kanban_digest(query)
-        return _voice_tool_result(result or _voice_lookup_no_match("Kanban", query), tool_name=name)
+        data = _voice_lookup_data("Kanban", query, status="answered" if result else "no_match", matches=len(result.splitlines()) if result else 0, actions=[] if result else [_voice_lookup_action("Kanban", query)])
+        return _voice_tool_result(result or _voice_lookup_no_match("Kanban", query), tool_name=name, data=data)
     if name == "session_lookup":
         query = str(args.get("query") or "").strip() or None
         result = _voice_recent_sessions(query)
-        return _voice_tool_result(result or _voice_lookup_no_match("Sessions", query), tool_name=name)
+        data = _voice_lookup_data("Sessions", query, status="answered" if result else "no_match", matches=len(result.splitlines()) if result else 0, actions=[] if result else [_voice_lookup_action("Sessions", query)])
+        return _voice_tool_result(result or _voice_lookup_no_match("Sessions", query), tool_name=name, data=data)
     if name == "context_lookup":
         query = str(args.get("query") or "").strip()
         sources = args.get("sources") or ["memory", "kanban", "brain", "sessions", "voice_tasks"]
         if not isinstance(sources, list):
             sources = ["memory", "kanban", "brain", "sessions", "voice_tasks"]
+        source_names = {str(source) for source in sources}
         parts: list[str] = []
+        source_state: Dict[str, Dict[str, Any]] = {}
+
+        def add_source(label: str, text: str) -> None:
+            source_state[label] = {"status": "answered" if text else "no_match", "matches": len(text.splitlines()) if text else 0}
+            if text:
+                parts.append(f"{label}:\n{text}")
+
         task_status = _voice_task_status_lookup(query or None)
         if task_status:
-            parts.append(f"Voice tasks:\n{task_status}")
-        if "memory" in sources:
-            parts.append(f"Memory:\n{_voice_memory_snapshot()}")
-        if "kanban" in sources:
-            parts.append(f"Kanban:\n{_voice_kanban_digest(query or None)}")
-        if "brain" in sources:
-            parts.append(f"Brain:\n{_voice_brain_lookup_text(query or None)}")
-        if "sessions" in sources:
-            parts.append(f"Sessions:\n{_voice_recent_sessions(query or None)}")
-        return _voice_tool_result("\n\n".join(parts), tool_name=name)
+            add_source("Voice tasks", task_status)
+        elif "voice_tasks" in source_names:
+            source_state["Voice tasks"] = {"status": "no_match", "matches": 0}
+        if "memory" in source_names:
+            add_source("Memory", _voice_memory_snapshot())
+        if "kanban" in source_names:
+            add_source("Kanban", _voice_kanban_digest(query or None))
+        if "brain" in source_names:
+            add_source("Brain", _voice_brain_lookup_text(query or None))
+        if "sessions" in source_names:
+            add_source("Sessions", _voice_recent_sessions(query or None))
+        status = "answered" if parts else "no_match"
+        data = _voice_lookup_data("Context", query, status=status, matches=sum(int(row.get("matches") or 0) for row in source_state.values()), actions=[] if parts else [_voice_lookup_action("Context", query)])
+        data["sources"] = source_state
+        text = "\n\n".join(parts) if parts else _voice_lookup_no_match("Context", query)
+        return _voice_tool_result(text, tool_name=name, data=data)
     if name == "rolly_background":
         request_text = str(args.get("request") or "").strip()
         if not request_text:
@@ -962,13 +1023,14 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
             f"{context_pack}\n"
             f"{mode_instruction}"
             f"{rate_instruction}"
-            "This is a live phone-call style conversation: speak naturally, briefly, and do not mention implementation details. "
+            "This is a live phone-call style conversation: speak naturally and briefly. No corporate filler, no pep-talk tone, no 'let me explain how I work.' "
+            "Do not narrate internal mechanics before a lookup; just use the tool when needed, then say the answer. "
             "Do not give mic/headset/echo troubleshooting unless the user asks or a system error indicates a problem. "
-            "Spoken responses should usually fit 10-15 seconds. If more exists, give the short answer first and offer to continue. "
+            "Spoken responses should usually fit 5-10 seconds. If more exists, give the short answer first and offer to continue. "
             "Call transcript events, tool calls/results, timestamps, elapsed time, and an end-call marker are saved to local JSONL for later improvement. "
-            "Prefer fast lookup tools (context_lookup, memory_lookup, kanban_lookup, brain_lookup, session_lookup) for context. "
+            "Quick lookup must be useful: use context_lookup/kanban_lookup/brain_lookup/session_lookup for grounded facts, read back IDs/provenance when present, and if a lookup returns no_match or cannot answer, offer the suggested background action instead of pretending it answered. "
             "Use rolly_background for long or action-oriented work; it queues real background Rolly work and returns a task id. "
-            "When rolly_background is queued, tell the user you will jump back in with the result if this call is still live; do not claim there is no live push channel. "
+            "When rolly_background is queued, say only that it is queued plus the task id if helpful; do not repeat the full mechanics. "
             "During active work, interpret user follow-ups as steer by default; clear stop/cancel means cancel intent, and 'when done' means queue. "
             "Never call a tool twice for the same user intent. Summarize tool results conversationally and ask at most one brief follow-up."
         ),
@@ -983,7 +1045,7 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
                         "query": {"type": "string", "description": "Short lookup query."},
                         "sources": {
                             "type": "array",
-                            "items": {"type": "string", "enum": ["memory", "brain", "kanban", "sessions"]},
+                            "items": {"type": "string", "enum": ["memory", "brain", "kanban", "sessions", "voice_tasks"]},
                             "description": "Optional source subset.",
                         },
                     },
