@@ -284,6 +284,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
 
   const handleCopyLast = () => {
+    const selected = termRef.current?.getSelection();
+    if (selected) {
+      navigator.clipboard.writeText(selected).catch((err) => {
+        console.warn("[dashboard clipboard] selected copy failed:", err.message);
+      });
+      termRef.current?.clearSelection();
+      setCopyState("copied");
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+      copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+      termRef.current?.focus();
+      return;
+    }
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     // Send the slash as a burst, wait long enough for Ink's tokenizer to
@@ -303,15 +315,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   };
 
   const sendTextToTerminal = useCallback((text: string, submit = true) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!text.trim()) return;
     const term = termRef.current;
     const ws = wsRef.current;
     if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
     // xterm.paste preserves terminal paste semantics, including bracketed
-    // paste when the TUI/shell has it enabled. A short delayed Return lets
-    // dictated/mobile text submit without making the user focus xterm first.
-    term.paste(trimmed);
+    // paste when the TUI/shell has it enabled. Keep the user's pasted text
+    // byte-for-byte instead of trimming command whitespace.
+    term.paste(text);
     if (submit) {
       window.setTimeout(() => {
         const s = wsRef.current;
@@ -900,7 +911,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2">
+    <div className="flex min-h-0 flex-1 flex-col gap-1">
       <PluginSlot name="chat:top" />
       {mobileModelToolsPortal}
 
@@ -910,15 +921,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-1 lg:flex-row lg:gap-2">
         <div
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg",
-            "p-2 sm:p-3",
+            "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-sm",
+            "p-1",
           )}
           style={{
             backgroundColor: TERMINAL_THEME.background,
-            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.4)",
+            boxShadow: "none",
           }}
         >
           <div
@@ -928,19 +939,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
           <form
             onSubmit={submitComposerDraft}
-            className="mt-2 flex shrink-0 items-end gap-1.5 rounded border border-current/20 bg-black/20 p-1.5"
+            className="mt-1 flex shrink-0 items-end gap-1 rounded-sm border border-current/15 bg-black/15 p-1"
             style={{ color: TERMINAL_THEME.foreground }}
           >
             <textarea
               value={composerDraft}
               onChange={(event) => setComposerDraft(event.target.value)}
               onKeyDown={handleComposerKeyDown}
-              placeholder="Dictate or paste text… Enter sends, Shift+Enter newline"
+              placeholder="paste/dictate… Enter sends"
               rows={1}
               autoCapitalize="sentences"
               className={cn(
-                "min-h-8 max-h-24 flex-1 resize-none rounded bg-black/20 px-2 py-1.5 text-sm leading-snug outline-none",
-                "placeholder:text-current/45 focus:ring-1 focus:ring-current/40",
+                "min-h-6 max-h-20 flex-1 resize-none rounded-sm bg-black/15 px-1.5 py-1 text-xs leading-tight outline-none",
+                "placeholder:text-current/40 focus:ring-1 focus:ring-current/35",
               )}
             />
             <Button
@@ -949,7 +960,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               onClick={pasteClipboardIntoComposer}
               title="Paste clipboard into the dictation box"
               aria-label="Paste clipboard into dictation box"
-              className="h-8 shrink-0 rounded border border-current/25 px-2 text-xs"
+              className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px]"
             >
               <ClipboardPaste className="h-3.5 w-3.5" />
               <span className="sr-only">
@@ -962,7 +973,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               disabled={!composerDraft.trim()}
               title="Send dictated/pasted text to the terminal"
               aria-label="Send dictated or pasted text"
-              className="h-8 shrink-0 rounded border border-current/25 px-2 text-xs disabled:opacity-40"
+              className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px] disabled:opacity-40"
             >
               <Send className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">send</span>
@@ -972,24 +983,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           <Button
             ghost
             onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
+            title="Copy selection, or copy last assistant response"
+            aria-label="Copy selection or last assistant response"
             className={cn(
               "absolute z-10",
               "normal-case tracking-normal font-normal",
-              "rounded border border-current/30",
-              "bg-black/20 backdrop-blur-sm",
-              "opacity-70 hover:opacity-100 hover:border-current/60",
+              "rounded-sm border border-current/20",
+              "bg-black/10 backdrop-blur-sm",
+              "opacity-35 hover:opacity-100 hover:border-current/50",
               "transition-opacity duration-150",
-              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
-              "lg:bottom-4 lg:right-4",
+              "bottom-8 right-1 px-1.5 py-0.5 text-[11px] sm:right-1",
             )}
             style={{ color: TERMINAL_THEME.foreground }}
           >
             <span className="inline-flex items-center gap-1.5">
               <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
+              <span className="hidden min-[520px]:inline tracking-wide">
+                {copyState === "copied" ? "copied" : "copy"}
               </span>
             </span>
           </Button>
@@ -1000,7 +1010,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             id="chat-side-panel"
             role="complementary"
             aria-label={modelToolsLabel}
-            className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
+            className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-72"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
               <ChatSidebar channel={channel} />

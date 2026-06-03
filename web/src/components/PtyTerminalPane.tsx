@@ -63,15 +63,16 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       : null,
   );
   const [composerDraft, setComposerDraft] = useState("");
+  const [pasteState, setPasteState] = useState<"idle" | "pasted" | "blocked">("idle");
+  const pasteResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const channel = useMemo(() => generateChannelId(), [tmuxTarget, resume]);
 
   const sendTextToTerminal = useCallback((text: string, submit = true) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!text.trim()) return;
     const term = termRef.current;
     const ws = wsRef.current;
     if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
-    term.paste(trimmed);
+    term.paste(text);
     if (submit) {
       window.setTimeout(() => {
         const s = wsRef.current;
@@ -87,6 +88,19 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
     setComposerDraft("");
     sendTextToTerminal(text);
   }, [composerDraft, sendTextToTerminal]);
+
+  const pasteClipboardIntoComposer = useCallback(() => {
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (!text) return;
+        setComposerDraft((prev) => (prev ? `${prev}\n${text}` : text));
+        setPasteState("pasted");
+      })
+      .catch(() => setPasteState("blocked"));
+    if (pasteResetRef.current) clearTimeout(pasteResetRef.current);
+    pasteResetRef.current = setTimeout(() => setPasteState("idle"), 1500);
+  }, []);
 
   const handleComposerKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== "Enter" || event.shiftKey) return;
@@ -226,6 +240,10 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       ro.disconnect();
       window.removeEventListener("resize", scheduleSync);
       if (raf) cancelAnimationFrame(raf);
+      if (pasteResetRef.current) {
+        clearTimeout(pasteResetRef.current);
+        pasteResetRef.current = null;
+      }
       wsRef.current?.close();
       wsRef.current = null;
       term.dispose();
@@ -234,27 +252,35 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
   }, [channel, resume, tmuxTarget, autoFocus]);
 
   return (
-    <div className={cn("relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg p-2", className)} style={{ backgroundColor: TERMINAL_THEME.background }} title={title}>
+    <div className={cn("relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-sm p-1", className)} style={{ backgroundColor: TERMINAL_THEME.background }} title={title}>
       {banner ? <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">{banner}</div> : null}
       <div ref={hostRef} className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1" />
       <form
         onSubmit={submitComposerDraft}
-        className="mt-2 flex shrink-0 items-end gap-1.5 rounded border border-current/20 bg-black/20 p-1.5"
+        className="mt-1 flex shrink-0 items-end gap-1 rounded-sm border border-current/15 bg-black/15 p-1"
         style={{ color: TERMINAL_THEME.foreground }}
       >
         <textarea
           value={composerDraft}
           onChange={(event) => setComposerDraft(event.target.value)}
           onKeyDown={handleComposerKeyDown}
-          placeholder="Dictate or paste text… Enter sends"
+          placeholder="paste/dictate… Enter sends"
           rows={1}
           autoCapitalize="sentences"
-          className="min-h-8 max-h-24 flex-1 resize-none rounded bg-black/20 px-2 py-1.5 text-sm leading-snug outline-none placeholder:text-current/45 focus:ring-1 focus:ring-current/40"
+          className="min-h-6 max-h-20 flex-1 resize-none rounded-sm bg-black/15 px-1.5 py-1 text-xs leading-tight outline-none placeholder:text-current/40 focus:ring-1 focus:ring-current/35"
         />
+        <button
+          type="button"
+          onClick={pasteClipboardIntoComposer}
+          title={pasteState === "blocked" ? "Clipboard blocked" : "Paste clipboard into box"}
+          className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px]"
+        >
+          paste
+        </button>
         <button
           type="submit"
           disabled={!composerDraft.trim()}
-          className="h-8 shrink-0 rounded border border-current/25 px-2 text-xs disabled:opacity-40"
+          className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px] disabled:opacity-40"
         >
           send
         </button>
