@@ -137,6 +137,13 @@ const CHAT_NAV_ITEM: NavItem = {
   icon: Terminal,
 };
 
+const VOICE_NAV_ITEM: NavItem = {
+  path: "/voice",
+  labelKey: "voice",
+  label: "Voice",
+  icon: Mic,
+};
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -178,7 +185,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/voice", labelKey: "voice", label: "Voice", icon: Mic },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -469,10 +475,13 @@ export default function App() {
       : base.filter((n) => n.path !== "/analytics");
   }, [embeddedChat, showTokenAnalytics]);
 
-  const sidebarNav = useMemo(
-    () => partitionSidebarNav(builtinNav, manifests),
-    [builtinNav, manifests],
-  );
+  const sidebarNav = useMemo(() => {
+    const nav = partitionSidebarNav(builtinNav, manifests);
+    return {
+      coreItems: nav.coreItems,
+      pluginItems: [VOICE_NAV_ITEM, ...nav.pluginItems],
+    };
+  }, [builtinNav, manifests]);
   const routes = useMemo(
     () => buildRoutes(builtinRoutes, manifests),
     [builtinRoutes, manifests],
