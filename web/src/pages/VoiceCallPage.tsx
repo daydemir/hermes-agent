@@ -1016,7 +1016,6 @@ export default function VoiceCallPage() {
           if (task.status === "complete") {
             const output = task.result || "Background Rolly task completed.";
             addLog("tool", `${taskId} complete\n${output.slice(0, 700)}`);
-            persistTranscript("tool", output, "delegation_handoff", { task_id: taskId, session_id: task.session_id });
             queueOrSendToolOutput(`handoff:${taskId}`, output, taskId);
             markWorkFinished(`task:${taskId}`, "done");
             return;
