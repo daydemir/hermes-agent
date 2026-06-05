@@ -22,6 +22,7 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+from hermes_state import SessionDB
 
 
 # =========================================================================
@@ -180,6 +181,7 @@ class TestComputeNextRun:
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     """Redirect cron storage to a temp directory."""
+    monkeypatch.setattr("cron.jobs.HERMES_DIR", tmp_path)
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
@@ -978,6 +980,19 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+        db = SessionDB(db_path=tmp_cron_dir / "state.db")
+        events = db.get_ingestion_events()
+        assert len(events) == 1
+        event = events[0]
+        assert event["source_type"] == "cron_output"
+        assert event["title"] == "test123"
+        assert event["metadata"] == {
+            "job_id": "test123",
+            "output_file": str(output_file),
+        }
+        assert event["body"] == "# Results\nEverything ok."
+        db.close()
 
     @pytest.mark.parametrize("bad_job_id", ["../escape", "nested/escape", ".", "..", ""])
     def test_rejects_unsafe_job_id(self, tmp_cron_dir, bad_job_id):

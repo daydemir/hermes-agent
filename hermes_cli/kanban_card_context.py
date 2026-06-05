@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
+import os
+import re
 
 from hermes_cli import kanban_db
 
@@ -68,55 +71,154 @@ def build_card_context(task_id: str, *, board: Optional[str] = None) -> dict[str
         conn.close()
 
 
+# MIX "soul" + coding principles, injected once at the top of every card-scoped
+# Claude Code session. These are the only things Claude Code can't infer from the
+# card itself: who MIX is / why the work matters, and Deniz's coding principles.
+# Everything else should come from the card. Canonical sources — keep in sync:
+#   $ROLLY_BRAIN_ROOT/wiki/mix-product-and-positioning.md
+#   $ROLLY_BRAIN_ROOT/wiki/coding-principles.md
+_DEFAULT_ROLLY_BRAIN_ROOT = Path(os.getenv("ROLLY_BRAIN_ROOT", "/Users/rolly/rolly-brain"))
+
+
+def _brain_wiki_path(name: str) -> Path:
+    return (_DEFAULT_ROLLY_BRAIN_ROOT / "wiki" / name).expanduser()
+
+
+@lru_cache(maxsize=None)
+def _read_brain_wiki(name: str) -> str:
+    path = _brain_wiki_path(name)
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _strip_frontmatter(text: str) -> str:
+    text = text.strip()
+    if not text.startswith("---\n"):
+        return text
+    parts = text.split("\n---\n", 1)
+    if len(parts) != 2:
+        return text
+    return parts[1].strip()
+
+
+@lru_cache(maxsize=None)
+def _mix_soul() -> str:
+    text = _strip_frontmatter(_read_brain_wiki("mix-product-and-positioning.md"))
+    if not text:
+        return (
+            "MIX is a location-aware audio/story platform where walking, direction, dwell time, "
+            "and physical place act as the interface. MIX turns walks through real places into "
+            "interactive audio stories that know where the listener is."
+        )
+    match = re.search(
+        r"(?ms)^## Current understanding\n\n(.*?)(?:\n## |\Z)",
+        text,
+    )
+    if not match:
+        return text
+    block = match.group(1).strip()
+    selected: list[str] = []
+    for line in block.splitlines():
+        line = line.strip()
+        if not line.startswith("-"):
+            continue
+        if line.startswith("- Best concise positioning:") or line.startswith("- MIX is a location-aware") or line.startswith("- Core experience:"):
+            selected.append(line[2:].strip())
+    if not selected:
+        selected = [line[2:].strip() for line in block.splitlines() if line.startswith("-")][:3]
+    return "\n".join(selected) if selected else text
+
+
+@lru_cache(maxsize=None)
+def _coding_principles() -> str:
+    text = _strip_frontmatter(_read_brain_wiki("coding-principles.md"))
+    if not text:
+        return (
+            "# Coding principles\n\n"
+            "- DRY.\n"
+            "- Functional.\n"
+            "- Lean.\n"
+            "- Clean.\n"
+            "- Simple AF.\n"
+            "- Hard cut.\n"
+            "- No fallbacks unless explicitly requested.\n"
+            "- Fail fast.\n"
+            "- Compile-time type safe.\n"
+            "- Minimize global mutable state.\n"
+            "- Minimize side effects.\n"
+            "- Minimize nil checks.\n"
+            "- Minimize force unwraps.\n"
+            "- Changes should simplify rather than complicate.\n"
+            "- CLI-driven development: core functionality lives in CLIs, interfaces sit on top.\n"
+            "- Validate functionality through the CLI.\n"
+            "- Avoid loose strings.\n"
+            "- Prefer readable minimal code.\n"
+            "- Use strict enums with directly associated functions/parameters."
+        )
+    match = re.search(r"(?ms)^# Coding principles\n\n(.*?)(?:\n## |\Z)", text)
+    if not match:
+        return text
+    block = match.group(1).strip()
+    bullets = [line.strip() for line in block.splitlines() if line.strip().startswith("-")]
+    if not bullets:
+        return text
+    return "# Coding principles\n\n" + "\n".join(bullets)
+
+
 def build_claude_prompt(context: dict[str, Any]) -> str:
-    """Build the initial Claude Code prompt for a card-scoped session."""
+    """Build the initial Claude Code prompt for a card-scoped session.
+
+    Deliberately minimal: identity + why (MIX), Deniz's coding principles
+    verbatim, then the precise card. We do not re-teach Claude Code how to
+    explore, edit, run tests, or hand off — it does that by default, and extra
+    boilerplate only dilutes the signal that matters.
+    """
 
     task = context["task"]
     links = context.get("links") or {}
     criteria = context.get("acceptance_criteria") or []
+
     lines: list[str] = [
-        "You are Claude Code working on a Rolly Kanban card.",
-        "Do exactly the card asks: no scope creep, no mock implementations, fail fast.",
-        "If acceptance/verification is unclear, stop and explain the blocker instead of guessing.",
-        "Respect global Rolly/MIX constraints: preserve user work, do not reset/stash, run narrow verification, and report exact files/tests.",
+        _mix_soul(),
         "",
-        f"Card: {task.get('id')} — {task.get('title')}",
-        f"Status: {task.get('status')} | Priority: {task.get('priority')} | Tenant: {task.get('tenant') or 'none'} | Assignee: {task.get('assignee') or 'none'}",
+        _coding_principles(),
+        "",
+        f"## Card {task.get('id')} — {task.get('title')}",
+        f"Status: {task.get('status')} · Priority: {task.get('priority')} · "
+        f"Assignee: {task.get('assignee') or 'none'} · Tenant: {task.get('tenant') or 'none'}",
         f"Workspace: {context.get('workspace_path')}",
-        f"Execution mode: {task.get('execution_mode') or 'manual Claude Code'}",
         "",
-        "## Body",
-        _trim(task.get("body"), 6000) or "(empty)",
+        _trim(task.get("body"), 6000) or "(no card body)",
     ]
+
     if context.get("latest_summary"):
         lines += ["", "## Latest worker summary", _trim(context.get("latest_summary"), 2000)]
-    lines += [
-        "",
-        "## Acceptance criteria",
-    ]
+
     if criteria:
+        lines += ["", "## Acceptance criteria"]
         for item in criteria:
-            lines.append(
-                f"- [{ 'x' if item.get('passed') else ' ' }] ({item.get('verifier')}) "
-                f"{_trim(item.get('text'), 1000)}"
-                + (f" — evidence: {_trim(item.get('evidence'), 700)}" if item.get('evidence') else "")
+            mark = "x" if item.get("passed") else " "
+            evidence = (
+                f" — evidence: {_trim(item.get('evidence'), 700)}"
+                if item.get("evidence")
+                else ""
             )
-    else:
-        lines.append("(none available in this board schema — rely on the card body and stop if acceptance is unclear)")
-    lines += [
-        "",
-        "## Links",
-        f"Parents: {', '.join(links.get('parents') or []) or 'none'}",
-        f"Children: {', '.join(links.get('children') or []) or 'none'}",
-    ]
-    lines += [
-        "",
-        "## Expected behavior",
-        "- First inspect the repo and card context.",
-        "- Make only changes needed for this card.",
-        "- Run the card's verification commands or the narrowest relevant tests.",
-        "- End with a concise handoff: files changed, tests run, remaining blockers.",
-    ]
+            lines.append(
+                f"- [{mark}] ({item.get('verifier')}) {_trim(item.get('text'), 1000)}{evidence}"
+            )
+
+    parents = links.get("parents") or []
+    children = links.get("children") or []
+    if parents or children:
+        lines += [
+            "",
+            f"Parents: {', '.join(parents) or 'none'} · Children: {', '.join(children) or 'none'}",
+        ]
+
     return "\n".join(lines).strip() + "\n"
 
 

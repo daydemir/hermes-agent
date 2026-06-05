@@ -213,6 +213,42 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+@pytest.mark.parametrize(
+    "from_status", ["triage", "todo", "scheduled", "ready", "blocked", "review"],
+)
+def test_complete_task_from_any_non_terminal_status(kanban_home, from_status):
+    """A human can close a card straight from any non-terminal column.
+
+    Regression for the bug where ``complete_task`` only accepted
+    ``running``/``ready``/``blocked``: completing a ``triage`` card (the
+    common "won't fix" case) matched 0 rows and silently returned False,
+    surfacing as a dashboard 409 and a CLI "cannot complete" no-op.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="close me")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?", (from_status, tid),
+            )
+        assert kb.complete_task(conn, tid, result="wont fix", summary="nope") is True
+        t = kb.get_task(conn, tid)
+        assert t.status == "done"
+        assert t.result == "wont fix"
+        assert t.completed_at is not None
+
+
+def test_complete_task_rejects_terminal_states(kanban_home):
+    """``done`` and ``archived`` stay excluded — double-complete is a no-op."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already closed")
+        assert kb.complete_task(conn, tid, result="first") is True
+        # Second completion on a done card matches 0 rows -> False.
+        assert kb.complete_task(conn, tid, result="again") is False
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (tid,))
+        assert kb.complete_task(conn, tid, result="zombie") is False
+
+
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])

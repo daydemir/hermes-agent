@@ -37,7 +37,7 @@ _STATUS_ICONS = {
     "ready":    "▶",
     "running":  "●",
     "scheduled":"⏱",
-    "blocked":  "⊘",
+    "triage":   "⊘",
     "done":     "✓",
     "archived": "—",
 }
@@ -357,9 +357,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
-                          help="Initial card status. Use 'blocked' for cards "
+                          help="Initial card status. Use 'triage' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "to skip the brief running-to-triage transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -548,7 +548,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
-    p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
+    p_block = sub.add_parser("block", help="Mark one or more tasks triage")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
@@ -560,7 +560,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
-    p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
+    p_unblock = sub.add_parser("unblock", help="Return one or more triage/scheduled tasks to ready")
     p_unblock.add_argument(
         "--reason",
         default=None,
@@ -570,7 +570,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move one or more todo/triage tasks to ready (recovery path)",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
@@ -664,7 +664,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                          help="Only show events from tasks in this tenant")
     p_watch.add_argument("--kinds", default=None,
                          help="Comma-separated event kinds to include "
-                              "(e.g. 'completed,blocked,gave_up,crashed,timed_out')")
+                              "(e.g. 'completed,triage_requested,gave_up,crashed,timed_out')")
     p_watch.add_argument("--interval", type=float, default=0.5,
                          help="Poll interval in seconds (default: 0.5)")
 
@@ -2009,9 +2009,9 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(f"cannot unblock {tid} (not triage/scheduled?)", file=sys.stderr)
             else:
-                print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+                print(f"Released {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2306,7 +2306,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                     f"consecutive ticks but 0 workers spawned successfully. "
                     f"Check profile health (venv, PATH, credentials) and "
                     f"`hermes kanban list --status ready` / "
-                    f"`hermes kanban list --status blocked` for recent "
+                    f"`hermes kanban list --status triage` for recent "
                     f"spawn_failed tasks.",
                     file=sys.stderr, flush=True,
                 )
@@ -2416,7 +2416,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
@@ -2752,7 +2752,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark triage; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

@@ -3491,3 +3491,45 @@ class TestApplyWalProbe:
         assert any("journal_mode=WAL" in sql for sql in conn.executed), (
             "set-pragma must fire when probe returns 'delete'"
         )
+
+
+class TestIngestionQueue:
+    def test_append_message_mirrors_to_ingestion_queue(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        msg_id = db.append_message(
+            "s1",
+            role="user",
+            content="hello ingestion queue",
+            observed=True,
+        )
+
+        events = db.get_ingestion_events()
+        assert len(events) == 1
+        event = events[0]
+        assert event["source_type"] == "message"
+        assert event["source_ref"] == str(msg_id)
+        assert event["session_id"] == "s1"
+        assert event["role"] == "user"
+        assert event["observed"] == 1
+        assert event["body"] == "hello ingestion queue"
+
+    def test_append_ingestion_event_round_trips_metadata(self, db):
+        event_id = db.append_ingestion_event(
+            source_type="content",
+            source_ref="https://example.com/item",
+            body={"headline": "hello"},
+            body_format="json",
+            title="Example",
+            metadata={"kind": "rss"},
+        )
+
+        events = db.get_ingestion_events()
+        assert len(events) == 1
+        event = events[0]
+        assert event["id"] == event_id
+        assert event["source_type"] == "content"
+        assert event["source_ref"] == "https://example.com/item"
+        assert event["title"] == "Example"
+        assert event["metadata"] == {"kind": "rss"}
+        assert event["body"] == {"headline": "hello"}
