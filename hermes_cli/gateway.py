@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -112,20 +113,16 @@ def _get_service_pids() -> set:
         try:
             label = get_launchd_label()
             result = subprocess.run(
-                ["launchctl", "list", label],
+                ["launchctl", "print", _launchd_target(label)],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
+                    match = re.search(r"\bpid\s*=\s*(\d+)\b", line)
+                    if match:
+                        pid = int(match.group(1))
+                        if pid > 0:
+                            pids.add(pid)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
@@ -959,7 +956,7 @@ def _probe_launchd_service_running() -> bool:
         return False
     try:
         result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
+            ["launchctl", "print", _launchd_target()],
             capture_output=True,
             text=True,
             timeout=10,
@@ -2830,7 +2827,30 @@ def get_launchd_label() -> str:
 
 
 def _launchd_domain() -> str:
-    return f"gui/{os.getuid()}"  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    override = os.getenv("HERMES_LAUNCHD_DOMAIN")
+    if override:
+        domain = override.format(uid=os.getuid())
+        if not (domain.startswith("user/") or domain.startswith("gui/")):
+            raise ValueError("HERMES_LAUNCHD_DOMAIN must start with user/ or gui/")
+        return domain
+    return f"user/{os.getuid()}"  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+
+
+def _launchd_target(label: str | None = None) -> str:
+    return f"{_launchd_domain()}/{label or get_launchd_label()}"
+
+
+def _legacy_launchd_target(label: str | None = None) -> str:
+    return f"gui/{os.getuid()}/{label or get_launchd_label()}"
+
+
+def _launchd_targets_for_bootout(label: str | None = None) -> list[str]:
+    targets = [_launchd_target(label), _legacy_launchd_target(label)]
+    return list(dict.fromkeys(targets))
+
+
+def _launchd_session_type() -> str:
+    return "Background" if _launchd_domain().startswith("user/") else "Aqua"
 
 
 def generate_launchd_plist() -> str:
@@ -2893,6 +2913,9 @@ def generate_launchd_plist() -> str:
     
     <key>WorkingDirectory</key>
     <string>{working_dir}</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>{_launchd_session_type()}</string>
     
     <key>EnvironmentVariables</key>
     <dict>
@@ -2948,8 +2971,11 @@ def refresh_launchd_plist_if_needed() -> bool:
 
     plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
     label = get_launchd_label()
-    # Bootout/bootstrap so launchd picks up the new definition
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
+    # Bootout/bootstrap so launchd picks up the new definition. Also boot out
+    # the legacy gui-domain target from older installs so migration cannot leave
+    # two launchd jobs owning the same gateway profile.
+    for target in _launchd_targets_for_bootout(label):
+        subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
     subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
     print("↻ Updated gateway launchd service definition to match the current Hermes install")
     return True
@@ -2985,7 +3011,8 @@ def launchd_install(force: bool = False):
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
+    for target in _launchd_targets_for_bootout(label):
+        subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
     
     if plist_path.exists():
         plist_path.unlink()
@@ -3003,24 +3030,26 @@ def launchd_start():
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
         subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", _launchd_target(label)], check=True, timeout=30)
         print("✓ Service started")
         return
 
     refresh_launchd_plist_if_needed()
     try:
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", _launchd_target(label)], check=True, timeout=30)
     except subprocess.CalledProcessError as e:
         if e.returncode not in {3, 113}:
             raise
         print("↻ launchd job was unloaded; reloading service definition")
+        for target in _launchd_targets_for_bootout(label):
+            subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
         subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", _launchd_target(label)], check=True, timeout=30)
     print("✓ Service started")
 
 def launchd_stop():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    target = _launchd_target(label)
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
         pid = get_running_pid(cleanup_stale=False)
@@ -3086,7 +3115,7 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    target = _launchd_target(label)
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
@@ -3112,6 +3141,8 @@ def launchd_restart():
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
         plist_path = get_launchd_plist_path()
+        for bootout_target in _launchd_targets_for_bootout(label):
+            subprocess.run(["launchctl", "bootout", bootout_target], check=False, timeout=90)
         subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
         subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")
@@ -3121,7 +3152,7 @@ def launchd_status(deep: bool = False):
     label = get_launchd_label()
     try:
         result = subprocess.run(
-            ["launchctl", "list", label],
+            ["launchctl", "print", _launchd_target(label)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -4210,14 +4241,7 @@ def _is_service_running() -> bool:
 
         return False
     elif is_macos() and get_launchd_plist_path().exists():
-        try:
-            result = subprocess.run(
-                ["launchctl", "list", get_launchd_label()],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
+        return _probe_launchd_service_running()
     elif is_windows():
         from hermes_cli import gateway_windows
         if gateway_windows.is_installed():

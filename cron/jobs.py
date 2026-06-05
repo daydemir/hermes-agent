@@ -1117,6 +1117,29 @@ def save_job_output(job_id: str, output: str):
             pass
         raise
     
+    # Best-effort mirror into the linear ingestion queue so cron output can
+    # be digested alongside conversation turns and other content sources.
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=HERMES_DIR / "state.db")
+        try:
+            db.append_ingestion_event(
+                source_type="cron_output",
+                source_ref=str(output_file),
+                body=output,
+                body_format="text",
+                title=job_id,
+                metadata={
+                    "job_id": job_id,
+                    "output_file": str(output_file),
+                },
+            )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Failed to mirror cron output for %s into ingestion queue: %s", job_id, exc)
+    
     return output_file
 
 

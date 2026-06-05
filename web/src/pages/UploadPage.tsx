@@ -33,7 +33,7 @@ function formatBytes(value: number): string {
 
 function speakerQuestion(analysis: AudioAnalysisResponse | null): string {
   const speakers = analysis?.speakers ?? [];
-  if (speakers.length < 2) return "";
+  if (speakers.length === 0) return "";
   const lines = speakers.map((speaker) => `${speaker.speaker}: “${speaker.example}”`);
   return `Who are these speakers in the uploaded phone call?\n\n${lines.join("\n\n")}`;
 }

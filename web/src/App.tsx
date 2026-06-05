@@ -86,6 +86,9 @@ import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { resolvePageTitle } from "@/lib/resolve-page-title";
+import { setRouteContext } from "@/lib/pageContext";
+import { RollyAssistantSidebar } from "@/components/RollyAssistantSidebar";
 import { api } from "@/lib/api";
 import type { StatusResponse } from "@/lib/api";
 import {
@@ -137,6 +140,13 @@ const CHAT_NAV_ITEM: NavItem = {
   icon: Terminal,
 };
 
+const VOICE_NAV_ITEM: NavItem = {
+  path: "/voice",
+  labelKey: "voice",
+  label: "Voice",
+  icon: Mic,
+};
+
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
  * <Routes>) when embedded — see the persistent chat host block rendered
@@ -178,7 +188,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/voice", labelKey: "voice", label: "Voice", icon: Mic },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -336,6 +345,14 @@ function buildRoutes(
       path: m.tab.path,
       element: <PluginPage name={m.name} />,
     });
+    const pluginBasePath = m.tab.path.replace(/\/$/, "");
+    if (pluginBasePath) {
+      routes.push({
+        key: `plugin:${m.name}:wildcard`,
+        path: `${pluginBasePath}/*`,
+        element: <PluginPage name={m.name} />,
+      });
+    }
   }
 
   for (const m of manifests) {
@@ -389,6 +406,10 @@ export default function App() {
   const isChromelessChatRoute =
     isChatRoute && new URLSearchParams(search).get("embed") === "1";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
+  const [chatHostMounted, setChatHostMounted] = useState(() => isChatRoute);
+  useEffect(() => {
+    if (isChatRoute) setChatHostMounted(true);
+  }, [isChatRoute]);
   const [rollyUser, setRollyUser] = useState(() => getRollyUserSlug());
   const selectRollyUser = useCallback((slug: string) => {
     const selected = setRollyUserSlug(slug);
@@ -457,10 +478,13 @@ export default function App() {
       : base.filter((n) => n.path !== "/analytics");
   }, [embeddedChat, showTokenAnalytics]);
 
-  const sidebarNav = useMemo(
-    () => partitionSidebarNav(builtinNav, manifests),
-    [builtinNav, manifests],
-  );
+  const sidebarNav = useMemo(() => {
+    const nav = partitionSidebarNav(builtinNav, manifests);
+    return {
+      coreItems: nav.coreItems,
+      pluginItems: [VOICE_NAV_ITEM, ...nav.pluginItems],
+    };
+  }, [builtinNav, manifests]);
   const routes = useMemo(
     () => buildRoutes(builtinRoutes, manifests),
     [builtinRoutes, manifests],
@@ -476,10 +500,24 @@ export default function App() {
     [manifests],
   );
 
+  // Publish the route layer of the page-context bus so the global Rolly
+  // assistant sidebar knows which page the user is on. Plugins (e.g. Kanban)
+  // layer richer entity context on top via the SDK; see lib/pageContext.ts.
+  useEffect(() => {
+    setRouteContext({
+      route: normalizedPath,
+      title: resolvePageTitle(normalizedPath, t, pluginTabMeta),
+    });
+  }, [normalizedPath, t, pluginTabMeta]);
+
   const layoutVariant = theme.layoutVariant ?? "standard";
   const sidebarWidth = isDesktopCollapsed ? "4.2rem" : "19.2rem";
   const rootStyle = {
     "--hermes-sidebar-width": sidebarWidth,
+    // The global Rolly assistant sidebar pushes content left (non-modal) by
+    // setting --hermes-assistant-pad on the document element when expanded.
+    paddingRight: "var(--hermes-assistant-pad, 0px)",
+    transition: "padding-right 200ms ease",
   } as CSSProperties;
 
   useEffect(() => {
@@ -795,6 +833,7 @@ export default function App() {
                 </Routes>
 
                 {embeddedChat &&
+                  chatHostMounted &&
                   !chatOverriddenByPlugin &&
                   (pluginsLoading ? (
                     isChatRoute ? (
@@ -829,6 +868,10 @@ export default function App() {
       </div>
 
       <PluginSlot name="overlay" />
+
+      {/* Global, page-aware Rolly assistant. Desktop-only: on narrow viewports a
+          fixed side panel would crowd the dashboard. Persists across routes. */}
+      {!isMobile && <RollyAssistantSidebar />}
     </div>
   );
 }

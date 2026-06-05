@@ -383,6 +383,85 @@ def _iter_home_target_platforms():
         pass
 
 
+def _lookup_gateway_session_id(platform_name: str, chat_id: str, thread_id: Optional[str] = None) -> Optional[str]:
+    """Return the active gateway session_id for a delivered cron target, if known."""
+    try:
+        sessions_path = get_hermes_home() / "sessions" / "sessions.json"
+        with open(sessions_path, "r", encoding="utf-8") as f:
+            sessions = json.load(f)
+    except Exception as exc:
+        logger.debug("Cron delivery could not load gateway sessions index: %s", exc)
+        return None
+
+    platform_key = str(platform_name).lower()
+    chat_key = str(chat_id)
+    thread_key = str(thread_id) if thread_id is not None else None
+    matches = []
+    for entry in (sessions or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        origin = entry.get("origin") or {}
+        if str(origin.get("platform", "")).lower() != platform_key:
+            continue
+        if str(origin.get("chat_id", "")) != chat_key:
+            continue
+        origin_thread = origin.get("thread_id")
+        origin_thread_key = str(origin_thread) if origin_thread is not None else None
+        if origin_thread_key != thread_key:
+            continue
+        session_id = entry.get("session_id")
+        if session_id:
+            matches.append((entry.get("updated_at") or "", str(session_id)))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def _record_cron_delivery_in_gateway_history(
+    *,
+    job: dict,
+    target: dict,
+    delivery_content: str,
+    platform_message_id: Optional[str] = None,
+) -> None:
+    """Mirror a delivered cron response into the destination gateway session history.
+
+    Cron output is sent outside the normal chat loop, so without this mirror the
+    next user turn cannot see the reminder/report that appeared in the same
+    Telegram/Slack/etc. chat.  Store it as an observed user-context note instead
+    of an assistant turn: the cron agent is a separate session, and inserting a
+    synthetic assistant message here can create invalid role alternation in the
+    live gateway conversation.
+    """
+    try:
+        session_id = _lookup_gateway_session_id(
+            str(target.get("platform") or ""),
+            str(target.get("chat_id") or ""),
+            target.get("thread_id"),
+        )
+        if not session_id:
+            logger.debug(
+                "Job '%s': no gateway session found to mirror cron delivery to %s:%s",
+                job.get("id", "?"), target.get("platform"), target.get("chat_id"),
+            )
+            return
+        from hermes_state import SessionDB
+        SessionDB().append_message(
+            session_id=session_id,
+            role="user",
+            content=(
+                "[Observed cronjob response delivered in this chat; "
+                "include it as conversation context.]\n"
+                f"{delivery_content}"
+            ),
+            platform_message_id=platform_message_id or "",
+            observed=True,
+        )
+    except Exception as exc:
+        logger.debug("Job '%s': failed to mirror cron delivery into session history: %s", job.get("id", "?"), exc)
+
+
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
 
@@ -721,6 +800,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
+                send_result = None
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
                     future = safe_schedule_threadsafe(
@@ -770,6 +850,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                    _record_cron_delivery_in_gateway_history(
+                        job=job,
+                        target=target,
+                        delivery_content=cleaned_delivery_content.strip(),
+                        platform_message_id=str(getattr(send_result, "message_id", "") or ""),
+                    )
                     delivered = True
             except Exception as e:
                 logger.warning(
@@ -804,6 +890,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _record_cron_delivery_in_gateway_history(
+                job=job,
+                target=target,
+                delivery_content=cleaned_delivery_content.strip(),
+                platform_message_id=str((result or {}).get("message_id") or ""),
+            )
 
     if delivery_errors:
         return "; ".join(delivery_errors)

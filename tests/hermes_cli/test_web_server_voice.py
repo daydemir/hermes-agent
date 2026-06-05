@@ -1,5 +1,6 @@
 """Tests for dashboard voice-call prototype endpoints."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -58,6 +59,8 @@ def test_voice_session_config_uses_phone_call_turn_detection(voice_client):
 
     config = web_server._voice_session_config(user="deniz")
     assert "dashboard user: deniz" in config["instructions"]
+    assert "do not address them by raw dashboard username" in config["instructions"]
+    assert "Do not give mic/headset/echo troubleshooting" in config["instructions"]
     assert config["audio"]["output"]["voice"] == "cedar"
     tool_names = [tool["name"] for tool in config["tools"]]
     assert "context_lookup" in tool_names
@@ -70,7 +73,7 @@ def test_voice_session_config_uses_phone_call_turn_detection(voice_client):
     assert turn_detection == {
         "type": "semantic_vad",
         "create_response": True,
-        "interrupt_response": True,
+        "interrupt_response": False,
     }
 
 
@@ -163,6 +166,21 @@ def test_voice_tool_memory_lookup_does_not_spawn_cli(voice_client, monkeypatch):
     assert resp.json()["tool_name"] == "memory_lookup"
 
 
+def test_voice_lookup_tools_return_explicit_no_match_text(voice_client, monkeypatch):
+    client, web_server = voice_client
+
+    monkeypatch.setattr(web_server, "_voice_kanban_digest", lambda query=None: "")
+    monkeypatch.setattr(web_server, "_voice_recent_sessions", lambda query=None: "")
+
+    kanban = client.post("/api/voice/tool", json={"name": "kanban_lookup", "arguments": {"query": "blocked mix card"}})
+    sessions = client.post("/api/voice/tool", json={"name": "session_lookup", "arguments": {"query": "recent mix message"}})
+
+    assert kanban.status_code == 200
+    assert kanban.json()["result"] == "Kanban: no matching results found for query: blocked mix card."
+    assert sessions.status_code == 200
+    assert sessions.json()["result"] == "Sessions: no matching results found for query: recent mix message."
+
+
 def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
@@ -215,6 +233,58 @@ def test_voice_transcript_persists_jsonl(voice_client):
     assert '"source": "test"' in body
 
 
+def test_voice_room_returns_participants_and_incremental_events(voice_client):
+    client, _web_server = voice_client
+    for event in [
+        {"call_id": "room/1", "role": "system", "text": "Call started.", "event_type": "call_start", "user": "deniz", "timestamp": "2026-06-02T00:00:01Z", "sequence": 1},
+        {"call_id": "room/1", "role": "system", "text": "Call started.", "event_type": "call_start", "user": "arman", "timestamp": "2026-06-02T00:00:02Z", "sequence": 1},
+        {"call_id": "room/1", "role": "system", "text": "Call ended.", "event_type": "call_end", "user": "arman", "timestamp": "2026-06-02T00:00:03Z", "sequence": 2},
+    ]:
+        assert client.post("/api/voice/transcript", json=event).status_code == 200
+
+    resp = client.get("/api/voice/room?call_id=room/1&since=1&limit=1")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["call_id"] == "room_1"
+    assert body["cursor"] == 3
+    assert [(event["index"], event["user"], event["event_type"]) for event in body["events"]] == [
+        (2, "arman", "call_start")
+    ]
+    assert {row["user"]: row["status"] for row in body["participants"]} == {"deniz": "live", "arman": "left"}
+
+
+def test_voice_meet_signaling_routes_to_room_participants(voice_client):
+    client, web_server = voice_client
+    with web_server._VOICE_ROOM_SIGNAL_LOCK:
+        web_server._VOICE_ROOM_SIGNALS.clear()
+
+    join = client.post(
+        "/api/voice/meet/signal",
+        json={"call_id": "signal/1", "type": "join", "user": "deniz"},
+        headers={"X-Rolly-User": "deniz"},
+    )
+    offer = client.post(
+        "/api/voice/meet/signal",
+        json={"call_id": "signal/1", "type": "offer", "to_user": "arman", "user": "deniz", "payload": {"type": "offer", "sdp": "offer-sdp"}},
+        headers={"X-Rolly-User": "deniz"},
+    )
+
+    assert join.status_code == 200
+    assert offer.status_code == 200
+    assert offer.json()["signal"]["call_id"] == "signal_1"
+
+    arman = client.get("/api/voice/meet/signals?call_id=signal/1&since=0", headers={"X-Rolly-User": "arman"})
+    buket = client.get("/api/voice/meet/signals?call_id=signal/1&since=0", headers={"X-Rolly-User": "buket"})
+
+    assert arman.status_code == 200
+    assert [(signal["type"], signal["from_user"], signal["to_user"]) for signal in arman.json()["signals"]] == [
+        ("join", "deniz", None),
+        ("offer", "deniz", "arman"),
+    ]
+    assert [(signal["type"], signal["to_user"]) for signal in buket.json()["signals"]] == [("join", None)]
+
+
 def test_run_voice_research_uses_cli_bridge(monkeypatch, voice_client):
     _client, web_server = voice_client
     calls = []
@@ -230,6 +300,23 @@ def test_run_voice_research_uses_cli_bridge(monkeypatch, voice_client):
     assert calls[0][0][1:5] == ["-m", "hermes_cli.main", "chat", "-q"]
     assert "Dashboard voice user: deniz" in calls[0][0][5]
     assert calls[0][0][-3:] == ["--source", "dashboard-voice", "-Q"]
+    assert calls[0][1]["timeout"] == 90
+
+
+def test_run_voice_research_background_timeout_is_longer_and_concise(monkeypatch, voice_client):
+    _client, web_server = voice_client
+
+    def fake_run(_args, **_kwargs):
+        raise web_server.subprocess.TimeoutExpired(cmd=["python", "-m", "hermes_cli.main", "chat", "huge prompt"], timeout=600)
+
+    monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_server._run_voice_research("long task", user="deniz", source="dashboard-voice-background")
+
+    message = str(exc_info.value)
+    assert message == "Rolly CLI tool timed out after 600s"
+    assert "huge prompt" not in message
 
 
 def test_voice_transcript_creates_state_session(voice_client):
@@ -280,10 +367,52 @@ def test_voice_background_tool_starts_real_task_contract(voice_client, monkeypat
     assert resp.status_code == 200
     body = resp.json()
     assert body["tool_name"] == "rolly_background"
+    assert body["result"] == "Queued background Rolly task vt_test. The voice UI will inject the result back into this live call when it is ready."
     assert body["data"]["task_id"] == "vt_test"
     assert body["data"]["status"] == "queued"
     assert started[0].call_id == "voice-call"
     assert started[0].request == "do the thing"
+
+
+def test_voice_background_task_spawns_durable_process_and_can_be_reloaded(voice_client, monkeypatch):
+    client, web_server = voice_client
+    popen_calls = []
+
+    class FakePopen:
+        pid = 12345
+
+    def fake_popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return FakePopen()
+
+    monkeypatch.setattr(web_server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        web_server._VOICE_TASK_EXECUTOR,
+        "submit",
+        lambda *_args, **_kwargs: pytest.fail("voice background tasks must not depend on the dashboard thread pool"),
+    )
+
+    resp = client.post(
+        "/api/voice/tool",
+        json={"name": "rolly_background", "call_id": "voice-durable", "arguments": {"request": "do durable work"}},
+        headers={"X-Rolly-User": "deniz"},
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["data"]["task_id"]
+    assert popen_calls
+    assert "hermes_cli.voice_task_runner" in popen_calls[0][0]
+    assert web_server._voice_task_state_path(task_id).exists()
+
+    with web_server._VOICE_TASKS_LOCK:
+        web_server._VOICE_TASKS.clear()
+
+    status = client.get(f"/api/voice/tasks/{task_id}")
+    assert status.status_code == 200
+    body = status.json()
+    assert body["task_id"] == task_id
+    assert body["status"] == "queued"
+    assert body["request"] == "do durable work"
 
 
 def test_voice_context_lookup_reports_live_voice_task_status(voice_client, monkeypatch):
@@ -319,6 +448,20 @@ def test_voice_task_status_lookup_reports_unavailable_for_missing_id(voice_clien
     assert "vt_missing: status unavailable" in result
 
 
+def test_voice_visible_task_result_replaces_secret_only_output(voice_client):
+    _client, web_server = voice_client
+    task = web_server.VoiceTask("vt_secret", "call-secret", "deniz", "do work", "voice_task_vt_secret")
+
+    result = web_server._voice_visible_task_result(
+        "⏭ Secret entry skipped\n\n  ⏭ Secret entry skipped\n\n  ⏭ Secret entry skipped",
+        task,
+    )
+
+    assert "only visible output was redacted secret-entry placeholders" in result
+    assert "voice_task_vt_secret" in result
+    assert "⏭ Secret entry skipped" not in result
+
+
 def test_voice_session_config_reports_speaking_rate_support(voice_client, monkeypatch):
     _client, web_server = voice_client
     monkeypatch.setenv("HERMES_VOICE_SPEAKING_RATE", "1.08")
@@ -326,10 +469,8 @@ def test_voice_session_config_reports_speaking_rate_support(voice_client, monkey
     config = web_server._voice_session_config(user="deniz")
 
     assert "slightly faster" in config["instructions"]
-    rate = config["metadata"]["speaking_rate"]
-    assert rate["requested"] == 1.08
-    assert rate["explicit_control_supported"] is False
-    assert rate["provider"] == "openai-realtime-webrtc"
+    assert "configured rate preference 1.08x" in config["instructions"]
+    assert "metadata" not in config
 
 
 def test_voice_invite_requires_feature_flag(voice_client, monkeypatch):
@@ -358,6 +499,75 @@ def test_voice_invite_returns_share_url_when_enabled(voice_client, monkeypatch):
     assert body["call_id"] == "voice-call"
     assert "mode=meet" in body["invite_url"]
     assert "call_id=voice-call" in body["invite_url"]
+    assert body["participant_audio_routing"] == "peer_audio_signaling"
+    assert "browser peer audio" in body["participant_audio_routing_detail"]
+
+
+def test_voice_invite_rejects_ended_call(voice_client, monkeypatch):
+    client, _web_server = voice_client
+    monkeypatch.setenv("HERMES_VOICE_MEET_INVITES", "1")
+
+    end_resp = client.post(
+        "/api/voice/transcript",
+        json={
+            "call_id": "ended-invite-call",
+            "role": "system",
+            "text": "ended",
+            "event_type": "call_end",
+            "user": "deniz",
+        },
+    )
+    assert end_resp.status_code == 200
+
+    resp = client.post(
+        "/api/voice/meet/invite",
+        json={"call_id": "ended-invite-call", "user": "deniz"},
+    )
+
+    assert resp.status_code == 409
+
+
+def test_voice_call_end_preserves_detached_runner_result_state(voice_client, monkeypatch):
+    client, web_server = voice_client
+    sent = []
+    task = web_server.VoiceTask("vt_race", "call-race", "deniz", "do work", "voice_task_vt_race")
+    with web_server._VOICE_TASKS_LOCK:
+        web_server._VOICE_TASKS.clear()
+        web_server._VOICE_TASKS[task.task_id] = task
+    web_server._voice_write_task_state(task)
+
+    runner_state = task.to_dict()
+    runner_state.update(
+        {
+            "status": "complete",
+            "progress": runner_state["progress"]
+            + [{"timestamp": "2026-06-03T18:49:00+00:00", "event_type": "complete", "message": "Rolly background task completed."}],
+            "result": "finished answer",
+            "error": None,
+            "updated_at": "2026-06-03T18:49:00+00:00",
+        }
+    )
+    web_server._voice_task_state_path(task.task_id).write_text(json.dumps(runner_state), encoding="utf-8")
+    monkeypatch.setattr(web_server, "_voice_send_post_call_notification", lambda task: sent.append((task.task_id, task.status, task.result)) or True)
+
+    end_resp = client.post(
+        "/api/voice/transcript",
+        json={
+            "call_id": "call-race",
+            "role": "system",
+            "text": "ended",
+            "event_type": "call_end",
+            "user": "deniz",
+            "timestamp": "2026-06-03T18:50:00+00:00",
+        },
+    )
+    assert end_resp.status_code == 200
+
+    persisted = json.loads(web_server._voice_task_state_path(task.task_id).read_text(encoding="utf-8"))
+    assert persisted["status"] == "complete"
+    assert persisted["result"] == "finished answer"
+    assert persisted["call_ended"] is True
+    assert sent == [("vt_race", "complete", "finished answer")]
 
 
 def test_voice_call_end_marks_task_and_sends_single_post_call_notification(voice_client, monkeypatch):

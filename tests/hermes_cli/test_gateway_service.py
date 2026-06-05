@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -478,6 +479,26 @@ class TestLaunchdServiceRecovery:
             == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         )
 
+    def test_launchd_domain_defaults_to_user_domain_and_allows_override(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LAUNCHD_DOMAIN", raising=False)
+        assert gateway_cli._launchd_domain() == f"user/{os.getuid()}"
+
+        monkeypatch.setenv("HERMES_LAUNCHD_DOMAIN", "gui/{uid}")
+        assert gateway_cli._launchd_domain() == f"gui/{os.getuid()}"
+
+        monkeypatch.setenv("HERMES_LAUNCHD_DOMAIN", "system")
+        with pytest.raises(ValueError, match="user/ or gui/"):
+            gateway_cli._launchd_domain()
+
+    def test_generated_launchd_plist_targets_background_user_session(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LAUNCHD_DOMAIN", raising=False)
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+        assert plist["LimitLoadToSessionType"] == "Background"
+
+        monkeypatch.setenv("HERMES_LAUNCHD_DOMAIN", "gui/{uid}")
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+        assert plist["LimitLoadToSessionType"] == "Aqua"
+
     def test_launchd_install_repairs_outdated_plist_without_force(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")
@@ -496,9 +517,14 @@ class TestLaunchdServiceRecovery:
 
         label = gateway_cli.get_launchd_label()
         domain = gateway_cli._launchd_domain()
+        bootout_targets = [
+            f"{domain}/{label}",
+            f"gui/{os.getuid()}/{label}",
+        ]
         assert "--replace" in plist_path.read_text(encoding="utf-8")
-        assert calls[:2] == [
-            ["launchctl", "bootout", f"{domain}/{label}"],
+        assert calls[:3] == [
+            ["launchctl", "bootout", bootout_targets[0]],
+            ["launchctl", "bootout", bootout_targets[1]],
             ["launchctl", "bootstrap", domain, str(plist_path)],
         ]
 
@@ -523,8 +549,14 @@ class TestLaunchdServiceRecovery:
 
         gateway_cli.launchd_start()
 
+        bootout_targets = [
+            f"{domain}/{label}",
+            f"gui/{os.getuid()}/{label}",
+        ]
         assert calls == [
             ["launchctl", "kickstart", target],
+            ["launchctl", "bootout", bootout_targets[0]],
+            ["launchctl", "bootout", bootout_targets[1]],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
         ]
@@ -551,8 +583,14 @@ class TestLaunchdServiceRecovery:
 
         gateway_cli.launchd_start()
 
+        bootout_targets = [
+            f"{domain}/{label}",
+            f"gui/{os.getuid()}/{label}",
+        ]
         assert calls == [
             ["launchctl", "kickstart", target],
+            ["launchctl", "bootout", bootout_targets[0]],
+            ["launchctl", "bootout", bootout_targets[1]],
             ["launchctl", "bootstrap", domain, str(plist_path)],
             ["launchctl", "kickstart", target],
         ]
@@ -681,8 +719,37 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_status_queries_explicit_launchd_target(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        target = gateway_cli._launchd_target()
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="service = { pid = 123 }\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        assert calls == [["launchctl", "print", target]]
+        assert "loaded" in capsys.readouterr().out.lower()
+
 
 class TestGatewayServiceDetection:
+    def test_macos_service_running_uses_explicit_launchd_probe(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: SimpleNamespace(exists=lambda: True))
+        monkeypatch.setattr(gateway_cli, "_probe_launchd_service_running", lambda: True)
+
+        assert gateway_cli._is_service_running() is True
+
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)

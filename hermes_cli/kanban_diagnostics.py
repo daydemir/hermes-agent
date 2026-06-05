@@ -145,6 +145,60 @@ def _task_field(task, name, default=None):
     return getattr(task, name, default)
 
 
+def _string_set(value) -> set[str]:
+    """Normalize config values that may be a list or comma string."""
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, Iterable):
+        parts = value
+    else:
+        return set()
+    return {
+        str(part).strip().lower()
+        for part in parts
+        if str(part).strip()
+    }
+
+
+def _rolly_user_assignee_slugs() -> set[str]:
+    """Optional Rolly-local human assignees from ``rolly-users.json``.
+
+    Upstream Hermes installs do not have this file. When present, these
+    slugs represent human card owners, not worker profiles, so diagnostics
+    should not treat ready cards assigned to them as stranded worker jobs.
+    """
+    try:
+        from hermes_cli import kanban_db
+        path = kanban_db.kanban_home() / "rolly-users.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(users, list):
+        return set()
+    out: set[str] = set()
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        slug = str(user.get("slug") or "").strip().lower()
+        if slug:
+            out.add(slug)
+    return out
+
+
+def _human_assignees(cfg: dict) -> set[str]:
+    """Return assignee names that are explicitly manual/human owners."""
+    names = _string_set(cfg.get("human_assignees"))
+    kanban_cfg = cfg.get("kanban")
+    if isinstance(kanban_cfg, dict):
+        names |= _string_set(kanban_cfg.get("human_assignees"))
+        names |= _string_set(kanban_cfg.get("manual_assignees"))
+    names |= _rolly_user_assignee_slugs()
+    return names
+
+
 def _parse_payload(ev) -> dict:
     """Tolerate event.payload being either a dict or a JSON string."""
     p = _task_field(ev, "payload", None)
@@ -724,20 +778,20 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Task has been in ``blocked`` status for too long without a comment.
+def _rule_stuck_in_triage(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Task has been in ``triage`` status for too long without a comment.
 
     Threshold: cfg["blocked_stale_hours"] (default 24).
-    Surfaced as a warning so humans know there's a pending unblock.
+    Surfaced as a warning so humans know there's a pending release.
     """
     hours = float(cfg.get("blocked_stale_hours", 24))
     status = _task_field(task, "status")
-    if status != "blocked":
+    if status != "triage":
         return []
-    # Find the most recent ``blocked`` event.
+    # Find the most recent ``triage_requested`` event.
     last_blocked_ts = 0
     for ev in events:
-        if _event_kind(ev) == "blocked":
+        if _event_kind(ev) == "triage_requested":
             t = _event_ts(ev)
             last_blocked_ts = max(last_blocked_ts, t)
     if last_blocked_ts == 0:
@@ -745,9 +799,9 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     age_hours = (now - last_blocked_ts) / 3600.0
     if age_hours < hours:
         return []
-    # Any comment / unblock after the block breaks the "stale" signal.
+    # Any comment / release after the triage breaks the "stale" signal.
     for ev in events:
-        if _event_kind(ev) in {"commented", "unblocked"} and _event_ts(ev) > last_blocked_ts:
+        if _event_kind(ev) in {"commented", "triage_released"} and _event_ts(ev) > last_blocked_ts:
             return []
     actions: list[DiagnosticAction] = [
         DiagnosticAction(
@@ -757,32 +811,32 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
         ),
     ]
     return [Diagnostic(
-        kind="stuck_in_blocked",
+        kind="stuck_in_triage",
         severity="warning",
-        title=f"Task has been blocked for {int(age_hours)}h",
+        title=f"Task has been in triage for {int(age_hours)}h",
         detail=(
-            f"This task transitioned to blocked {int(age_hours)}h ago and "
-            f"has had no comments or unblock attempts since. Blocked tasks "
-            f"are waiting for human input — check the block reason and "
-            f"either unblock with feedback or answer with a comment."
+            f"This task transitioned to triage {int(age_hours)}h ago and "
+            f"has had no comments or release attempts since. Triage tasks "
+            f"are waiting for human input — check the reason and "
+            f"either release with feedback or answer with a comment."
         ),
         actions=actions,
         first_seen_at=last_blocked_ts,
         last_seen_at=last_blocked_ts,
         count=1,
-        data={"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)},
+        data={"triaged_at": last_blocked_ts, "age_hours": round(age_hours, 1)},
     )]
 
 
-def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Task has cycled through blocked → unblocked many times — the
-    ``unblock`` is not fixing the underlying problem and the worker
-    keeps re-blocking for substantially the same reason.
+def _rule_triage_release_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Task has cycled through triage → release many times — the
+    ``release`` is not fixing the underlying problem and the worker
+    keeps re-triaging for substantially the same reason.
 
-    ``_rule_stuck_in_blocked`` resets its timer on any ``commented`` /
-    ``unblocked`` event, so a task that cycles every few minutes is
+    ``_rule_stuck_in_triage`` resets its timer on any ``commented`` /
+    ``triage_released`` event, so a task that cycles every few minutes is
     invisible to it regardless of how many times it cycles (#29747
-    gap 1). This rule complements that one by counting block→unblock
+    gap 1). This rule complements that one by counting triage→release
     cycles in a sliding window.
 
     Threshold: cfg["block_cycle_threshold"] (default 3) cycles within
@@ -795,7 +849,7 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     # Walk events chronologically (arrival order — callers pre-sort by
     # id, which is the canonical chronological order; ``created_at``
     # alone is insufficient because multiple events can share the same
-    # second).  Count "blocked after unblocked" transitions: every time
+    # second).  Count "triage after release" transitions: every time
     # a blocked event follows at least one unblocked event since the
     # last cycle was counted, that's a new cycle.
     cycles = 0
@@ -807,14 +861,14 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
         if ts < cycle_cutoff:
             continue
         kind = _event_kind(ev)
-        if kind == "blocked":
+        if kind == "triage_requested":
             if initial_blocked_ts == 0:
                 initial_blocked_ts = ts
             if seen_unblock_since_last_cycle:
                 cycles += 1
                 last_cycle_blocked_ts = ts
                 seen_unblock_since_last_cycle = False
-        elif kind == "unblocked":
+        elif kind == "triage_released":
             seen_unblock_since_last_cycle = True
 
     if cycles < threshold:
@@ -830,12 +884,12 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
             suggested=True,
         ))
     return [Diagnostic(
-        kind="block_unblock_cycling",
+        kind="triage_release_cycling",
         severity="warning",
         title=f"Task block→unblock cycled {cycles}x in {int(window_seconds/3600)}h",
         detail=(
             f"This task has been blocked {cycles} times after being "
-            "unblocked, suggesting the unblock is not addressing the "
+            "triage_released, suggesting the release is not addressing the "
             "root cause and the worker keeps hitting the same wall. "
             "Review the block reasons in the event history; a different "
             "intervention (reassign, change scope, archive) may be needed."
@@ -890,18 +944,25 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if _task_field(task, "claim_lock"):
         return []
     assignee = _task_field(task, "assignee") or ""
-    if not assignee.strip():
+    assignee_name = assignee.strip()
+    if not assignee_name:
         # Unassigned tasks: the dispatcher's ``skipped_unassigned`` is
         # already the right signal. A separate diagnostic here would
         # double-flag the same condition.
+        return []
+    if assignee_name.lower() in _human_assignees(cfg):
+        # Rolly's simplified board uses assignee for human ownership too
+        # (deniz/arman/buket/etc.). Those cards are not expected to be
+        # claimed by the dispatcher, so worker-stranding diagnostics are
+        # noise.
         return []
 
     # Find the most recent event that put this task into ready.
     # ``created`` covers tasks born ready; ``promoted`` covers parent-
     # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
-    # ``unblocked`` covers human-driven resumes.
+    # ``triage_released`` covers human-driven resumes.
     READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
+        "created", "promoted", "reclaimed", "triage_released",
     }
     last_ready_ts = 0
     for ev in events:
@@ -982,8 +1043,8 @@ _RULES: list[RuleFn] = [
     _rule_prose_phantom_refs,
     _rule_repeated_failures,
     _rule_repeated_crashes,
-    _rule_stuck_in_blocked,
-    _rule_block_unblock_cycling,
+    _rule_stuck_in_triage,
+    _rule_triage_release_cycling,
     _rule_stranded_in_ready,
 ]
 
@@ -996,8 +1057,8 @@ DIAGNOSTIC_KINDS = (
     "prose_phantom_refs",
     "repeated_failures",
     "repeated_crashes",
-    "stuck_in_blocked",
-    "block_unblock_cycling",
+    "stuck_in_triage",
+    "triage_release_cycling",
     "stranded_in_ready",
 )
 

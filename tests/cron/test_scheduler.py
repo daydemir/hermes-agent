@@ -528,6 +528,49 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    def test_delivery_mirrors_response_into_gateway_session_history(self, tmp_path, monkeypatch):
+        """Cron deliveries should be visible to the next turn in that chat."""
+        from gateway.config import Platform
+
+        hermes_home = tmp_path / ".hermes"
+        sessions_dir = hermes_home / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "sessions.json").write_text(json.dumps({
+            "agent:main:telegram:dm:123": {
+                "session_id": "session-123",
+                "updated_at": "2026-06-02T18:36:00",
+                "origin": {"platform": "telegram", "chat_id": "123", "thread_id": None},
+            }
+        }), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        db = MagicMock()
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "m-1"})), \
+             patch("hermes_state.SessionDB", return_value=db):
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Here is today's summary.")
+
+        db.append_message.assert_called_once()
+        kwargs = db.append_message.call_args.kwargs
+        assert kwargs["session_id"] == "session-123"
+        assert kwargs["role"] == "user"
+        assert kwargs["observed"] is True
+        assert kwargs["platform_message_id"] == "m-1"
+        assert "Observed cronjob response delivered in this chat" in kwargs["content"]
+        assert "Cronjob Response: daily-report" in kwargs["content"]
+        assert "Here is today's summary." in kwargs["content"]
+
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
         from gateway.config import Platform

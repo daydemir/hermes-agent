@@ -1,12 +1,41 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
-import { api, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
+import { api, type VoiceMeetSignal, type VoiceRoomEvent, type VoiceRoomParticipant, type VoiceTaskResponse, type VoiceToolRequest } from "@/lib/api";
 import { getRollyUser, getRollyUserSlug } from "@/lib/rollyIdentity";
+import {
+  isRollyWakePhrase,
+  computePoliteRole,
+  shouldIgnoreOffer,
+  shouldApplyAnswer,
+  nextRestartBackoffMs,
+  isStaleOffer,
+  meshSinkKey,
+  parseIceConfig,
+} from "@/lib/voiceMeet";
 
 type CallStatus = "idle" | "requesting" | "connecting" | "live" | "ending" | "error";
 
+const STUN_FALLBACK: RTCConfiguration = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+/** Per-peer perfect-negotiation state for the Meet-mode audio mesh. */
+interface MeshPeer {
+  pc: RTCPeerConnection;
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  pendingCandidates: RTCIceCandidateInit[];
+  queue: Promise<void>;
+  restartAttempts: number;
+  micSender: RTCRtpSender | null;
+}
+
 type LogKind = "system" | "user" | "rolly" | "tool" | "error";
+
+const VOICE_ACTION_BUTTON_CLASS = "leading-tight text-sm tracking-[0.12em] sm:text-base sm:tracking-[0.2em]";
+const AUTO_SCROLL_NEAR_BOTTOM_PX = 64;
+
+type ScrollColumn = "transcript" | "events";
 
 type WakeLockSentinelLike = EventTarget & {
   release: () => Promise<void>;
@@ -41,14 +70,30 @@ function formatElapsed(ms: number | null): string {
   return `+${(ms / 1000).toFixed(1)}s`;
 }
 
-function isRollyWakePhrase(text: string): boolean {
-  const normalized = text
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^a-z\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return /\bhey\s+(?:rolly|rollie|rowley|rowly|rowy|roley|rally)\b/.test(normalized);
+function isRealtimeSpeechEvent(entry: LogEntry): boolean {
+  return entry.text === "Realtime API heard speech start." || entry.text === "Realtime API heard speech stop." || entry.text === "Realtime API committed mic audio.";
+}
+
+function isNearScrollBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= AUTO_SCROLL_NEAR_BOTTOM_PX;
+}
+
+function scrollColumnToBottom(element: HTMLElement | null): void {
+  if (!element) return;
+  element.scrollTop = element.scrollHeight;
+}
+
+function sharedRoomLog(event: VoiceRoomEvent, localUser: string): { kind: LogKind; text: string } | null {
+  const eventUser = event.user || "unknown dashboard user";
+  if (eventUser === localUser && event.event_type !== "call_start" && event.event_type !== "call_end") return null;
+  if (event.event_type === "call_start") return { kind: "system", text: `${eventUser} joined the room.` };
+  if (event.event_type === "call_end") return { kind: "system", text: `${eventUser} left the room.` };
+  if (eventUser === localUser) return null;
+  if (event.event_type === "transcript" && event.text.trim()) {
+    if (event.role === "user") return { kind: "user", text: `${eventUser}: ${event.text}` };
+    if (event.role === "rolly" || event.role === "assistant") return { kind: "rolly", text: `Rolly to ${eventUser}: ${event.text}` };
+  }
+  return null;
 }
 
 export default function VoiceCallPage() {
@@ -60,6 +105,7 @@ export default function VoiceCallPage() {
   const [selectedInputId, setSelectedInputId] = useState("");
   const [speaker, setSpeaker] = useState(() => getRollyUserSlug());
   const [error, setError] = useState<string | null>(null);
+  const [verboseEvents, setVerboseEvents] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([
     {
       id: logId(),
@@ -69,6 +115,10 @@ export default function VoiceCallPage() {
       elapsedMs: null,
     },
   ]);
+  const transcriptScrollRef = useRef<HTMLDivElement | null>(null);
+  const eventsScrollRef = useRef<HTMLDivElement | null>(null);
+  const [transcriptAtLatest, setTranscriptAtLatest] = useState(true);
+  const [eventsAtLatest, setEventsAtLatest] = useState(true);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataRef = useRef<RTCDataChannel | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -85,6 +135,7 @@ export default function VoiceCallPage() {
   const callStartedAtRef = useRef<number | null>(null);
   const eventSeqRef = useRef(0);
   const pendingTranscriptSavesRef = useRef<Promise<unknown>[]>([]);
+  const transcriptSaveChainRef = useRef<Promise<unknown>>(Promise.resolve());
   const callSeqRef = useRef(0);
   const [saveStatus, setSaveStatus] = useState("Not saving yet");
   const [lastSavePath, setLastSavePath] = useState<string | null>(null);
@@ -95,12 +146,36 @@ export default function VoiceCallPage() {
   const [mode, setMode] = useState<"solo" | "meet">("solo");
   const [callIdDisplay, setCallIdDisplay] = useState(callIdRef.current);
   const [inviteUrl, setInviteUrl] = useState<string | null>(null);
+  const [invitePending, setInvitePending] = useState(false);
+  const [roomParticipants, setRoomParticipants] = useState<VoiceRoomParticipant[]>([]);
   const [voiceTasks, setVoiceTasks] = useState<VoiceTaskResponse[]>([]);
   const [rollyListenState, setRollyListenState] = useState("Always on");
   const handledToolCallsRef = useRef<Set<string>>(new Set());
+  const activeCallModeRef = useRef<"solo" | "meet">("solo");
   const meetInvokedRef = useRef(false);
+  const voiceRoomCursorRef = useRef(0);
+  const seenVoiceRoomEventsRef = useRef<Set<string>>(new Set());
+  const voiceSignalCursorRef = useRef(0);
+  const meetPeerConnectionsRef = useRef<Map<string, MeshPeer>>(new Map());
+  const meetRemoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const meetSignalCancelRef = useRef<(() => void) | null>(null);
   const userSpeakingRef = useRef(false);
   const responseActiveRef = useRef(false);
+  // Audio playback registry + cross-call WebRTC plumbing for Meet mode.
+  const audioSinksRef = useRef<Set<HTMLAudioElement>>(new Set());
+  const [audioBlocked, setAudioBlocked] = useState(false);
+  const iceConfigRef = useRef<RTCConfiguration | null>(null);
+  const myJoinIndexRef = useRef(0);
+  const rollyTrackRef = useRef<MediaStreamTrack | null>(null);
+  const fanoutCtxRef = useRef<AudioContext | null>(null);
+  const fanoutDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const fanoutActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (status !== "idle") return;
+    meetInvokedRef.current = false;
+    setRollyListenState(mode === "meet" ? "Silent until “Hey Rolly”" : "Always on");
+  }, [mode, status]);
   const pendingResponseCreateRef = useRef(false);
   const activeWorkRef = useRef<Map<string, string>>(new Map());
   const pendingHandoffsRef = useRef<Array<{ toolCallId: string; taskId: string; output: string }>>([]);
@@ -289,20 +364,20 @@ export default function VoiceCallPage() {
       const now = Date.now();
       const startedAt = callStartedAtRef.current;
       const sequence = ++eventSeqRef.current;
-      const save = api.saveVoiceTranscript(
-        {
-          call_id: callIdRef.current,
-          role,
-          text,
-          event_type: eventType,
-          user: speaker,
-          timestamp: new Date(now).toISOString(),
-          sequence,
-          elapsed_ms: startedAt === null ? undefined : now - startedAt,
-          metadata,
-        },
-        speaker,
-      )
+      const payload = {
+        call_id: callIdRef.current,
+        role,
+        text,
+        event_type: eventType,
+        user: speaker,
+        timestamp: new Date(now).toISOString(),
+        sequence,
+        elapsed_ms: startedAt === null ? undefined : now - startedAt,
+        metadata,
+      };
+      const save = transcriptSaveChainRef.current
+        .catch(() => undefined)
+        .then(() => api.saveVoiceTranscript(payload, speaker))
         .then((resp) => {
           setLastSavePath(resp.path);
           setSaveStatus(`Saved event #${sequence}`);
@@ -316,6 +391,7 @@ export default function VoiceCallPage() {
         .finally(() => {
           pendingTranscriptSavesRef.current = pendingTranscriptSavesRef.current.filter((item) => item !== save);
         });
+      transcriptSaveChainRef.current = save.catch(() => undefined);
       pendingTranscriptSavesRef.current.push(save);
       return save;
     },
@@ -375,47 +451,33 @@ export default function VoiceCallPage() {
     tick();
   }, [addLog, stopMicMonitor]);
 
-  const enableMicList = useCallback(async () => {
-    setError(null);
-    try {
-      if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error(
-          "Microphone access requires HTTPS. Open https://denizs-mac-mini.taildfdcc0.ts.net:9119/voice instead of the raw http:// Tailscale IP.",
-        );
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
-      await refreshInputDevices();
-      addLog("system", "Microphone permission granted; input list refreshed.");
-    } catch (exc) {
-      const message = exc instanceof Error ? exc.message : String(exc);
-      setError(message);
-      addLog("error", message);
-    }
-  }, [addLog, refreshInputDevices]);
-
   const switchMicrophone = useCallback(
     async (deviceId: string) => {
       if (status !== "live" || !peerRef.current) return;
       setError(null);
+      let nextStream: MediaStream | null = null;
       try {
         const audio: MediaTrackConstraints = deviceId ? { deviceId: { exact: deviceId } } : {};
-        const nextStream = await navigator.mediaDevices.getUserMedia({ audio });
+        nextStream = await navigator.mediaDevices.getUserMedia({ audio });
         const nextTrack = nextStream.getAudioTracks()[0];
         if (!nextTrack) throw new Error("Selected microphone produced no audio track.");
         const sender = peerRef.current.getSenders().find((item) => item.track?.kind === "audio");
         if (!sender) throw new Error("Active call has no microphone sender to replace.");
         await sender.replaceTrack(nextTrack);
         streamRef.current?.getTracks().forEach((track) => track.stop());
-        streamRef.current = nextStream;
+        const acceptedStream = nextStream;
+        if (!acceptedStream) throw new Error("Selected microphone stream was unavailable.");
+        streamRef.current = acceptedStream;
+        nextStream = null;
         nextTrack.enabled = !muted;
-        startMicMonitor(nextStream);
+        startMicMonitor(acceptedStream);
         await refreshInputDevices();
         addLog("system", `Switched microphone to ${nextTrack.label || "selected input"}.`);
         persistTranscript("system", `Switched microphone to ${nextTrack.label || "selected input"}.`, "mic_switched", {
           selected_input_id: deviceId || "browser-default",
         });
       } catch (exc) {
+        nextStream?.getTracks().forEach((track) => track.stop());
         const message = exc instanceof Error ? exc.message : String(exc);
         setError(`Microphone switch failed: ${message}`);
         addLog("error", `Microphone switch failed: ${message}`);
@@ -427,43 +489,63 @@ export default function VoiceCallPage() {
     [addLog, muted, persistTranscript, refreshInputDevices, startMicMonitor, status],
   );
 
-  const createInvite = useCallback(async () => {
-    setError(null);
-    try {
-      const resp = await api.createVoiceMeetInvite({ call_id: callIdRef.current, user: speaker });
-      setMode("meet");
-      setInviteUrl(resp.invite_url);
-      addLog("system", `Meet invite ready: ${resp.invite_url}`);
-      persistTranscript("system", `Meet invite created: ${resp.invite_url}`, "meet_invite_created", { mode: "meet" });
-    } catch (exc) {
-      const message = exc instanceof Error ? exc.message : String(exc);
-      setError(`Meet invite unavailable: ${message}`);
-      addLog("error", `Meet invite unavailable: ${message}`);
-    }
-  }, [addLog, persistTranscript, speaker]);
-
-  const stopCall = useCallback(() => {
+  const stopCall = useCallback((reason = "user") => {
     const endStartedAt = Date.now();
     const durationMs = callStartedAtRef.current === null ? 0 : endStartedAt - callStartedAtRef.current;
     callSeqRef.current += 1;
+    const statusAtEnd = status;
     setStatus((current) => (current === "idle" ? current : "ending"));
     stopWorkingCue(false);
     stopBackgroundCallSupport();
-    persistTranscript("system", "Call ended by user; microphone released.", "call_end", {
+    const endText = reason === "setup_error"
+      ? "Call ended after setup error; microphone released."
+      : "Call ended by user; microphone released.";
+    const voiceTasksAtEnd = voiceTasks.map((task) => ({ task_id: task.task_id, status: task.status, session_id: task.session_id }));
+    persistTranscript("system", endText, "call_end", {
       duration_ms: durationMs,
       pending_saves_at_end: pendingTranscriptSavesRef.current.length,
+      active_work_count_at_end: activeWorkRef.current.size,
+      voice_tasks_at_end: voiceTasksAtEnd,
       log_entries: logs.length,
+      status_before_end: statusAtEnd,
+      status_at_end: "ending",
+      reason,
     });
+    if (activeCallModeRef.current === "meet" && speaker) {
+      void api.postVoiceMeetSignal({ call_id: callIdRef.current, type: "leave", user: speaker }, speaker).catch(() => undefined);
+    }
+    meetSignalCancelRef.current?.();
+    meetSignalCancelRef.current = null;
+    meetPeerConnectionsRef.current.forEach((peer) => peer.pc.close());
+    meetPeerConnectionsRef.current.clear();
+    meetRemoteAudioRef.current.forEach((audio) => {
+      audio.srcObject = null;
+      audio.remove();
+    });
+    meetRemoteAudioRef.current.clear();
+    audioSinksRef.current.clear();
+    setAudioBlocked(false);
+    void fanoutCtxRef.current?.close().catch(() => undefined);
+    fanoutCtxRef.current = null;
+    fanoutDestRef.current = null;
+    fanoutActiveRef.current = false;
+    rollyTrackRef.current = null;
     if (dataRef.current) {
       dataRef.current.onerror = null;
+      dataRef.current.onmessage = null;
       dataRef.current.onopen = null;
+    }
+    if (peerRef.current) {
+      peerRef.current.onconnectionstatechange = null;
+      peerRef.current.ontrack = null;
     }
     dataRef.current?.close();
     peerRef.current?.close();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     stopMicMonitor();
-    if (audioRef.current?.srcObject instanceof MediaStream) {
-      audioRef.current.srcObject.getTracks().forEach((track) => track.stop());
+    // Only detach the OpenAI sink; do NOT stop() the remote track — we don't own
+    // it (pc.close() reaps it) and the fan-out mixer may still reference it.
+    if (audioRef.current) {
       audioRef.current.srcObject = null;
     }
     dataRef.current = null;
@@ -481,7 +563,333 @@ export default function VoiceCallPage() {
     Promise.allSettled([...pendingTranscriptSavesRef.current]).then(() => setSaveStatus("Call saved"));
     setStatus("idle");
     addLog("system", `Call ended; saved end marker (${(durationMs / 1000).toFixed(1)}s).`);
-  }, [addLog, logs.length, persistTranscript, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue]);
+  }, [addLog, logs.length, persistTranscript, speaker, status, stopBackgroundCallSupport, stopMicMonitor, stopWorkingCue, voiceTasks]);
+
+  const allSinksPlaying = useCallback(() => {
+    for (const el of audioSinksRef.current) {
+      if (el.paused) return false;
+    }
+    return true;
+  }, []);
+
+  // Attach a remote MediaStream to an <audio> sink and start playback. The page
+  // is always capturing (mic open for the whole call), so WebKit relaxes its
+  // MediaStream autoplay block and play() almost always resolves — we rely on
+  // an explicit play() (NOT the autoplay attribute, which is non-deterministic
+  // for a reassigned srcObject) and only surface the "tap to enable" fallback
+  // on an actual rejection. The element MUST already be in the DOM.
+  const attachAndPlay = useCallback(
+    async (el: HTMLAudioElement, stream: MediaStream) => {
+      el.muted = false;
+      el.srcObject = stream;
+      audioSinksRef.current.add(el);
+      try {
+        await el.play();
+        if (allSinksPlaying()) setAudioBlocked(false);
+      } catch {
+        setAudioBlocked(true);
+      }
+    },
+    [allSinksPlaying],
+  );
+
+  // Route an inbound mesh track to a sink keyed by (user, stream id) — never by
+  // user alone — so two streams from one peer (mic + a relayed Rolly mix) can't
+  // collide and overwrite each other. ontrack is terminal: play only, never
+  // re-relayed.
+  const handleMeshTrack = useCallback(
+    (remoteUser: string, event: RTCTrackEvent) => {
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+      const key = meshSinkKey(remoteUser, stream.id);
+      let el = meetRemoteAudioRef.current.get(key);
+      if (!el) {
+        el = document.createElement("audio");
+        el.dataset.rollyMeetPeer = remoteUser;
+        document.body.appendChild(el);
+        meetRemoteAudioRef.current.set(key, el);
+      }
+      void attachAndPlay(el, stream);
+    },
+    [attachAndPlay],
+  );
+
+  const teardownMeshSinksFor = useCallback((remoteUser: string) => {
+    const prefix = `${remoteUser}:`;
+    for (const [key, el] of meetRemoteAudioRef.current) {
+      if (!key.startsWith(prefix)) continue;
+      el.srcObject = null;
+      el.remove();
+      audioSinksRef.current.delete(el);
+      meetRemoteAudioRef.current.delete(key);
+    }
+  }, []);
+
+  // "Tap to enable call audio" gesture handler. Safari's transient activation is
+  // strict, so this is synchronous: fire play() on every sink in a tight loop
+  // with no await in between, then resume the cue/background contexts.
+  const enableAudio = useCallback(() => {
+    for (const el of audioSinksRef.current) {
+      el.muted = false;
+      void el.play().catch(() => undefined);
+    }
+    void cueAudioContextRef.current?.resume().catch(() => undefined);
+    void backgroundAudioContextRef.current?.resume().catch(() => undefined);
+    window.setTimeout(() => {
+      if (allSinksPlaying()) setAudioBlocked(false);
+    }, 150);
+  }, [allSinksPlaying]);
+
+  // Fan Rolly's spoken reply out to every other mesh participant. We mix the
+  // local mic + the OpenAI Rolly track through a WebAudio destination (a fresh
+  // synthetic track that bypasses the mic's echo-cancellation/noise-suppression)
+  // and replaceTrack it onto each peer's existing sender — zero renegotiation,
+  // no new m-line, no relay loop. Only the invoker's session is non-silent, so
+  // no duplicate answers, and the invoker still hears Rolly via their own sink.
+  const enableRollyFanout = useCallback(() => {
+    if (fanoutActiveRef.current) return;
+    const rolly = rollyTrackRef.current;
+    const mic = streamRef.current?.getAudioTracks()[0] ?? null;
+    if (!rolly || !mic) return;
+    const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return;
+    try {
+      const ctx = new AudioContextCtor();
+      fanoutCtxRef.current = ctx;
+      const dest = ctx.createMediaStreamDestination();
+      fanoutDestRef.current = dest;
+      ctx.createMediaStreamSource(new MediaStream([mic])).connect(dest);
+      ctx.createMediaStreamSource(new MediaStream([rolly])).connect(dest);
+      const mixedTrack = dest.stream.getAudioTracks()[0];
+      if (!mixedTrack) return;
+      void ctx.resume().catch(() => undefined);
+      for (const peer of meetPeerConnectionsRef.current.values()) {
+        void peer.micSender?.replaceTrack(mixedTrack).catch(() => undefined);
+      }
+      fanoutActiveRef.current = true;
+      addLog("system", "Rolly fan-out active: other participants now hear Rolly's reply.");
+    } catch (exc) {
+      addLog("system", `Rolly fan-out unavailable: ${exc instanceof Error ? exc.message : String(exc)}`);
+    }
+  }, [addLog]);
+
+  // Meet-mode audio mesh: a per-peer perfect-negotiation state machine over the
+  // HTTP long-poll signaling channel. Idempotent peers, ICE candidate buffering,
+  // join-index gating of stale offers, impolite-only ICE restart, and per-peer
+  // serial / cross-peer parallel signal processing.
+  const startMeetPeerAudio = useCallback(
+    async (roomCallId: string, localStream: MediaStream) => {
+      meetSignalCancelRef.current?.();
+      let cancelled = false;
+      meetSignalCancelRef.current = () => {
+        cancelled = true;
+      };
+
+      if (!iceConfigRef.current) {
+        try {
+          iceConfigRef.current = parseIceConfig(await api.getVoiceIce(speaker));
+        } catch {
+          iceConfigRef.current = STUN_FALLBACK;
+        }
+      }
+      if (cancelled) return;
+
+      const peers = meetPeerConnectionsRef.current;
+
+      const drainCandidates = async (peer: MeshPeer) => {
+        const pending = peer.pendingCandidates.splice(0);
+        for (const candidate of pending) {
+          try {
+            await peer.pc.addIceCandidate(candidate);
+          } catch {
+            /* drop a single bad candidate, keep the rest */
+          }
+        }
+      };
+
+      const ensurePeer = (remoteUser: string): MeshPeer => {
+        const existing = peers.get(remoteUser);
+        if (existing) return existing;
+        const pc = new RTCPeerConnection(iceConfigRef.current ?? STUN_FALLBACK);
+        const tx = pc.addTransceiver("audio", { direction: "sendrecv" });
+        const fanoutTrack = fanoutActiveRef.current ? fanoutDestRef.current?.stream.getAudioTracks()[0] ?? null : null;
+        const outboundTrack = fanoutTrack ?? localStream.getAudioTracks()[0] ?? null;
+        if (outboundTrack) void tx.sender.replaceTrack(outboundTrack).catch(() => undefined);
+        const peer: MeshPeer = {
+          pc,
+          polite: computePoliteRole(speaker, remoteUser),
+          makingOffer: false,
+          ignoreOffer: false,
+          pendingCandidates: [],
+          queue: Promise.resolve(),
+          restartAttempts: 0,
+          micSender: tx.sender,
+        };
+        pc.onnegotiationneeded = async () => {
+          try {
+            peer.makingOffer = true;
+            await pc.setLocalDescription();
+            if (!pc.localDescription) return;
+            await api.postVoiceMeetSignal(
+              { call_id: roomCallId, type: "offer", to_user: remoteUser, user: speaker, payload: pc.localDescription.toJSON() as unknown as Record<string, unknown> },
+              speaker,
+            );
+          } catch {
+            /* a failed offer is retried via the next state change / restart */
+          } finally {
+            peer.makingOffer = false;
+          }
+        };
+        pc.onicecandidate = (event) => {
+          // End-of-candidates (null) needs no signaling for connectivity; the
+          // receiver ignores candidate-less payloads, so only trickle real ones.
+          if (!event.candidate) return;
+          void api.postVoiceMeetSignal(
+            { call_id: roomCallId, type: "ice", to_user: remoteUser, user: speaker, payload: event.candidate.toJSON() as Record<string, unknown> },
+            speaker,
+          ).catch(() => undefined);
+        };
+        pc.ontrack = (event) => handleMeshTrack(remoteUser, event);
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === "connected") {
+            peer.restartAttempts = 0;
+            addLog("system", `Remote audio live: ${remoteUser}.`);
+            return;
+          }
+          if (pc.connectionState === "failed") {
+            // Only the impolite (offerer) peer restarts ICE, with bounded
+            // backoff, so two peers never fire dueling restarts. "disconnected"
+            // is transient and intentionally ignored.
+            if (peer.polite) {
+              addLog("system", `Remote audio to ${remoteUser} dropped; awaiting re-offer.`);
+              return;
+            }
+            const backoff = nextRestartBackoffMs(peer.restartAttempts);
+            if (backoff === undefined) {
+              addLog("system", `Remote audio to ${remoteUser} failed after retries.`);
+              return;
+            }
+            peer.restartAttempts += 1;
+            window.setTimeout(() => {
+              if (peers.get(remoteUser) === peer && pc.connectionState !== "connected" && pc.connectionState !== "closed") {
+                try {
+                  pc.restartIce();
+                } catch {
+                  /* ignore */
+                }
+              }
+            }, backoff);
+          }
+        };
+        peers.set(remoteUser, peer);
+        return peer;
+      };
+
+      const processSignal = async (peer: MeshPeer, remoteUser: string, signal: VoiceMeetSignal) => {
+        const { pc } = peer;
+        if (signal.type === "offer") {
+          if (isStaleOffer(signal.index, myJoinIndexRef.current)) return;
+          const offer = signal.payload as unknown as RTCSessionDescriptionInit;
+          peer.ignoreOffer = shouldIgnoreOffer({ polite: peer.polite, makingOffer: peer.makingOffer, signalingState: pc.signalingState });
+          if (peer.ignoreOffer) return;
+          try {
+            await pc.setRemoteDescription(offer);
+          } catch {
+            // Polite peer mid-offer: some WebKit builds need an explicit rollback
+            // before applying the remote offer.
+            if (peer.polite && pc.signalingState !== "stable") {
+              try {
+                await pc.setLocalDescription({ type: "rollback" });
+                await pc.setRemoteDescription(offer);
+              } catch {
+                return;
+              }
+            } else {
+              return;
+            }
+          }
+          await drainCandidates(peer);
+          await pc.setLocalDescription();
+          if (!pc.localDescription) return;
+          await api.postVoiceMeetSignal(
+            { call_id: roomCallId, type: "answer", to_user: remoteUser, user: speaker, payload: pc.localDescription.toJSON() as unknown as Record<string, unknown> },
+            speaker,
+          );
+          return;
+        }
+        if (signal.type === "answer") {
+          if (!shouldApplyAnswer(pc.signalingState)) return;
+          try {
+            await pc.setRemoteDescription(signal.payload as unknown as RTCSessionDescriptionInit);
+            await drainCandidates(peer);
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        if (signal.type === "ice") {
+          const candidate = signal.payload as RTCIceCandidateInit | null;
+          if (!candidate || !candidate.candidate) return;
+          if (!pc.remoteDescription) {
+            peer.pendingCandidates.push(candidate);
+            return;
+          }
+          try {
+            await pc.addIceCandidate(candidate);
+          } catch {
+            /* ignore */
+          }
+        }
+      };
+
+      const handleSignal = (signal: VoiceMeetSignal) => {
+        const remoteUser = signal.from_user;
+        if (!remoteUser || remoteUser === speaker) return;
+        if (signal.to_user && signal.to_user !== speaker) return;
+        if (signal.type === "join") {
+          ensurePeer(remoteUser);
+          addLog("system", `${remoteUser} joined peer audio.`);
+          return;
+        }
+        if (signal.type === "leave") {
+          peers.get(remoteUser)?.pc.close();
+          peers.delete(remoteUser);
+          teardownMeshSinksFor(remoteUser);
+          return;
+        }
+        const peer = ensurePeer(remoteUser);
+        // Per-peer serial chain, cross-peer parallel: a slow setRemoteDescription
+        // for one peer cannot head-of-line-block the others or the poll loop.
+        peer.queue = peer.queue.then(() => processSignal(peer, remoteUser, signal)).catch(() => undefined);
+      };
+
+      const pollSignals = async () => {
+        while (!cancelled) {
+          try {
+            const response = await api.getVoiceMeetSignals(roomCallId, voiceSignalCursorRef.current, 200, speaker, 10000);
+            voiceSignalCursorRef.current = response.cursor;
+            for (const signal of response.signals) handleSignal(signal);
+          } catch (exc) {
+            addLog("system", `Meet peer audio signaling paused: ${exc instanceof Error ? exc.message : String(exc)}`);
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          }
+        }
+      };
+
+      // Seed the cursor from the high-water index returned by our own join, so a
+      // (re)joiner never replays completed offer/answer/ice as live glare.
+      try {
+        const joinResp = await api.postVoiceMeetSignal({ call_id: roomCallId, type: "join", user: speaker }, speaker);
+        myJoinIndexRef.current = joinResp.signal.index;
+        voiceSignalCursorRef.current = joinResp.signal.index;
+      } catch {
+        myJoinIndexRef.current = 0;
+        voiceSignalCursorRef.current = 0;
+      }
+      if (cancelled) return;
+      void pollSignals();
+    },
+    [addLog, speaker, handleMeshTrack, teardownMeshSinksFor],
+  );
 
   const sendRealtimeEvent = useCallback((payload: Record<string, unknown>) => {
     const channel = dataRef.current;
@@ -490,8 +898,12 @@ export default function VoiceCallPage() {
   }, []);
 
   const requestResponseCreate = useCallback(
-    (reason: string) => {
+    (reason: string, options?: { queueIfActive?: boolean }) => {
       if (responseActiveRef.current) {
+        if (options?.queueIfActive === false) {
+          addLog("system", `Skipped extra voice response while current response is active (${reason}).`);
+          return;
+        }
         pendingResponseCreateRef.current = true;
         addLog("system", `Queued voice response until current response finishes (${reason}).`);
         return;
@@ -539,19 +951,23 @@ export default function VoiceCallPage() {
         });
       }
       persistTranscript("tool", handoff.output, "delegation_handoff", { task_id: handoff.taskId });
-      requestResponseCreate("tool output");
+      requestResponseCreate(
+        handoff.toolCallId.startsWith("handoff:") ? "background handoff" : "tool output",
+        handoff.toolCallId.startsWith("handoff:") ? undefined : { queueIfActive: false },
+      );
     }
   }, [persistTranscript, requestResponseCreate, sendRealtimeEvent]);
 
   const queueOrSendToolOutput = useCallback(
     (toolCallId: string, output: string, taskId = "foreground") => {
+      const isBackgroundHandoff = toolCallId.startsWith("handoff:");
       if (userSpeakingRef.current) {
         pendingHandoffsRef.current.push({ toolCallId, taskId, output });
         setPendingHandoffs(pendingHandoffsRef.current.length);
         persistTranscript("system", "Queued Rolly result until user stops speaking.", "handoff_queued", { task_id: taskId });
         return;
       }
-      if (toolCallId.startsWith("handoff:")) {
+      if (isBackgroundHandoff) {
         sendRealtimeEvent({
           type: "conversation.item.create",
           item: {
@@ -570,18 +986,25 @@ export default function VoiceCallPage() {
           },
         });
       }
-      requestResponseCreate("tool output");
+      requestResponseCreate(
+        isBackgroundHandoff ? "background handoff" : "tool output",
+        isBackgroundHandoff ? undefined : { queueIfActive: false },
+      );
     },
     [persistTranscript, requestResponseCreate, sendRealtimeEvent],
   );
 
   const pollVoiceTask = useCallback(
-    async (taskId: string, toolCallId: string) => {
-      markWorkStarted(`task:${taskId}`, `Rolly background task ${taskId} running`);
+    async (taskId: string, toolCallId: string, callSeq: number) => {
       let lastProgress = "";
       try {
         for (;;) {
           await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          if (callSeqRef.current !== callSeq || !dataRef.current || dataRef.current.readyState !== "open") {
+            addLog("system", `${taskId}: stopped live polling because the call is no longer active.`);
+            markWorkFinished(`task:${taskId}`, false);
+            return;
+          }
           const task: VoiceTaskResponse = await api.getVoiceTask(taskId, speaker);
           rememberVoiceTask(task);
           const latest = task.progress?.[task.progress.length - 1]?.message ?? task.status;
@@ -592,30 +1015,29 @@ export default function VoiceCallPage() {
           }
           if (task.status === "complete") {
             const output = task.result || "Background Rolly task completed.";
-            markWorkFinished(`task:${taskId}`, false);
             addLog("tool", `${taskId} complete\n${output.slice(0, 700)}`);
-            persistTranscript("tool", output, "delegation_result", { task_id: taskId, session_id: task.session_id });
             queueOrSendToolOutput(`handoff:${taskId}`, output, taskId);
+            markWorkFinished(`task:${taskId}`, "done");
             return;
           }
           if (task.status === "failed" || task.status === "cancelled") {
             const output = `Background Rolly task ${task.status}: ${task.error || "no error detail"}`;
-            markWorkFinished(`task:${taskId}`, "error");
             addLog("error", output);
             persistTranscript("tool", output, "delegation_error", { task_id: taskId, session_id: task.session_id });
             queueOrSendToolOutput(`handoff:${taskId}`, output, taskId);
+            markWorkFinished(`task:${taskId}`, "error");
             return;
           }
         }
       } catch (exc) {
         const message = exc instanceof Error ? exc.message : String(exc);
-        markWorkFinished(`task:${taskId}`, "error");
         addLog("error", `${taskId} polling failed: ${message}`);
         persistTranscript("tool", message, "delegation_error", { task_id: taskId });
         queueOrSendToolOutput(toolCallId, `Background task status check failed: ${message}`, taskId);
+        markWorkFinished(`task:${taskId}`, "error");
       }
     },
-    [addLog, markWorkFinished, markWorkStarted, persistTranscript, queueOrSendToolOutput, rememberVoiceTask, speaker],
+    [addLog, markWorkFinished, persistTranscript, queueOrSendToolOutput, rememberVoiceTask, speaker],
   );
 
   const handleToolCall = useCallback(
@@ -649,7 +1071,7 @@ export default function VoiceCallPage() {
       const startedAt = Date.now();
       markWorkStarted(`tool:${toolKey}`, `${name} running since ${formatClock(new Date(startedAt).toISOString())}`);
       addLog("tool", `Running ${name}… ${JSON.stringify(args).slice(0, 300)}`);
-      persistTranscript("tool", `Running ${name}: ${JSON.stringify(args)}`, "tool_call", {
+      await persistTranscript("tool", `Running ${name}: ${JSON.stringify(args)}`, "tool_call", {
         realtime_call_id: callId,
         tool_name: name,
         started_at: new Date(startedAt).toISOString(),
@@ -674,11 +1096,12 @@ export default function VoiceCallPage() {
             output,
           },
         });
-        requestResponseCreate("tool output");
+        requestResponseCreate("tool output", { queueIfActive: false });
         const taskId = typeof result.data?.task_id === "string" ? result.data.task_id : "";
         if (name === "rolly_background" && taskId) {
           rememberVoiceTask(result.data as unknown as VoiceTaskResponse);
-          void pollVoiceTask(taskId, callId);
+          markWorkStarted(`task:${taskId}`, `${taskId} running in background`);
+          void pollVoiceTask(taskId, callId, callSeqRef.current);
         }
       } catch (exc) {
         const durationMs = Date.now() - startedAt;
@@ -698,7 +1121,7 @@ export default function VoiceCallPage() {
             output: `Tool failed: ${message}`,
           },
         });
-        requestResponseCreate("tool output");
+        requestResponseCreate("tool output", { queueIfActive: false });
       }
     },
     [addLog, markWorkFinished, markWorkStarted, persistTranscript, pollVoiceTask, rememberVoiceTask, requestResponseCreate, sendRealtimeEvent, speaker],
@@ -728,22 +1151,24 @@ export default function VoiceCallPage() {
       if (type === "conversation.item.input_audio_transcription.completed") {
         const text = eventText(event);
         if (text) {
-          if (mode === "meet") {
+          const currentMode = activeCallModeRef.current;
+          if (currentMode === "meet") {
             const invoked = isRollyWakePhrase(text);
             if (invoked) {
               meetInvokedRef.current = true;
               setRollyListenState("Invoked by “Hey Rolly”");
               startBoundedWorkingCue();
+              enableRollyFanout();
               requestResponseCreate("meet wake phrase");
             } else if (!meetInvokedRef.current) {
               setRollyListenState("Silent; no “Hey Rolly” heard");
             }
           }
           const meetMetadata =
-            mode === "meet"
-              ? { mode, invoked_rolly: meetInvokedRef.current, dashboard_user: speaker, speaker_attribution: "unknown_room_speaker" }
-              : { mode, invoked_rolly: meetInvokedRef.current };
-          addLog("user", mode === "meet" ? `[room mic / dashboard: ${speaker || "unknown"}] ${text}` : text);
+            currentMode === "meet"
+              ? { mode: currentMode, invoked_rolly: meetInvokedRef.current, dashboard_user: speaker, speaker_attribution: "unknown_room_speaker" }
+              : { mode: currentMode, invoked_rolly: meetInvokedRef.current };
+          addLog("user", currentMode === "meet" ? `[room mic / dashboard: ${speaker || "unknown"}] ${text}` : text);
           persistTranscript("user", text, "transcript", meetMetadata);
         }
         return;
@@ -762,7 +1187,6 @@ export default function VoiceCallPage() {
         return;
       }
       if (type === "input_audio_buffer.committed") {
-        if (mode === "solo") startWorkingCue();
         addLog("system", "Realtime API committed mic audio.");
         persistTranscript("system", "Realtime API committed mic audio.", "audio_committed");
         return;
@@ -774,7 +1198,7 @@ export default function VoiceCallPage() {
       if (type === "response.done" || type === "response.cancelled") {
         finishResponse(type === "response.cancelled" ? "cancelled" : "done");
         stopWorkingCue(type === "response.cancelled" ? false : "done");
-        if (mode === "meet") {
+        if (activeCallModeRef.current === "meet") {
           meetInvokedRef.current = false;
           setRollyListenState("Silent until “Hey Rolly”");
         }
@@ -804,10 +1228,12 @@ export default function VoiceCallPage() {
         persistTranscript("error", messageText, "realtime_error");
       }
     },
-    [addLog, finishResponse, flushPendingHandoffs, handleToolCall, mode, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue],
+    [addLog, finishResponse, flushPendingHandoffs, handleToolCall, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue, enableRollyFanout],
   );
 
-  const startCall = useCallback(async () => {
+  const startCall = useCallback(async (overrideMode?: "solo" | "meet", preserveCallId = false) => {
+    const callMode = overrideMode ?? mode;
+    activeCallModeRef.current = callMode;
     if (!speaker) {
       setError("Pick a dashboard user first, then start the call.");
       addLog("error", "Pick a dashboard user first, then start the call.");
@@ -815,12 +1241,15 @@ export default function VoiceCallPage() {
     }
     const callSeq = callSeqRef.current + 1;
     callSeqRef.current = callSeq;
-    if (!new URLSearchParams(window.location.search).get("call_id")) {
+    if (!preserveCallId && !new URLSearchParams(window.location.search).get("call_id")) {
       callIdRef.current = `voice-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
     setCallIdDisplay(callIdRef.current);
     callStartedAtRef.current = Date.now();
-    eventSeqRef.current = 0;
+    if (!preserveCallId) eventSeqRef.current = 0;
+    voiceRoomCursorRef.current = 0;
+    seenVoiceRoomEventsRef.current = new Set();
+    voiceSignalCursorRef.current = 0;
     pendingTranscriptSavesRef.current = [];
     setLastSavePath(null);
     setSaveStatus("Saving call events…");
@@ -835,11 +1264,18 @@ export default function VoiceCallPage() {
     setVoiceTasks([]);
     handledToolCallsRef.current = new Set();
     meetInvokedRef.current = false;
-    setRollyListenState(mode === "meet" ? "Silent until “Hey Rolly”" : "Always on");
+    audioSinksRef.current.clear();
+    setAudioBlocked(false);
+    rollyTrackRef.current = null;
+    fanoutActiveRef.current = false;
+    fanoutDestRef.current = null;
+    void fanoutCtxRef.current?.close().catch(() => undefined);
+    fanoutCtxRef.current = null;
+    setRollyListenState(callMode === "meet" ? "Silent until “Hey Rolly”" : "Always on");
     persistTranscript("system", "Call started.", "call_start", {
       user_agent: navigator.userAgent,
       selected_input_id: selectedInputId || "browser-default",
-      mode,
+      mode: callMode,
     });
     const isCurrentCall = () => callSeqRef.current === callSeq;
     setError(null);
@@ -863,9 +1299,20 @@ export default function VoiceCallPage() {
       streamRef.current = stream;
       startMicMonitor(stream);
       await startBackgroundCallSupport();
+      if (!isCurrentCall()) {
+        stopBackgroundCallSupport();
+        stopMicMonitor();
+        if (streamRef.current === stream) streamRef.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const track = stream.getAudioTracks()[0];
       addLog("system", `Browser mic opened: ${track?.label || "unknown device"}. Watch the mic level; it should move when you talk.`);
       persistTranscript("system", `Browser mic opened: ${track?.label || "unknown device"}.`, "mic_opened");
+      if (callMode === "meet") {
+        void startMeetPeerAudio(callIdRef.current, stream);
+        addLog("system", "Meet peer audio signaling started.");
+      }
       setStatus("connecting");
 
       const peer = new RTCPeerConnection();
@@ -879,7 +1326,10 @@ export default function VoiceCallPage() {
 
       peer.ontrack = (event) => {
         if (!audioRef.current) return;
-        audioRef.current.srcObject = event.streams[0];
+        // Capture Rolly's track so Meet mode can fan it out to other participants.
+        rollyTrackRef.current = event.track;
+        const remoteStream = event.streams[0] ?? new MediaStream([event.track]);
+        void attachAndPlay(audioRef.current, remoteStream);
       };
       stream.getAudioTracks().forEach((track) => peer.addTrack(track, stream));
 
@@ -888,29 +1338,63 @@ export default function VoiceCallPage() {
       dataChannel.onopen = () => {
         setStatus("live");
         playVoiceCue("live");
-        const liveMessage = mode === "meet"
+        const liveMessage = callMode === "meet"
           ? "Meet mode live. Rolly is silent until someone says “Hey Rolly.”"
           : "Live. Talk normally; Rolly can answer by voice and call tools.";
         addLog("system", liveMessage);
-        persistTranscript("system", "Realtime data channel live.", "call_live", { mode });
+        persistTranscript("system", "Realtime data channel live.", "call_live", { mode: callMode });
       };
       dataChannel.onmessage = handleRealtimeEvent;
       dataChannel.onerror = () => addLog("error", "Realtime data channel error.");
 
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
+      persistTranscript("system", "WebRTC offer created; requesting Realtime answer.", "webrtc_offer_created", { mode: callMode });
 
-      const answerSdp = await api.createVoiceCall(offer.sdp || "", speaker, mode);
+      const answerSdp = await api.createVoiceCall(offer.sdp || "", speaker, callMode);
       if (!isCurrentCall()) return;
+      persistTranscript("system", "Realtime SDP answer received.", "realtime_answer_received", { mode: callMode });
       await peer.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      persistTranscript("system", "Realtime remote description applied.", "webrtc_remote_description_set", { mode: callMode });
     } catch (exc) {
       const message = exc instanceof Error ? exc.message : String(exc);
       setError(message);
       setStatus("error");
       addLog("error", message);
-      stopCall();
+      stopCall("setup_error");
     }
-  }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMicMonitor, stopCall, playVoiceCue]);
+  }, [addLog, handleRealtimeEvent, mode, persistTranscript, refreshInputDevices, selectedInputId, speaker, startBackgroundCallSupport, startMeetPeerAudio, startMicMonitor, stopBackgroundCallSupport, stopCall, stopMicMonitor, playVoiceCue, attachAndPlay]);
+
+  const startMeetingInvite = useCallback(async () => {
+    setError(null);
+    setInvitePending(true);
+    if (!new URLSearchParams(window.location.search).get("call_id")) {
+      callIdRef.current = `voice-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      setCallIdDisplay(callIdRef.current);
+      setInviteUrl(null);
+    }
+    try {
+      const resp = await api.createVoiceMeetInvite({ call_id: callIdRef.current, user: speaker });
+      setMode("meet");
+      setInviteUrl(resp.invite_url);
+      addLog("system", `Meet invite ready: ${resp.invite_url}`);
+      if (resp.participant_audio_routing === "not_supported") {
+        addLog("system", resp.participant_audio_routing_detail || "Participant-to-participant audio is not bridged yet.");
+      }
+      persistTranscript("system", `Meet invite created: ${resp.invite_url}`, "meet_invite_created", {
+        mode: "meet",
+        participant_audio_routing: resp.participant_audio_routing,
+        participant_audio_routing_detail: resp.participant_audio_routing_detail,
+      });
+      await startCall("meet", true);
+    } catch (exc) {
+      const message = exc instanceof Error ? exc.message : String(exc);
+      setError(`Meet invite unavailable: ${message}`);
+      addLog("error", `Meet invite unavailable: ${message}`);
+    } finally {
+      setInvitePending(false);
+    }
+  }, [addLog, persistTranscript, speaker, startCall]);
 
   const toggleMute = useCallback(() => {
     const next = !muted;
@@ -924,6 +1408,17 @@ export default function VoiceCallPage() {
     return () => {
       dataRef.current?.close();
       peerRef.current?.close();
+      meetSignalCancelRef.current?.();
+      meetPeerConnectionsRef.current.forEach((peer) => peer.pc.close());
+      meetPeerConnectionsRef.current.clear();
+      meetRemoteAudioRef.current.forEach((audio) => {
+        audio.srcObject = null;
+        audio.remove();
+      });
+      meetRemoteAudioRef.current.clear();
+      audioSinksRef.current.clear();
+      void fanoutCtxRef.current?.close().catch(() => undefined);
+      fanoutCtxRef.current = null;
       streamRef.current?.getTracks().forEach((track) => track.stop());
       stopWorkingCue(false);
       stopBackgroundCallSupport();
@@ -955,6 +1450,42 @@ export default function VoiceCallPage() {
     }
   }, []);
   useEffect(() => {
+    if (mode !== "meet") return;
+    let cancelled = false;
+    const pollRoom = async () => {
+      try {
+        const room = await api.getVoiceRoom(callIdRef.current, voiceRoomCursorRef.current, 200, speaker);
+        if (cancelled) return;
+        voiceRoomCursorRef.current = room.cursor;
+        setRoomParticipants(room.participants);
+        const additions: LogEntry[] = [];
+        for (const event of room.events) {
+          const key = `${event.index}:${event.user ?? ""}:${event.event_type ?? ""}:${event.sequence ?? ""}`;
+          if (seenVoiceRoomEventsRef.current.has(key)) continue;
+          seenVoiceRoomEventsRef.current.add(key);
+          const mapped = sharedRoomLog(event, speaker);
+          if (!mapped) continue;
+          additions.push({
+            id: `room-${key}`,
+            kind: mapped.kind,
+            text: mapped.text,
+            timestamp: event.timestamp || new Date().toISOString(),
+            elapsedMs: event.elapsed_ms ?? null,
+          });
+        }
+        if (additions.length) setLogs((prev) => [...prev, ...additions].slice(-300));
+      } catch {
+        // Keep voice interaction usable if room polling misses a beat.
+      }
+    };
+    void pollRoom();
+    const timer = window.setInterval(() => void pollRoom(), 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [mode, speaker]);
+  useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === "visible" && status === "live") {
         void requestWakeLock();
@@ -966,14 +1497,55 @@ export default function VoiceCallPage() {
   }, [requestWakeLock, status]);
 
   const live = status === "live";
-  const busy = status === "requesting" || status === "connecting" || status === "ending";
+  const busy = invitePending || status === "requesting" || status === "connecting" || status === "ending";
+  const hasMeetInvite = mode === "meet" && Boolean(inviteUrl);
   const speakerLabel = getRollyUser(speaker)?.label ?? "No dashboard user selected";
   const transcriptLogs = logs.filter((entry) => entry.kind === "user" || entry.kind === "rolly");
-  const eventLogs = logs.filter((entry) => entry.kind !== "user" && entry.kind !== "rolly");
+  const eventLogs = logs.filter((entry) => entry.kind !== "user" && entry.kind !== "rolly" && (verboseEvents || !isRealtimeSpeechEvent(entry)));
+  const lastTranscriptLog = transcriptLogs[transcriptLogs.length - 1];
+  const lastEventLog = eventLogs[eventLogs.length - 1];
+  const lastVoiceTask = voiceTasks[voiceTasks.length - 1];
+  const transcriptLatestKey = lastTranscriptLog?.id ?? "empty-transcript";
+  const eventsLatestKey = `${lastEventLog?.id ?? "empty-events"}:${lastVoiceTask?.task_id ?? "no-task"}:${lastVoiceTask?.updated_at ?? ""}`;
+
+  const updateScrollLock = useCallback((column: ScrollColumn, element: HTMLDivElement | null) => {
+    if (!element) return;
+    const atLatest = isNearScrollBottom(element);
+    if (column === "transcript") setTranscriptAtLatest(atLatest);
+    else setEventsAtLatest(atLatest);
+  }, []);
+
+  const jumpToLatest = useCallback(
+    (column: ScrollColumn) => {
+      const element = column === "transcript" ? transcriptScrollRef.current : eventsScrollRef.current;
+      scrollColumnToBottom(element);
+      updateScrollLock(column, element);
+    },
+    [updateScrollLock],
+  );
+
+  useLayoutEffect(() => {
+    if (transcriptAtLatest) scrollColumnToBottom(transcriptScrollRef.current);
+  }, [transcriptLatestKey, transcriptAtLatest]);
+
+  useLayoutEffect(() => {
+    if (eventsAtLatest) scrollColumnToBottom(eventsScrollRef.current);
+  }, [eventsLatestKey, eventsAtLatest]);
 
   return (
     <main className="flex h-full min-h-0 flex-col gap-4 overflow-auto p-4 lg:p-6">
-      <audio ref={audioRef} autoPlay />
+      {/* Playback driven by explicit play() in attachAndPlay, not the autoplay
+          attribute (non-deterministic for a reassigned srcObject in WebKit). */}
+      <audio ref={audioRef} />
+      {audioBlocked ? (
+        <button
+          type="button"
+          onClick={enableAudio}
+          className="w-full border border-amber-400/60 bg-amber-400/10 px-4 py-3 text-sm font-semibold uppercase tracking-[0.12em] text-amber-200 hover:bg-amber-400/20"
+        >
+          🔊 Tap to enable call audio
+        </button>
+      ) : null}
       <section className="border border-current/20 bg-background-base/70 p-5 text-midground shadow-xl">
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
@@ -985,11 +1557,17 @@ export default function VoiceCallPage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            {!live && !busy ? <Button onClick={enableMicList}>Enable mic list</Button> : null}
-            {!live && !busy ? <Button onClick={createInvite}>Start meeting / invite</Button> : null}
-            {!live && !busy ? <Button onClick={startCall} disabled={!speaker}>Start call</Button> : null}
-            {live ? <Button onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
-            {live || busy ? <Button onClick={stopCall}>End call</Button> : null}
+            {!live && !busy ? (
+              <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={hasMeetInvite ? () => void startCall("meet", true) : startMeetingInvite} disabled={!speaker}>
+                {hasMeetInvite ? "Join meeting" : "Start meeting / invite"}
+              </Button>
+            ) : null}
+            {!live && !busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => void startCall()} disabled={!speaker}>Start call</Button> : null}
+            {live ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={toggleMute}>{muted ? "Unmute" : "Mute"}</Button> : null}
+            <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => setVerboseEvents((value) => !value)}>
+              Verbose: {verboseEvents ? "on" : "off"}
+            </Button>
+            {live || busy ? <Button className={VOICE_ACTION_BUTTON_CLASS} onClick={() => stopCall()}>End call</Button> : null}
           </div>
         </div>
         <div className="mt-4 flex flex-wrap gap-2 text-xs uppercase tracking-[0.12em] text-text-secondary">
@@ -1014,10 +1592,10 @@ export default function VoiceCallPage() {
         <div className="mt-3 text-xs uppercase tracking-[0.12em] text-text-secondary">
           <div className="mb-3">USER: {speakerLabel}</div>
           <div className="mb-3 flex gap-2">
-            <Button disabled={live || busy} onClick={() => setMode("solo")}>
+            <Button className={VOICE_ACTION_BUTTON_CLASS} disabled={live || busy} onClick={() => setMode("solo")}>
               1:1 Rolly
             </Button>
-            <Button disabled={live || busy} onClick={() => setMode("meet")}>
+            <Button className={VOICE_ACTION_BUTTON_CLASS} disabled={live || busy} onClick={() => setMode("meet")}>
               Meet: Hey Rolly
             </Button>
           </div>
@@ -1050,52 +1628,69 @@ export default function VoiceCallPage() {
         {error ? <p className="mt-3 text-sm text-red-300">{error}</p> : null}
       </section>
 
-      <section className="grid min-h-[24rem] gap-4 xl:grid-cols-[1fr_1fr_22rem]">
-        <div className="min-h-0 border border-current/20 bg-black/30 p-4">
-          <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
-            Live transcript
-          </Typography>
-          <div className="mt-3 flex max-h-[60vh] flex-col gap-2 overflow-auto pr-1 text-sm">
+      <section className="grid min-h-[24rem] gap-3 xl:grid-cols-[1fr_1fr_20rem]">
+        <div className="min-h-0 border border-current/20 bg-black/30 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
+              Live transcript
+            </Typography>
+            {!transcriptAtLatest ? (
+              <button className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary underline underline-offset-4 hover:text-midground" onClick={() => jumpToLatest("transcript")} type="button">
+                Jump to latest
+              </button>
+            ) : null}
+          </div>
+          <div ref={transcriptScrollRef} onScroll={(event) => updateScrollLock("transcript", event.currentTarget)} className="mt-2 flex max-h-[60vh] flex-col gap-1 overflow-auto pr-1 text-sm">
             {(transcriptLogs.length ? transcriptLogs : [{ id: "empty-transcript", kind: "system" as LogKind, text: "No spoken transcript yet.", timestamp: new Date().toISOString(), elapsedMs: null }]).map((entry) => (
-              <div key={entry.id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={entry.id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {entry.kind} · {formatClock(entry.timestamp)} · {formatElapsed(entry.elapsedMs)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{entry.text}</div>
+                <div className="whitespace-pre-wrap leading-snug">{entry.text}</div>
               </div>
             ))}
           </div>
         </div>
-        <div className="min-h-0 border border-current/20 bg-black/30 p-4">
-          <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
-            Events + work
-          </Typography>
-          <div className="mt-3 flex max-h-[60vh] flex-col gap-2 overflow-auto pr-1 text-sm">
+        <div className="min-h-0 border border-current/20 bg-black/30 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em]">
+              Events + work
+            </Typography>
+            {!eventsAtLatest ? (
+              <button className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary underline underline-offset-4 hover:text-midground" onClick={() => jumpToLatest("events")} type="button">
+                Jump to latest
+              </button>
+            ) : null}
+          </div>
+          <div ref={eventsScrollRef} onScroll={(event) => updateScrollLock("events", event.currentTarget)} className="mt-2 flex max-h-[60vh] flex-col gap-1 overflow-auto pr-1 text-sm">
             {eventLogs.map((entry) => (
-              <div key={entry.id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={entry.id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {entry.kind} · {formatClock(entry.timestamp)} · {formatElapsed(entry.elapsedMs)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{entry.text}</div>
+                <div className="whitespace-pre-wrap leading-snug">{entry.text}</div>
               </div>
             ))}
             {voiceTasks.map((task) => (
-              <div key={task.task_id} className="border border-current/10 bg-background-base/50 p-3">
-                <div className="mb-1 text-[0.65rem] uppercase tracking-[0.14em] text-text-secondary">
+              <div key={task.task_id} className="border border-current/10 bg-background-base/50 px-2 py-1">
+                <div className="text-[0.62rem] uppercase tracking-[0.12em] text-text-secondary">
                   {task.task_id} · {task.status} · {formatClock(task.updated_at)}
                 </div>
-                <div className="whitespace-pre-wrap leading-relaxed">{task.progress?.[task.progress.length - 1]?.message || task.request}</div>
+                <div className="whitespace-pre-wrap leading-snug">{task.progress?.[task.progress.length - 1]?.message || task.request}</div>
               </div>
             ))}
           </div>
         </div>
-        <aside className="border border-current/20 bg-background-base/50 p-4 text-sm text-text-secondary">
+        <aside className="border border-current/20 bg-background-base/50 px-3 py-2 text-sm text-text-secondary">
           <Typography className="font-mondwest text-display text-lg uppercase tracking-[0.12em] text-midground">
             Pinned
           </Typography>
           <div className="mt-3 space-y-3">
             <div>Transcript: {lastSavePath || "not saved yet"}</div>
             <div>Queued tasks: {voiceTasks.length || "none"}</div>
+            <div>
+              Room: {roomParticipants.length ? roomParticipants.map((participant) => `${participant.user} ${participant.status}`).join(", ") : "solo / no peers"}
+            </div>
             <div>Speaking pace: slightly faster style instruction; explicit provider rate unsupported.</div>
           </div>
           <Typography className="mt-5 font-mondwest text-display text-lg uppercase tracking-[0.12em] text-midground">

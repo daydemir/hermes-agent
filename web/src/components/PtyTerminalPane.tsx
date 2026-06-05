@@ -4,7 +4,8 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -61,7 +62,51 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
       : null,
   );
+  const [composerDraft, setComposerDraft] = useState("");
+  const [pasteState, setPasteState] = useState<"idle" | "pasted" | "blocked">("idle");
+  const pasteResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const channel = useMemo(() => generateChannelId(), [tmuxTarget, resume]);
+
+  const sendTextToTerminal = useCallback((text: string, submit = true) => {
+    if (!text.trim()) return;
+    const term = termRef.current;
+    const ws = wsRef.current;
+    if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
+    term.paste(text);
+    if (submit) {
+      window.setTimeout(() => {
+        const s = wsRef.current;
+        if (s && s.readyState === WebSocket.OPEN) s.send("\r");
+      }, 80);
+    }
+    term.focus();
+  }, []);
+
+  const submitComposerDraft = useCallback((event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    const text = composerDraft;
+    setComposerDraft("");
+    sendTextToTerminal(text);
+  }, [composerDraft, sendTextToTerminal]);
+
+  const pasteClipboardIntoComposer = useCallback(() => {
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (!text) return;
+        setComposerDraft((prev) => (prev ? `${prev}\n${text}` : text));
+        setPasteState("pasted");
+      })
+      .catch(() => setPasteState("blocked"));
+    if (pasteResetRef.current) clearTimeout(pasteResetRef.current);
+    pasteResetRef.current = setTimeout(() => setPasteState("idle"), 1500);
+  }, []);
+
+  const handleComposerKeyDown = useCallback((event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.shiftKey) return;
+    event.preventDefault();
+    submitComposerDraft();
+  }, [submitComposerDraft]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -82,7 +127,8 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       macOptionIsMeta: true,
       macOptionClickForcesSelection: true,
       rightClickSelectsWord: true,
-      scrollback: 5000,
+      scrollback: 100000,
+      scrollOnUserInput: false,
       theme: TERMINAL_THEME,
     });
     termRef.current = term;
@@ -116,6 +162,7 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
     term.unicode.activeVersion = "11";
     term.loadAddon(new WebLinksAddon());
     term.open(host);
+
     if (tierWidthPx(host) >= 768) {
       try {
         const webgl = new WebglAddon();
@@ -175,10 +222,8 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
         else if (ev.code === 4403) setBanner("Terminal is only reachable from localhost.");
         else term.write("\r\n\x1b[90m[session ended]\x1b[0m\r\n");
       };
-      // eslint-disable-next-line no-control-regex -- xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       onDataDisposable = term.onData((data) => {
-        if (ws.readyState !== WebSocket.OPEN || SGR_MOUSE_RE.test(data)) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
         ws.send(data);
       });
       onResizeDisposable = term.onResize(({ cols, rows }) => {
@@ -195,6 +240,10 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
       ro.disconnect();
       window.removeEventListener("resize", scheduleSync);
       if (raf) cancelAnimationFrame(raf);
+      if (pasteResetRef.current) {
+        clearTimeout(pasteResetRef.current);
+        pasteResetRef.current = null;
+      }
       wsRef.current?.close();
       wsRef.current = null;
       term.dispose();
@@ -203,9 +252,39 @@ export function PtyTerminalPane({ tmuxTarget, resume, className, title, autoFocu
   }, [channel, resume, tmuxTarget, autoFocus]);
 
   return (
-    <div className={cn("relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg p-2", className)} style={{ backgroundColor: TERMINAL_THEME.background }} title={title}>
+    <div className={cn("relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-sm p-1", className)} style={{ backgroundColor: TERMINAL_THEME.background }} title={title}>
       {banner ? <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">{banner}</div> : null}
       <div ref={hostRef} className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1" />
+      <form
+        onSubmit={submitComposerDraft}
+        className="mt-1 flex shrink-0 items-end gap-1 rounded-sm border border-current/15 bg-black/15 p-1"
+        style={{ color: TERMINAL_THEME.foreground }}
+      >
+        <textarea
+          value={composerDraft}
+          onChange={(event) => setComposerDraft(event.target.value)}
+          onKeyDown={handleComposerKeyDown}
+          placeholder="paste/dictate… Enter sends"
+          rows={1}
+          autoCapitalize="sentences"
+          className="min-h-6 max-h-20 flex-1 resize-none rounded-sm bg-black/15 px-1.5 py-1 text-xs leading-tight outline-none placeholder:text-current/40 focus:ring-1 focus:ring-current/35"
+        />
+        <button
+          type="button"
+          onClick={pasteClipboardIntoComposer}
+          title={pasteState === "blocked" ? "Clipboard blocked" : "Paste clipboard into box"}
+          className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px]"
+        >
+          paste
+        </button>
+        <button
+          type="submit"
+          disabled={!composerDraft.trim()}
+          className="h-6 shrink-0 rounded-sm border border-current/20 px-1.5 text-[11px] disabled:opacity-40"
+        >
+          send
+        </button>
+      </form>
     </div>
   );
 }

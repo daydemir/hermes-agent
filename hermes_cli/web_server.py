@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import base64
 import hmac
 import hashlib
 import importlib.util
@@ -22,6 +23,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -192,6 +194,14 @@ class VoiceMeetInviteRequest(BaseModel):
     user: Optional[str] = None
 
 
+class VoiceMeetSignalRequest(BaseModel):
+    call_id: str
+    type: str
+    payload: Dict[str, Any] = {}
+    to_user: Optional[str] = None
+    user: Optional[str] = None
+
+
 class VoiceTask:
     def __init__(self, task_id: str, call_id: str, user: str, request: str, session_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -208,6 +218,7 @@ class VoiceTask:
         ]
         self.call_ended = False
         self.post_call_notification: Dict[str, Any] = {"status": "not_needed"}
+        self.runner_pid: Optional[int] = None
         self.created_at = now
         self.updated_at = now
 
@@ -235,9 +246,111 @@ class VoiceTask:
             "error": self.error,
             "call_ended": self.call_ended,
             "post_call_notification": dict(self.post_call_notification),
+            "runner_pid": self.runner_pid,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+
+
+def _voice_tasks_root() -> Path:
+    root = Path(get_hermes_home()) / "voice-tasks"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _voice_task_state_path(task_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id).strip("._") or "unknown-task"
+    return _voice_tasks_root() / f"{safe}.json"
+
+
+def _voice_task_status_rank(status: str | None) -> int:
+    value = (status or "queued").strip().lower()
+    if value in {"complete", "failed", "cancelled"}:
+        return 3
+    if value == "running":
+        return 2
+    if value == "queued":
+        return 1
+    return 0
+
+
+def _voice_merge_existing_task_state(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Preserve detached-runner progress when the dashboard writes stale state.
+
+    Background voice tasks are run by a separate process that writes the same
+    JSON state file as the dashboard.  The dashboard keeps an in-memory
+    ``VoiceTask`` object from queue time; later UI events such as call_end, or
+    the parent process writing runner_pid after spawn, can otherwise overwrite a
+    runner-written running/complete/failed state with stale queued/null data.
+    """
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    except (OSError, json.JSONDecodeError):
+        existing = None
+    if not isinstance(existing, dict) or existing.get("task_id") != data.get("task_id"):
+        return data
+
+    existing_rank = _voice_task_status_rank(str(existing.get("status") or ""))
+    incoming_rank = _voice_task_status_rank(str(data.get("status") or ""))
+    if existing_rank > incoming_rank:
+        for key in ("status", "progress", "result", "error", "updated_at"):
+            if key in existing:
+                data[key] = existing[key]
+
+    # Keep durable metadata from either writer.  These fields are monotonic or
+    # operational and should not be lost while preserving runner output above.
+    data["call_ended"] = bool(data.get("call_ended")) or bool(existing.get("call_ended"))
+    if data.get("runner_pid") is None and existing.get("runner_pid") is not None:
+        data["runner_pid"] = existing.get("runner_pid")
+    if not data.get("created_at") and existing.get("created_at"):
+        data["created_at"] = existing.get("created_at")
+
+    existing_notification = existing.get("post_call_notification")
+    incoming_notification = data.get("post_call_notification")
+    if isinstance(existing_notification, dict) and isinstance(incoming_notification, dict):
+        existing_status = str(existing_notification.get("status") or "")
+        incoming_status = str(incoming_notification.get("status") or "")
+        if incoming_status in {"not_needed", ""} and existing_status not in {"", "not_needed"}:
+            data["post_call_notification"] = existing_notification
+    return data
+
+
+def _voice_write_task_state(task: VoiceTask) -> None:
+    path = _voice_task_state_path(task.task_id)
+    data = _voice_merge_existing_task_state(path, task.to_dict())
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _voice_task_from_dict(data: Dict[str, Any]) -> VoiceTask:
+    task = VoiceTask(
+        task_id=str(data["task_id"]),
+        call_id=str(data["call_id"]),
+        user=str(data.get("user") or "unknown dashboard user"),
+        request=str(data.get("request") or ""),
+        session_id=str(data.get("session_id") or f"voice_task_{data['task_id']}"),
+    )
+    task.status = str(data.get("status") or "queued")
+    task.progress = list(data.get("progress") or task.progress)
+    task.result = data.get("result")
+    task.error = data.get("error")
+    task.call_ended = bool(data.get("call_ended"))
+    task.post_call_notification = dict(data.get("post_call_notification") or {"status": "not_needed"})
+    task.runner_pid = data.get("runner_pid")
+    task.created_at = str(data.get("created_at") or task.created_at)
+    task.updated_at = str(data.get("updated_at") or task.updated_at)
+    return task
+
+
+def _voice_read_task_state(task_id: str) -> VoiceTask | None:
+    path = _voice_task_state_path(task_id)
+    if not path.exists():
+        return None
+    try:
+        return _voice_task_from_dict(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 def _voice_api_key() -> str:
@@ -364,10 +477,17 @@ def _voice_update_call_state(event: VoiceTranscriptEvent, user: str) -> None:
     if event.event_type == "call_end":
         ended_tasks: list[VoiceTask] = []
         with _VOICE_TASKS_LOCK:
-            for task in _VOICE_TASKS.values():
+            for task_id, task in list(_VOICE_TASKS.items()):
                 if task.call_id == event.call_id:
+                    # Detached runners may have advanced the on-disk state while
+                    # the dashboard still holds the original queued object.
+                    # Rehydrate before marking call_ended so final results are
+                    # not hidden from task state or post-call handoff logic.
+                    task = _voice_read_task_state(task_id) or task
                     task.call_ended = True
                     task.updated_at = now
+                    _VOICE_TASKS[task_id] = task
+                    _voice_write_task_state(task)
                     ended_tasks.append(task)
         for task in ended_tasks:
             if task.status in {"complete", "failed", "cancelled"}:
@@ -377,6 +497,77 @@ def _voice_update_call_state(event: VoiceTranscriptEvent, user: str) -> None:
 def _voice_call_has_ended(call_id: str) -> bool:
     with _VOICE_CALLS_LOCK:
         return bool((_VOICE_CALLS.get(call_id) or {}).get("ended_at"))
+
+
+def _voice_read_room_state(call_id: str, since: int = 0, limit: int = 200) -> Dict[str, Any]:
+    path = _voice_transcript_path(call_id)
+    safe_since = max(0, since)
+    safe_limit = max(1, min(limit, 500))
+    participants: Dict[str, Dict[str, Any]] = {}
+    events: list[Dict[str, Any]] = []
+    if not path.exists():
+        return {"ok": True, "call_id": call_id, "cursor": 0, "participants": [], "events": []}
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    for index, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        user = str(record.get("user") or "unknown dashboard user")
+        event_type = str(record.get("event_type") or "")
+        timestamp = record.get("timestamp")
+        if event_type == "call_start":
+            participants[user] = {"user": user, "status": "live", "joined_at": timestamp, "left_at": None}
+        elif event_type == "call_end":
+            state = participants.setdefault(user, {"user": user, "status": "unknown", "joined_at": None, "left_at": None})
+            state["status"] = "left"
+            state["left_at"] = timestamp
+        if index > safe_since and len(events) < safe_limit:
+            record = dict(record)
+            record["index"] = index
+            events.append(record)
+    return {
+        "ok": True,
+        "call_id": call_id,
+        "cursor": len(lines),
+        "participants": sorted(participants.values(), key=lambda row: str(row.get("joined_at") or "")),
+        "events": events,
+    }
+
+
+async def _voice_wait_for_room_state(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0, min(wait_ms, 30000)) / 1000
+    while True:
+        state = _voice_read_room_state(call_id, since=since, limit=limit)
+        if state["events"] or time.monotonic() >= deadline:
+            return state
+        await asyncio.sleep(0.2)
+
+
+def _voice_room_signal_state(call_id: str, since: int = 0, limit: int = 200, *, user: str | None = None) -> Dict[str, Any]:
+    safe_since = max(0, since)
+    safe_limit = max(1, min(limit, 500))
+    with _VOICE_ROOM_SIGNAL_LOCK:
+        messages = list(_VOICE_ROOM_SIGNALS.get(call_id, []))
+    # A peer must never re-read its OWN offer/answer/ice/join (no from_user==user
+    # clause): self-echo plus a cursor reset would replay completed exchanges as
+    # live glare/offer storms for late joiners and reconnects. Clients seed their
+    # cursor from the index returned by their join POST, so they only ever see
+    # signals that arrived after they joined.
+    visible = [
+        msg for msg in messages
+        if int(msg.get("index") or 0) > safe_since and (not msg.get("to_user") or msg.get("to_user") == user)
+    ][:safe_limit]
+    return {"ok": True, "call_id": call_id, "cursor": len(messages), "signals": visible}
+
+
+async def _voice_wait_for_room_signals(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0, *, user: str | None = None) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(0, min(wait_ms, 30000)) / 1000
+    while True:
+        state = _voice_room_signal_state(call_id, since=since, limit=limit, user=user)
+        if state["signals"] or time.monotonic() >= deadline:
+            return state
+        await asyncio.sleep(0.2)
 
 
 def _voice_send_post_call_notification(task: VoiceTask) -> bool:
@@ -407,6 +598,7 @@ def _voice_maybe_notify_post_call(task: VoiceTask, final_status: str) -> None:
     if current in {"sent", "skipped_unconfigured", "failed"}:
         return
     task.post_call_notification = {"status": "pending", "final_status": final_status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    _voice_write_task_state(task)
     try:
         sent = _voice_send_post_call_notification(task)
     except Exception as exc:
@@ -416,6 +608,7 @@ def _voice_maybe_notify_post_call(task: VoiceTask, final_status: str) -> None:
             "error": str(exc)[:500],
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        _voice_write_task_state(task)
         _voice_task_event(task, "post_call_notification_error", str(exc)[:700], {"task_id": task.task_id, "status": final_status})
         return
     task.post_call_notification = {
@@ -426,6 +619,7 @@ def _voice_maybe_notify_post_call(task: VoiceTask, final_status: str) -> None:
     }
     event = "post_call_notification_sent" if sent else "post_call_notification_skipped"
     text = "Telegram handoff sent after call end." if sent else "Telegram handoff skipped: HERMES_VOICE_TELEGRAM_HANDOFF_TARGET/TELEGRAM_BOT_TOKEN not configured."
+    _voice_write_task_state(task)
     _voice_task_event(task, event, text, {"task_id": task.task_id, "status": final_status})
 
 
@@ -436,6 +630,8 @@ _VOICE_TASKS: Dict[str, VoiceTask] = {}
 _VOICE_TASKS_LOCK = threading.Lock()
 _VOICE_CALLS: Dict[str, Dict[str, Any]] = {}
 _VOICE_CALLS_LOCK = threading.Lock()
+_VOICE_ROOM_SIGNALS: Dict[str, list[Dict[str, Any]]] = {}
+_VOICE_ROOM_SIGNAL_LOCK = threading.Lock()
 _VOICE_TASK_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HERMES_VOICE_TASK_WORKERS", "4")), thread_name_prefix="voice-rolly")
 
 
@@ -466,12 +662,14 @@ def _voice_task_status_lookup(query: str | None = None, limit: int = 1600) -> st
     if not task_ids:
         return ""
     rows: list[str] = []
-    with _VOICE_TASKS_LOCK:
-        for task_id in task_ids:
-            task = _VOICE_TASKS.get(task_id)
-            if task is not None:
-                latest = task.progress[-1]["message"] if task.progress else task.status
-                rows.append(f"{task_id}: {task.status}; updated {task.updated_at}; {latest}")
+    for task_id in task_ids:
+        task = _voice_read_task_state(task_id)
+        if task is None:
+            with _VOICE_TASKS_LOCK:
+                task = _VOICE_TASKS.get(task_id)
+        if task is not None:
+            latest = task.progress[-1]["message"] if task.progress else task.status
+            rows.append(f"{task_id}: {task.status}; updated {task.updated_at}; {latest}")
     missing = [task_id for task_id in task_ids if not any(row.startswith(f"{task_id}:") for row in rows)]
     if missing:
         transcript_root = Path(get_hermes_home()) / "voice-transcripts"
@@ -502,23 +700,51 @@ def _voice_task_status_lookup(query: str | None = None, limit: int = 1600) -> st
     return _voice_bound_text("\n".join(rows), limit)
 
 
+def _voice_visible_task_result(result: str, task: VoiceTask) -> str:
+    lines = [line.strip() for line in (result or "").splitlines() if line.strip()]
+    if lines and all(re.fullmatch(r"(?:⏭\s*)?Secret entry skipped", line) for line in lines):
+        return (
+            f"Background Rolly task {task.task_id} completed, but the only visible output was "
+            "redacted secret-entry placeholders. No user-safe implementation summary was produced. "
+            f"Task session: {task.session_id}."
+        )
+    return result
+
+
 def _voice_task_worker(task_id: str) -> None:
     with _VOICE_TASKS_LOCK:
         task = _VOICE_TASKS[task_id]
         task.mark("running", "Rolly is working in the background.")
+        _voice_write_task_state(task)
     _voice_task_event(task, "delegation_started", "Rolly background task started.")
     try:
         result = _run_voice_research(task.request, user=task.user, source="dashboard-voice-background", parent_call_id=task.call_id)
+        result = _voice_visible_task_result(result, task)
         with _VOICE_TASKS_LOCK:
             task.mark("complete", "Rolly background task completed.", result=result)
+            _voice_write_task_state(task)
         _voice_task_event(task, "delegation_result", result, {"status": "complete"})
         _voice_maybe_notify_post_call(task, "complete")
     except Exception as exc:
         message = str(exc)[:1200]
         with _VOICE_TASKS_LOCK:
             task.mark("failed", f"Rolly background task failed: {message}", error=message)
+            _voice_write_task_state(task)
         _voice_task_event(task, "delegation_error", message, {"status": "failed"})
         _voice_maybe_notify_post_call(task, "failed")
+
+
+def _voice_spawn_task_process(task: VoiceTask) -> int:
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "hermes_cli.voice_task_runner", "--task-file", str(_voice_task_state_path(task.task_id))],
+        cwd=str(PROJECT_ROOT),
+        env={**os.environ, "HERMES_HOME": str(get_hermes_home())},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return int(getattr(proc, "pid", 0) or 0)
 
 
 def _voice_start_background_task(call_id: str, request_text: str, user: str) -> VoiceTask:
@@ -527,8 +753,10 @@ def _voice_start_background_task(call_id: str, request_text: str, user: str) -> 
     task = VoiceTask(task_id=task_id, call_id=call_id, user=user, request=request_text, session_id=f"voice_task_{task_id}")
     with _VOICE_TASKS_LOCK:
         _VOICE_TASKS[task_id] = task
+        _voice_write_task_state(task)
     _voice_task_event(task, "delegation_queued", "Background Rolly task queued.", {"request": request_text})
-    _VOICE_TASK_EXECUTOR.submit(_voice_task_worker, task_id)
+    task.runner_pid = _voice_spawn_task_process(task)
+    _voice_write_task_state(task)
     return task
 
 
@@ -678,6 +906,11 @@ def _voice_tool_result(text: str, *, tool_name: str, data: Dict[str, Any] | None
     return {"ok": True, "result": _voice_bound_text(text, 2200), "data": data or {}, "error": None, "tool_name": tool_name, "cached": cached}
 
 
+def _voice_lookup_no_match(source: str, query: str | None) -> str:
+    suffix = f" for query: {query}" if query else ""
+    return f"{source}: no matching results found{suffix}."
+
+
 def _voice_tool_cache_key(payload: VoiceToolRequest, user: str | None = None) -> str | None:
     explicit = payload.idempotency_key or payload.realtime_call_id or str(payload.arguments.get("_realtime_call_id") or "")
     if explicit or payload.call_id:
@@ -706,9 +939,13 @@ def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> 
             raise HTTPException(status_code=400, detail="Missing query")
         return _voice_tool_result(_voice_brain_lookup_text(query), tool_name=name)
     if name == "kanban_lookup":
-        return _voice_tool_result(_voice_kanban_digest(str(args.get("query") or "").strip() or None), tool_name=name)
+        query = str(args.get("query") or "").strip() or None
+        result = _voice_kanban_digest(query)
+        return _voice_tool_result(result or _voice_lookup_no_match("Kanban", query), tool_name=name)
     if name == "session_lookup":
-        return _voice_tool_result(_voice_recent_sessions(str(args.get("query") or "").strip() or None), tool_name=name)
+        query = str(args.get("query") or "").strip() or None
+        result = _voice_recent_sessions(query)
+        return _voice_tool_result(result or _voice_lookup_no_match("Sessions", query), tool_name=name)
     if name == "context_lookup":
         query = str(args.get("query") or "").strip()
         sources = args.get("sources") or ["memory", "kanban", "brain", "sessions", "voice_tasks"]
@@ -735,7 +972,7 @@ def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> 
             raise HTTPException(status_code=400, detail="Missing call_id")
         task = _voice_start_background_task(payload.call_id, request_text, _voice_speaker_label(user))
         return _voice_tool_result(
-            f"Queued background Rolly task {task.task_id}. The voice UI will inject the result back into this live call when it is ready; briefly tell the user you will jump back in if the call is still live.",
+            f"Queued background Rolly task {task.task_id}. The voice UI will inject the result back into this live call when it is ready.",
             tool_name=name,
             data=task.to_dict(),
         )
@@ -783,12 +1020,14 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
         "model": model,
         "instructions": (
             "You are Rolly, the concise AI ops and dev colleague for MIX/Suelio. "
-            f"You are speaking with dashboard user: {speaker}. Use that identity for context and attribution. "
+            f"You are speaking with dashboard user: {speaker}. Use that identity for context and attribution, "
+            "but do not address them by raw dashboard username unless it sounds natural in speech. "
             "Session-start context pack follows; treat it as useful but possibly stale.\n"
             f"{context_pack}\n"
             f"{mode_instruction}"
             f"{rate_instruction}"
             "This is a live phone-call style conversation: speak naturally, briefly, and do not mention implementation details. "
+            "Do not give mic/headset/echo troubleshooting unless the user asks or a system error indicates a problem. "
             "Spoken responses should usually fit 10-15 seconds. If more exists, give the short answer first and offer to continue. "
             "Call transcript events, tool calls/results, timestamps, elapsed time, and an end-call marker are saved to local JSONL for later improvement. "
             "Prefer fast lookup tools (context_lookup, memory_lookup, kanban_lookup, brain_lookup, session_lookup) for context. "
@@ -854,9 +1093,6 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
             },
         ],
         "tool_choice": "auto",
-        "metadata": {
-            "speaking_rate": speaking_rate,
-        },
         "audio": {
             "input": {
                 "transcription": {"model": "gpt-4o-mini-transcribe"},
@@ -864,12 +1100,15 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
                 "turn_detection": {
                     # Phone-call behavior: let the Realtime API decide when the
                     # user has semantically finished speaking, then immediately
-                    # generate a spoken response in solo mode and allow barge-in
-                    # interrupts. Meet mode disables auto-response so the UI can
+                    # generate a spoken response in solo mode. Realtime barge-in
+                    # interrupts are disabled for dashboard calls because phone
+                    # speaker echo can be misdetected as user speech, causing the
+                    # assistant to stop itself and restart with audible beeps.
+                    # Meet mode disables auto-response so the UI can
                     # hard-gate speech on the "Hey Rolly" wake phrase.
                     "type": "semantic_vad",
                     "create_response": mode == "solo",
-                    "interrupt_response": True,
+                    "interrupt_response": False,
                 },
             },
             "output": {"voice": voice},
@@ -953,14 +1192,23 @@ def _run_voice_research(question: str, user: str | None = None, *, source: str =
     )
     env = os.environ.copy()
     env.setdefault("HERMES_HOME", str(get_hermes_home()))
-    proc = subprocess.run(
-        [sys.executable, "-m", "hermes_cli.main", "chat", "-q", prompt, "--source", source, "-Q"],
-        cwd=str(PROJECT_ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=int(os.getenv("HERMES_VOICE_TOOL_TIMEOUT", "90")),
+    timeout_seconds = int(
+        os.getenv(
+            "HERMES_VOICE_BACKGROUND_TASK_TIMEOUT" if source == "dashboard-voice-background" else "HERMES_VOICE_TOOL_TIMEOUT",
+            "600" if source == "dashboard-voice-background" else "90",
+        )
     )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "chat", "-q", prompt, "--source", source, "-Q"],
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Rolly CLI tool timed out after {timeout_seconds}s") from exc
     output = (proc.stdout or "").strip()
     if proc.returncode != 0:
         detail = (proc.stderr or output or f"exit {proc.returncode}").strip()
@@ -993,6 +1241,8 @@ async def create_voice_meet_invite(payload: VoiceMeetInviteRequest, request: Req
     call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.call_id).strip("._")
     if not call_id:
         raise HTTPException(status_code=400, detail="Missing call_id")
+    if _voice_call_has_ended(call_id):
+        raise HTTPException(status_code=409, detail="Cannot create meet invite for ended voice call")
     user = payload.user or _voice_auth_context(request) or "unknown dashboard user"
     _voice_ensure_state_session(call_id, user, mode="meet")
     base = os.getenv("HERMES_DASHBOARD_PUBLIC_URL") or str(request.base_url).rstrip("/")
@@ -1003,8 +1253,51 @@ async def create_voice_meet_invite(payload: VoiceMeetInviteRequest, request: Req
         "mode": "meet",
         "call_id": call_id,
         "invite_url": invite_url,
+        "participant_audio_routing": "peer_audio_signaling",
+        "participant_audio_routing_detail": (
+            "Meet invites share a Rolly Voice room id and use browser peer audio between participants. "
+            "Each browser also keeps its own Rolly/OpenAI realtime connection."
+        ),
         "feature_flag": "HERMES_VOICE_MEET_INVITES",
     }
+
+
+@app.get("/api/voice/ice")
+async def get_voice_ice(_request: Request):
+    """ICE server config for the dashboard Meet-mode peer mesh.
+
+    Always advertises a public STUN server. When a TURN relay is configured via
+    env (``HERMES_VOICE_TURN_URLS`` + ``HERMES_VOICE_TURN_USERNAME`` +
+    ``HERMES_VOICE_TURN_CREDENTIAL``) it is appended so the browser can relay
+    human<->human audio. On a Tailscale-only deployment the browser mDNS
+    obfuscates the host candidate, so when a TURN entry exists AND
+    ``HERMES_VOICE_ICE_RELAY_ONLY`` is set we also hand back
+    ``ice_transport_policy: "relay"`` to force all mesh media through the relay
+    both peers can reach. The relay policy is emitted ONLY when a TURN entry is
+    present, so a misconfigured/missing TURN degrades to STUN instead of
+    bricking the call. This applies to the mesh only; the OpenAI Realtime peer
+    keeps its default policy.
+    """
+    ice: List[Dict[str, Any]] = [{"urls": "stun:stun.l.google.com:19302"}]
+    extra_stun = os.environ.get("HERMES_VOICE_STUN_URLS", "").strip()
+    if extra_stun:
+        ice.append({"urls": [u.strip() for u in extra_stun.split(",") if u.strip()]})
+    turn_urls = os.environ.get("HERMES_VOICE_TURN_URLS", "").strip()
+    turn_user = os.environ.get("HERMES_VOICE_TURN_USERNAME", "").strip()
+    turn_cred = os.environ.get("HERMES_VOICE_TURN_CREDENTIAL", "").strip()
+    has_turn = bool(turn_urls and turn_user and turn_cred)
+    if has_turn:
+        ice.append(
+            {
+                "urls": [u.strip() for u in turn_urls.split(",") if u.strip()],
+                "username": turn_user,
+                "credential": turn_cred,
+            }
+        )
+    out: Dict[str, Any] = {"ok": True, "ice_servers": ice}
+    if has_turn and env_var_enabled("HERMES_VOICE_ICE_RELAY_ONLY", default=False):
+        out["ice_transport_policy"] = "relay"
+    return out
 
 
 @app.get("/api/voice/context")
@@ -1063,17 +1356,66 @@ async def start_voice_task(payload: VoiceTaskStartRequest, request: Request):
 
 @app.get("/api/voice/tasks/{task_id}")
 async def get_voice_task(task_id: str, _request: Request):
-    with _VOICE_TASKS_LOCK:
-        task = _VOICE_TASKS.get(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="Voice task not found")
-        return task.to_dict()
+    task = _voice_read_task_state(task_id)
+    if task is None:
+        with _VOICE_TASKS_LOCK:
+            task = _VOICE_TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Voice task not found")
+    return task.to_dict()
 
 
 @app.post("/api/voice/transcript")
 async def save_voice_transcript(payload: VoiceTranscriptEvent, request: Request):
     path = _save_voice_transcript_event(payload, request)
     return {"ok": True, "path": str(path)}
+
+
+@app.get("/api/voice/room")
+async def get_voice_room(call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0):
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id).strip("._")
+    if not safe_call_id:
+        raise HTTPException(status_code=400, detail="Missing call_id")
+    if wait_ms > 0:
+        return await _voice_wait_for_room_state(safe_call_id, since=since, limit=limit, wait_ms=wait_ms)
+    return _voice_read_room_state(safe_call_id, since=since, limit=limit)
+
+
+@app.post("/api/voice/meet/signal")
+async def post_voice_meet_signal(payload: VoiceMeetSignalRequest, request: Request):
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.call_id).strip("._")
+    if not safe_call_id:
+        raise HTTPException(status_code=400, detail="Missing call_id")
+    user = _voice_speaker_label(payload.user or _voice_auth_context(request))
+    signal_type = re.sub(r"[^A-Za-z0-9_.-]", "_", payload.type).strip("._")
+    if signal_type not in {"join", "leave", "offer", "answer", "ice"}:
+        raise HTTPException(status_code=400, detail="Unsupported signal type")
+    with _VOICE_ROOM_SIGNAL_LOCK:
+        messages = _VOICE_ROOM_SIGNALS.setdefault(safe_call_id, [])
+        message = {
+            "index": len(messages) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "call_id": safe_call_id,
+            "from_user": user,
+            "to_user": payload.to_user,
+            "type": signal_type,
+            "payload": payload.payload,
+        }
+        messages.append(message)
+        if len(messages) > 1000:
+            del messages[:-1000]
+    return {"ok": True, "signal": message}
+
+
+@app.get("/api/voice/meet/signals")
+async def get_voice_meet_signals(request: Request, call_id: str, since: int = 0, limit: int = 200, wait_ms: int = 0):
+    safe_call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", call_id).strip("._")
+    if not safe_call_id:
+        raise HTTPException(status_code=400, detail="Missing call_id")
+    user = _voice_auth_context(request)
+    if wait_ms > 0:
+        return await _voice_wait_for_room_signals(safe_call_id, since=since, limit=limit, wait_ms=wait_ms, user=user)
+    return _voice_room_signal_state(safe_call_id, since=since, limit=limit, user=user)
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -3498,6 +3840,8 @@ _AUDIO_EXTENSIONS = {
     ".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".mp4",
     ".oga", ".ogg", ".opus", ".wav", ".webm",
 }
+_OPENAI_AUDIO_DIARIZATION_MODEL = "gpt-audio-mini"
+_OPENAI_AUDIO_CHUNK_SECONDS = 600
 
 
 def _audio_uploads_dir() -> Path:
@@ -3580,14 +3924,21 @@ def _turns_from_words(words: Any) -> List[Dict[str, Any]]:
 def _turns_from_labelled_text(text: str) -> List[Dict[str, str]]:
     turns: List[Dict[str, str]] = []
     current: Optional[Dict[str, str]] = None
-    label_re = re.compile(r"^(?:\[?((?:SPEAKER[_ -]?\d+)|(?:Speaker\s*\d+))\]?\s*[:\-]\s*)(.+)$", re.I)
+    label_re = re.compile(
+        r"^(?:\[?((?:SPEAKER[_ -]?[A-Z0-9]+)|(?:Speaker\s*[A-Z0-9]+))\]?\s*[:\-]\s*)(.+)$",
+        re.I,
+    )
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         match = label_re.match(line)
         if match:
-            current = {"speaker": match.group(1).replace(" ", "_"), "text": match.group(2).strip()}
+            label = re.sub(r"\s+", " ", match.group(1).strip().replace("_", " "))
+            if label.upper().startswith("SPEAKER"):
+                rest = label[7:].strip()
+                label = f"Speaker {rest}" if rest else "Speaker"
+            current = {"speaker": label, "text": match.group(2).strip()}
             turns.append(current)
         elif current is not None:
             current["text"] = (current["text"] + " " + line).strip()
@@ -3602,6 +3953,135 @@ def _speaker_examples(turns: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         if text_value and speaker not in examples:
             examples[speaker] = text_value[:240]
     return [{"speaker": speaker, "example": example} for speaker, example in examples.items()]
+
+
+def _ffmpeg_audio_chunks(audio_path: Path, *, chunk_seconds: int = _OPENAI_AUDIO_CHUNK_SECONDS) -> List[bytes]:
+    """Convert uploaded audio to <=chunk_seconds MP3 chunks for OpenAI audio input."""
+    with tempfile.TemporaryDirectory(prefix="hermes-audio-diarize-") as tmp:
+        out_pattern = Path(tmp) / "chunk-%03d.mp3"
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                "-f",
+                "segment",
+                "-segment_time",
+                str(chunk_seconds),
+                "-reset_timestamps",
+                "1",
+                str(out_pattern),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=900,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"ffmpeg audio chunking failed ({proc.returncode}): {detail[:500]}")
+        chunks = [p.read_bytes() for p in sorted(Path(tmp).glob("chunk-*.mp3")) if p.stat().st_size > 0]
+        if not chunks:
+            raise RuntimeError("ffmpeg produced no audio chunks")
+        return chunks
+
+
+def _openai_audio_chat_completion(audio_mp3: bytes, *, chunk_index: int, total_chunks: int) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set; cannot run OpenAI audio diarization")
+
+    prompt = (
+        "Transcribe this phone call / meeting audio and diarize speakers. "
+        "Return only speaker-labelled transcript lines in this exact style:\n"
+        "Speaker A: ...\nSpeaker B: ...\n"
+        "Use a new line whenever the speaker changes. Do not include timestamps, summaries, markdown, "
+        "or any text that is not part of the labelled transcript."
+    )
+    if total_chunks > 1:
+        prompt += f"\nThis is chunk {chunk_index + 1} of {total_chunks}; label speakers within this chunk as Speaker A, Speaker B, etc."
+    payload = {
+        "model": _OPENAI_AUDIO_DIARIZATION_MODEL,
+        "messages": [
+            {"role": "system", "content": "You are a careful audio transcription and speaker diarization assistant."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": base64.b64encode(audio_mp3).decode("ascii"),
+                            "format": "mp3",
+                        },
+                    },
+                ],
+            },
+        ],
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"OpenAI audio diarization failed ({exc.code}): {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI audio diarization request failed: {exc}") from exc
+    try:
+        content = body["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI audio diarization returned unexpected response: {body}") from exc
+    return str(content or "").strip()
+
+
+def _run_openai_audio_diarization(audio_path: Path) -> Dict[str, Any]:
+    chunks = _ffmpeg_audio_chunks(audio_path)
+    chunk_texts = [
+        _openai_audio_chat_completion(chunk, chunk_index=i, total_chunks=len(chunks))
+        for i, chunk in enumerate(chunks)
+    ]
+    named_transcript = "\n".join(text for text in chunk_texts if text.strip()).strip()
+    turns = _turns_from_labelled_text(named_transcript)
+    if not turns:
+        raise RuntimeError("OpenAI audio diarization returned no parseable speaker-labelled turns")
+    speakers = _speaker_examples(turns)
+    speaker_count = len({s["speaker"] for s in speakers})
+    status = "needs_speaker_names" if speaker_count > 1 else "complete"
+    return {
+        "status": status,
+        "provider": f"openai:{_OPENAI_AUDIO_DIARIZATION_MODEL}",
+        "transcript": "\n".join(str(turn.get("text") or "").strip() for turn in turns).strip(),
+        "turns": turns,
+        "speakers": speakers,
+        "speaker_names": {},
+        "named_transcript": named_transcript,
+        "chunks": len(chunks),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _run_audio_cli(audio_path: Path) -> Dict[str, Any]:
@@ -3688,8 +4168,7 @@ def _run_audio_diarization(audio_path: Path) -> None:
     running.update({"status": "running"})
     _write_audio_analysis(audio_path, running)
     try:
-        cli_result = _run_audio_cli(audio_path)
-        analysis = _load_cli_audio_result(cli_result)
+        analysis = _run_openai_audio_diarization(audio_path)
         _write_audio_analysis(audio_path, analysis)
         transcript_path = audio_path.with_suffix(audio_path.suffix + ".transcript.txt")
         transcript_path.write_text(analysis.get("named_transcript") or analysis.get("transcript") or "", encoding="utf-8")

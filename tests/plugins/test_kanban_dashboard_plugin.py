@@ -68,11 +68,9 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # Rolly's dashboard schema is intentionally simple.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        assert expected in names, f"missing column {expected}: {names}"
+    assert names == ["triage", "ready", "done"]
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
@@ -114,6 +112,80 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_board_assignees_include_rolly_user_registry(client, kanban_home):
+    (kanban_home / "rolly-users.json").write_text(
+        '{"users":[{"slug":"deniz"},{"slug":"arman"}]}',
+        encoding="utf-8",
+    )
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["assignees"] == ["deniz", "arman"]
+    assert data["users"] == ["deniz", "arman"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Owned card", "assignee": "deniz"},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["assignees"] == ["deniz", "arman"]
+    assert data["users"] == ["deniz", "arman"]
+
+
+def test_completed_tasks_hidden_by_default_but_available_in_history(client):
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "finish me", "priority": 4})
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "finished"},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    assert task_id not in {
+        t["id"] for col in data["columns"] for t in col["tasks"]
+    }
+
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
+    assert r.status_code == 200
+    data = r.json()
+    done = next(c for c in data["columns"] if c["name"] == "done")
+    assert [t["id"] for t in done["tasks"]] == [task_id]
+    assert done["tasks"][0]["completed_at"] is not None
+
+
+def test_archived_children_count_as_completed_progress(client):
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "parent"})
+    assert r.status_code == 200, r.text
+    parent_id = r.json()["task"]["id"]
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent_id]},
+    )
+    assert r.status_code == 200, r.text
+    child_id = r.json()["task"]["id"]
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{child_id}", json={"status": "archived"})
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
+    assert r.status_code == 200
+    data = r.json()
+    parent = next(
+        t for col in data["columns"] for t in col["tasks"] if t["id"] == parent_id
+    )
+    assert parent["progress"] == {"done": 1, "total": 1}
+
+
 def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     workspace = tmp_path / "work dir"
     workspace.mkdir()
@@ -132,7 +204,7 @@ def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     r = client.get(f"/api/plugins/kanban/tasks/{task_id}/claude-context")
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["mode"] == "card-tmux-two-window"
+    assert data["mode"] == "card-tmux-single-window"
     assert data["task_id"] == task_id
     assert data["workspace_path"] == str(workspace.resolve())
     expected_session = "card-" + task_id.replace("_", "-")
@@ -140,6 +212,10 @@ def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     assert data["session_name"] == expected_session
     assert "Implement card workspace" in data["prompt"]
     assert "manual Claude Code" in data["prompt"]
+    assert f"Card id: {task_id}" in data["rolly_prompt"]
+    assert "Title: Implement card workspace" in data["rolly_prompt"]
+    assert "First, look up the card by id" in data["rolly_prompt"]
+    assert "do not treat this prompt as the card's success criteria" in data["rolly_prompt"]
 
 
 def test_claude_context_endpoint_defaults_scratch_workspace_to_home(client):
@@ -159,7 +235,7 @@ def test_claude_context_endpoint_defaults_scratch_workspace_to_home(client):
     assert data["session_name"] == expected_session
 
 
-def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkeypatch):
+def test_tmux_session_endpoint_starts_single_card_window(client, tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     r = client.post(
@@ -184,27 +260,189 @@ def test_tmux_session_endpoint_starts_card_tmux_windows(client, tmp_path, monkey
         return Result(0)
 
     monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
-    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test._tui_shell_command", lambda: "hermes --tui")
 
     r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["started"] is True
+    assert data["mode"] == "card-tmux-single-window"
     assert data["session_name"] == expected_session
-    assert data["rolly_target"] == f"{expected_session}:rolly-chat"
-    assert data["terminal_target"] == f"{expected_session}:terminal"
-    assert data["terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}%3Aterminal"
-    assert data["rolly_terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}%3Arolly-chat"
+    assert data["terminal_target"] == expected_session
+    assert data["terminal_url"] == f"/api/pty?pty_mode=tmux&tmux_session={expected_session}"
     assert data["attach_command"] == f"tmux attach-session -t {expected_session}"
+    # The two-window model is gone: no rolly-chat window, no second terminal.
+    assert "rolly_target" not in data
+    assert "terminal_window_target" not in data
     assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
-    assert calls[1][0] == [
-        "tmux", "new-session", "-d", "-s", expected_session, "-n", "rolly-chat", "-c", str(workspace.resolve()), "hermes --tui",
+    assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
+    # Exactly ONE window is created, rooted at the card workspace.
+    assert calls[2][0] == [
+        "tmux", "new-session", "-d", "-s", expected_session, "-n", "terminal", "-c", str(workspace.resolve()),
     ]
-    assert calls[2][0] == ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())]
+    assert len(calls) == 3
+    assert not any(c[0][1] == "new-window" for c in calls)
+    assert not any(c[0][1] == "select-window" for c in calls)
+    assert not any("rolly-chat" in str(c[0]) for c in calls)
 
 
-def test_scheduled_tasks_have_their_own_column_not_todo(client):
-    """Scheduled/time-delay tasks must not be silently bucketed into todo."""
+def test_tmux_session_endpoint_reconnect_is_idempotent_when_window_present(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Reconnect", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[:2] == ["tmux", "has-session"]:
+            return Result(0)  # session already exists
+        if args[:2] == ["tmux", "list-windows"]:
+            return Result(0, stdout="terminal\n")  # the one window is alive
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["started"] is False
+    assert data["terminal_target"] == expected_session
+    # Reconnecting to a healthy session creates nothing — no extra windows.
+    assert not any(c[0][1] == "new-session" for c in calls)
+    assert not any(c[0][1] == "new-window" for c in calls)
+
+
+def test_tmux_session_endpoint_recreates_missing_terminal_window(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Repair", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[:2] == ["tmux", "has-session"]:
+            return Result(0)  # session exists ...
+        if args[:2] == ["tmux", "list-windows"]:
+            return Result(0, stdout="")  # ... but the 'terminal' window is gone
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["started"] is False
+    # Exactly one window is (re)created, still named 'terminal' at the workspace.
+    assert ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())] in [
+        c[0] for c in calls
+    ]
+    assert not any(c[0][1] == "new-session" for c in calls)
+
+
+def test_tmux_session_endpoint_kills_card_tmux_session(client, tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Done work", "workspace_kind": "dir", "workspace_path": str(workspace)},
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    expected_session = "card-" + task_id.replace("_", "-")
+    calls = []
+
+    class Result:
+        def __init__(self, returncode=0):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return Result(0)
+
+    monkeypatch.setattr("hermes_dashboard_plugin_kanban_test.subprocess.run", fake_run)
+
+    r = client.delete(f"/api/plugins/kanban/tasks/{task_id}/tmux-session")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["killed"] is True
+    assert data["session_exists"] is False
+    assert data["session_name"] == expected_session
+    assert calls[0][0] == ["tmux", "has-session", "-t", expected_session]
+    assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
+    assert calls[2][0] == ["tmux", "kill-session", "-t", expected_session]
+
+
+def test_dashboard_rolly_chat_passes_board_slug_to_tmux_session():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "function CardWorkspaceSection" in js
+    assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/claude-context`, props.boardSlug)" in js
+    assert "withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/tmux-session`, props.boardSlug)" in js
+    assert "setTerminalReady(!!(d && d.session_exists))" in js
+    assert "method: \"DELETE\"" in js
+    assert "killTmuxSession" in js
+    assert "copyRollyPrompt" in js
+    assert "copyTextToClipboard((p && p.rolly_prompt) || \"\"" in js
+    assert "payload.rolly_prompt" in js
+    assert "copyCardPrompt" in js
+    assert "h(RollyChatSection, { task: t, boardSlug: props.boardSlug })" not in js
+    assert "readPathTaskId() || readUrlParam(\"task\")" in js
+    assert "function readReturnToBoardPath()" in js
+    assert "writeCardPath(taskId, isPriorityListRoute ? \"/kanban/list\" : \"/kanban/board\")" in js
+    assert "window.dispatchEvent(new PopStateEvent(\"popstate\"))" in js
+
+
+def test_dashboard_has_simple_columns_and_priority_list_route():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    style = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    js = bundle.read_text()
+    css = style.read_text()
+
+    assert 'const COLUMN_ORDER = ["triage", "ready", "done"]' in js
+    assert "function PriorityList" in js
+    assert 'path === "/kanban" || path === "/kanban/list" || path === "/kanban/priority"' in js
+    assert 'href: "/kanban/board"' in js
+    assert 'href: "/kanban"' in js
+    assert 'task.status !== "done" && task.status !== "archived"' in js
+    assert "h(OrchestrationPanel, null)" not in js
+    assert 'tx(t, "nudgeDispatcher", "Nudge dispatcher")' not in js
+    assert "Ready cards are prepared for manual execution" in js
+    assert "assign a profile when you are ready to run this manually" in js
+    assert "Higher-priority cards appear earlier in the priority list" in js
+    assert 'className: "hermes-kanban-priority-list"' in js
+    assert ".hermes-kanban-priority-list" in css
+
+
+def test_legacy_statuses_bucket_into_triage(client):
+    """The dashboard hard-cuts old workflow states into the simple card schema."""
 
     task = client.post(
         "/api/plugins/kanban/tasks",
@@ -224,8 +462,42 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
-    assert any(t["id"] == task["id"] for t in columns["scheduled"])
-    assert not any(t["id"] == task["id"] for t in columns["todo"])
+    assert list(columns) == ["triage", "ready", "done"]
+    assert any(t["id"] == task["id"] for t in columns["triage"])
+
+
+def test_complete_triage_card_via_patch(client):
+    """Clicking "Complete" on a triage card must close it (regression).
+
+    The card sits in the leftmost (triage) column; the dashboard PATCHes
+    ``status=done`` with the result/summary box. This used to 409 because
+    ``complete_task`` only accepted running/ready/blocked, so the card
+    never moved — the user's "I fill in the box but it won't complete".
+    """
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "wont fix this"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'triage' WHERE id = ?", (task["id"],),
+            )
+    finally:
+        conn.close()
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "result": "Won't fix", "summary": "wont fix"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "done"
+
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
+    done = next(c for c in r.json()["columns"] if c["name"] == "done")
+    assert task["id"] in {t["id"] for t in done["tasks"]}
 
 
 def test_tenant_filter(client):
@@ -243,11 +515,10 @@ def test_tenant_filter(client):
 
 
 def test_board_query_param_default_overrides_current_board_pointer(client):
-    """Dashboard ``?board=default`` must win even if the CLI's current-board
-    pointer targets a non-default board.
+    """Dashboard ``?board=default`` must still work for direct API access.
 
-    Regression: selecting the Default board in the dashboard must not fall
-    through to whichever board ``hermes kanban boards switch`` last pinned.
+    The dashboard UI no longer surfaces Default as a selectable board, but the
+    backend route should remain able to read it explicitly for back-compat.
     """
     default_task = client.post(
         "/api/plugins/kanban/tasks",
@@ -298,6 +569,20 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "onChange: function (e)" in js
     assert "selectChangeHandler(props.setTenantFilter)" in js
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
+
+
+def test_dashboard_card_assignment_uses_system_user_dropdown():
+    """Card assignment controls should pick system users from a dropdown."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "? boardData.users" in js
+    assert "System user to assign" in js
+    assert "Assign this card to a system user" in js
+    assert "selectChangeHandler(setV)" in js
+    assert "emptyAssignee" not in js
 
 
 def test_dashboard_card_detail_is_fullscreen_not_sidebar():
@@ -405,12 +690,17 @@ def test_patch_status_complete(client):
     assert r.status_code == 200
     assert r.json()["task"]["status"] == "done"
 
-    # Board reflects the move.
-    done = next(
+    # Completed cards leave the active board automatically, but remain in history.
+    default_done = next(
         c for c in client.get("/api/plugins/kanban/board").json()["columns"]
         if c["name"] == "done"
     )
-    assert any(x["id"] == t["id"] for x in done["tasks"])
+    assert not any(x["id"] == t["id"] for x in default_done["tasks"])
+    history_done = next(
+        c for c in client.get("/api/plugins/kanban/board?include_archived=true").json()["columns"]
+        if c["name"] == "done"
+    )
+    assert any(x["id"] == t["id"] for x in history_done["tasks"])
 
 
 def test_patch_block_then_unblock(client):
@@ -440,9 +730,9 @@ def test_patch_schedule_then_unblock(client):
     assert r.json()["task"]["status"] == "scheduled"
 
     columns = client.get("/api/plugins/kanban/board").json()["columns"]
-    assert "scheduled" in [c["name"] for c in columns]
-    scheduled = next(c for c in columns if c["name"] == "scheduled")
-    assert any(x["id"] == t["id"] for x in scheduled["tasks"])
+    assert [c["name"] for c in columns] == ["triage", "ready", "done"]
+    triage = next(c for c in columns if c["name"] == "triage")
+    assert any(x["id"] == t["id"] for x in triage["tasks"])
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
@@ -786,8 +1076,8 @@ def test_board_progress_rollup(client):
         t = client.get(f"/api/plugins/kanban/tasks/{cid}").json()["task"]
         assert t["status"] == "ready", f"{cid} should be ready after parent done"
 
-    # 0/2 done.
-    r = client.get("/api/plugins/kanban/board")
+    # 0/2 done (visible from the completed/history view because the parent is done).
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
     parent_row = next(
         t for col in r.json()["columns"] for t in col["tasks"]
         if t["id"] == parent["id"]
@@ -800,7 +1090,7 @@ def test_board_progress_rollup(client):
         json={"status": "done"},
     )
     assert r.status_code == 200
-    r = client.get("/api/plugins/kanban/board")
+    r = client.get("/api/plugins/kanban/board?include_archived=true")
     parent_row = next(
         t for col in r.json()["columns"] for t in col["tasks"]
         if t["id"] == parent["id"]
@@ -2262,15 +2552,16 @@ def test_dashboard_search_includes_body_and_result():
 
 
 def test_dashboard_bulk_actions_include_reclaim_first():
-    """Bulk action bar must expose reclaim_first checkbox and expanded status buttons."""
+    """Bulk action bar must expose reclaim_first and the simplified status buttons."""
     repo_root = Path(__file__).resolve().parents[2]
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
 
     assert "reclaim_first: reclaimFirst" in dist
     assert "hermes-kanban-bulk-reclaim-first" in dist
-    assert '"→ todo"' in dist
-    assert '"Block"' in dist
-    assert '"Unblock"' in dist
+    assert '"→ triage"' in dist
+    assert '"→ ready"' in dist
+    assert '"Complete"' in dist
+    assert '"→ todo"' not in dist
 
 
 def test_dashboard_shift_click_range_selection_exists():

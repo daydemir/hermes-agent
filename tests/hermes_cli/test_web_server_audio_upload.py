@@ -107,3 +107,86 @@ def test_audio_analysis_speaker_name_assignment(upload_client, tmp_path):
     assert "Deniz: hello from one" in body["named_transcript"]
     assert "Arman: hello from two" in body["named_transcript"]
     assert "Deniz: hello from one" in audio_path.with_suffix(audio_path.suffix + ".transcript.txt").read_text()
+
+
+def test_audio_labelled_text_parses_openai_speaker_letters(upload_client):
+    _client, web_server = upload_client
+
+    turns = web_server._turns_from_labelled_text(
+        "Speaker A: hello there\n"
+        "continued thought\n"
+        "Speaker B: hi back\n"
+        "[SPEAKER_02] - third voice"
+    )
+
+    assert turns == [
+        {"speaker": "Speaker A", "text": "hello there continued thought"},
+        {"speaker": "Speaker B", "text": "hi back"},
+        {"speaker": "Speaker 02", "text": "third voice"},
+    ]
+
+
+def test_openai_audio_diarization_provider_path(upload_client, monkeypatch, tmp_path):
+    _client, web_server = upload_client
+    audio_path = tmp_path / "call.m4a"
+    audio_path.write_bytes(b"fake audio")
+    calls = []
+
+    monkeypatch.setattr(web_server, "_ffmpeg_audio_chunks", lambda path: [b"mp3 one", b"mp3 two"])
+
+    def fake_openai(chunk, *, chunk_index, total_chunks):
+        calls.append((chunk, chunk_index, total_chunks))
+        if chunk_index == 0:
+            return "Speaker A: hello\nSpeaker B: hey"
+        return "Speaker A: following up"
+
+    monkeypatch.setattr(web_server, "_openai_audio_chat_completion", fake_openai)
+
+    analysis = web_server._run_openai_audio_diarization(audio_path)
+
+    assert calls == [(b"mp3 one", 0, 2), (b"mp3 two", 1, 2)]
+    assert analysis["provider"] == "openai:gpt-audio-mini"
+    assert analysis["status"] == "needs_speaker_names"
+    assert analysis["chunks"] == 2
+    assert analysis["turns"] == [
+        {"speaker": "Speaker A", "text": "hello"},
+        {"speaker": "Speaker B", "text": "hey"},
+        {"speaker": "Speaker A", "text": "following up"},
+    ]
+    assert {speaker["speaker"] for speaker in analysis["speakers"]} == {"Speaker A", "Speaker B"}
+
+
+def test_run_audio_diarization_uses_openai_and_writes_transcript(upload_client, monkeypatch):
+    _client, web_server = upload_client
+    audio_path = web_server._audio_uploads_dir() / "call.m4a"
+    audio_path.write_bytes(b"audio")
+    called = []
+
+    def fake_openai(path):
+        called.append(path)
+        return {
+            "status": "needs_speaker_names",
+            "provider": "openai:gpt-audio-mini",
+            "transcript": "hello\nhey",
+            "turns": [
+                {"speaker": "Speaker A", "text": "hello"},
+                {"speaker": "Speaker B", "text": "hey"},
+            ],
+            "speakers": [
+                {"speaker": "Speaker A", "example": "hello"},
+                {"speaker": "Speaker B", "example": "hey"},
+            ],
+            "speaker_names": {},
+            "named_transcript": "Speaker A: hello\nSpeaker B: hey",
+            "updated_at": "now",
+        }
+
+    monkeypatch.setattr(web_server, "_run_openai_audio_diarization", fake_openai)
+    monkeypatch.setattr(web_server, "_run_audio_cli", lambda path: (_ for _ in ()).throw(AssertionError("xAI CLI should not run")))
+
+    web_server._run_audio_diarization(audio_path)
+
+    assert called == [audio_path]
+    analysis = web_server._read_audio_analysis(audio_path)
+    assert analysis["provider"] == "openai:gpt-audio-mini"
+    assert audio_path.with_suffix(audio_path.suffix + ".transcript.txt").read_text() == "Speaker A: hello\nSpeaker B: hey"

@@ -285,6 +285,22 @@ CREATE TABLE IF NOT EXISTS messages (
     observed INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS ingestion_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    source_type TEXT NOT NULL,
+    source_ref TEXT,
+    session_id TEXT,
+    role TEXT,
+    body TEXT,
+    body_format TEXT DEFAULT 'text',
+    title TEXT,
+    metadata_json TEXT,
+    observed INTEGER DEFAULT 0,
+    profile TEXT,
+    status TEXT DEFAULT 'new'
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -301,6 +317,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_ingestion_events_created ON ingestion_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ingestion_events_source_type ON ingestion_events(source_type, id DESC);
+CREATE INDEX IF NOT EXISTS idx_ingestion_events_status ON ingestion_events(status, id);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 
@@ -1866,7 +1885,112 @@ class SessionDB:
                 )
             return msg_id
 
+        msg_id = self._execute_write(_do)
+
+        # Best-effort mirror into the linear ingestion queue so Rolly can
+        # digest conversation turns alongside other ingested content.
+        try:
+            self.append_ingestion_event(
+                source_type="message",
+                source_ref=str(msg_id),
+                session_id=session_id,
+                role=role,
+                body=stored_content,
+                body_format="json" if not isinstance(content, str) else "text",
+                metadata={
+                    "message_id": msg_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "token_count": token_count,
+                    "finish_reason": finish_reason,
+                    "platform_message_id": platform_message_id,
+                    "observed": observed,
+                },
+                observed=observed,
+            )
+        except Exception as exc:
+            logger.warning("Failed to mirror message %s into ingestion queue: %s", msg_id, exc)
+
+        return msg_id
+
+    def append_ingestion_event(
+        self,
+        source_type: str,
+        body: Any = None,
+        source_ref: Optional[str] = None,
+        session_id: Optional[str] = None,
+        role: Optional[str] = None,
+        title: Optional[str] = None,
+        metadata: Any = None,
+        body_format: str = "text",
+        observed: bool = False,
+        profile: Optional[str] = None,
+        status: str = "new",
+        created_at: Optional[float] = None,
+    ) -> int:
+        """Append one item to the linear ingestion log.
+
+        This is the lowest-friction shared queue for content, cron outputs,
+        and conversation turns. Writers append; consumers read by ascending id.
+        """
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+        stored_body = self._encode_content(body)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO ingestion_events (
+                    created_at, source_type, source_ref, session_id, role,
+                    body, body_format, title, metadata_json, observed, profile, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    created_at if created_at is not None else time.time(),
+                    source_type,
+                    source_ref,
+                    session_id,
+                    role,
+                    stored_body,
+                    body_format,
+                    title,
+                    metadata_json,
+                    1 if observed else 0,
+                    profile,
+                    status,
+                ),
+            )
+            return cursor.lastrowid
+
         return self._execute_write(_do)
+
+    def get_ingestion_events(
+        self,
+        after_id: int = 0,
+        limit: int = 100,
+        source_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return ingestion events ordered by the linear queue id."""
+        query = "SELECT * FROM ingestion_events WHERE id > ?"
+        params: List[Any] = [after_id]
+        if source_type:
+            query += " AND source_type = ?"
+            params.append(source_type)
+        query += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        conn = self._conn
+        assert conn is not None
+        rows = conn.execute(query, params).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["body"] = self._decode_content(item.get("body"))
+            if item.get("metadata_json"):
+                try:
+                    item["metadata"] = json.loads(item["metadata_json"])
+                except (TypeError, json.JSONDecodeError):
+                    item["metadata"] = item["metadata_json"]
+            else:
+                item["metadata"] = None
+            result.append(item)
+        return result
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.

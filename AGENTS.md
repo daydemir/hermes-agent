@@ -66,6 +66,23 @@ hermes-agent/
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
+## Runtime restart discipline
+
+Gateway/dashboard restarts can interrupt live Telegram/dashboard turns. Agents must
+know their execution surface before applying changes that require a restart:
+
+- Foreground/live user sessions may restart only when explicitly asked, or after
+  a concise warning + confirmation if the user is actively waiting.
+- Background agents must not directly restart/`kickstart` gateway or dashboard
+  services. They should finish code/config changes, verify them where possible,
+  and report `restart_required` with the exact service + reason back to the
+  foreground/orchestrating session.
+- If a background task truly must restart a runtime, delegate that decision to a
+  foreground Rolly session or a maintenance window job designed to be silent and
+  noninteractive.
+- Config writes that change gateway behavior should be treated as restart-needed
+  unless the code path explicitly hot-reloads that setting.
+
 ## File Dependency Chain
 
 ```

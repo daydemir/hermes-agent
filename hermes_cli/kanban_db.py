@@ -96,8 +96,18 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "review", "done", "archived"}
+VALID_INITIAL_STATUSES = {"running", "triage"}
+# Statuses a card can be completed *from* (``complete_task``). A worker only
+# ever completes from ``running``, but a human closing a card via the
+# dashboard "Complete" button or ``hermes kanban complete`` can legitimately
+# close one from any non-terminal column — including ``triage``/``todo``/
+# ``scheduled``/``review`` (e.g. marking a triage card "won't fix"). Only the
+# terminal states are excluded: ``done`` (already closed) and ``archived``
+# (off the board). Previously this was limited to running/ready/blocked, so
+# completing a triage card was a silent no-op that surfaced as a 409 in the
+# dashboard and "cannot complete (… terminal state)" on the CLI (#28xxx).
+COMPLETABLE_FROM_STATUSES = tuple(sorted(VALID_STATUSES - {"done", "archived"}))
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -2222,16 +2232,14 @@ def create_task(
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
-                if initial_status == "blocked":
-                    task_status = "blocked"
+                # parks it directly in triage for human-ops review or for a
+                # specifier.
+                if initial_status in {"blocked", "triage"} or triage:
+                    task_status = "triage"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
-                    task_status = "triage"
                 else:
                     task_status = "ready"
                     if parents:
@@ -2246,13 +2254,6 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
-                    missing = _find_missing_parents(conn, parents)
-                    if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2882,48 +2883,48 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
       ``hermes kanban block <id>``).  This is a deliberate handoff that
       should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      emits a ``"triage"`` event row in ``task_events``.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
+      ``"gave_up"``, *not* ``"triage"``, and is meant to recover
       automatically once the underlying conditions change (e.g. parents
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
+    ``"triage"`` / ``"unblocked"`` event for the task.  If the most
+    recent one is ``"triage"`` (or there is a ``"triage"`` event and
     no ``"unblocked"`` event has fired since), the task is sticky and
     ``recompute_ready`` must *not* auto-promote it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
+    was set to ``status='triage'`` by the circuit breaker or by direct
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('triage_requested', 'triage_released') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] == "triage_requested"
 
 
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` / ``triage`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
+    ``triage`` tasks are also considered for promotion (so a task
+    parked in triage purely by a parent dependency unlocks itself when the
     parent completes), *except* in two cases:
 
     1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
+       ``kanban_block`` — those stay in triage until an explicit
        ``kanban_unblock`` (#28712).
 
     2. The task's ``consecutive_failures`` has reached the effective
@@ -2947,12 +2948,12 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'triage')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            if cur_status == "triage" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -2967,16 +2968,11 @@ def recompute_ready(
             if all(p["status"] in ("done", "archived") for p in parents):
                 guard_error = _mix_ready_guard_error(conn, task_id)
                 if guard_error:
-                    if cur_status == "blocked":
-                        conn.execute(
-                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'blocked'",
-                            (task_id,),
-                        )
                     _append_mix_ready_guard_event(
                         conn, task_id, guard_error, suppress_duplicate=True,
                     )
                     continue
-                if cur_status == "blocked":
+                if cur_status == "triage":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
@@ -2995,7 +2991,7 @@ def recompute_ready(
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
+                        "WHERE id = ? AND status = 'triage'",
                         (task_id,),
                     )
                 else:
@@ -3417,7 +3413,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status IN ('running', 'ready', 'triage') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
@@ -3624,11 +3620,18 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition a card to ``done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    A card can be completed from any non-terminal status (see
+    :data:`COMPLETABLE_FROM_STATUSES` — everything except ``done`` and
+    ``archived``). A worker completes from ``running``, but a human
+    closing a card via the dashboard "Complete" button or
+    ``hermes kanban complete <id>`` may close one straight from
+    ``triage``/``todo``/``scheduled``/``ready``/``blocked``/``review``
+    without a claim/start/complete sequence — e.g. marking a triage card
+    "won't fix". When ``expected_run_id`` is given (the worker path) the
+    close is additionally pinned to that run via ``current_run_id`` so a
+    stale worker can't complete a task reclaimed out from under it.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -3682,37 +3685,30 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                """,
-                (result, now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
-            )
+        # A card can be closed from any non-terminal column (see
+        # COMPLETABLE_FROM_STATUSES). The worker path additionally pins the
+        # close to the run it owns via ``current_run_id`` so a stale worker
+        # can't complete a task that was reclaimed out from under it.
+        status_placeholders = ",".join("?" for _ in COMPLETABLE_FROM_STATUSES)
+        params: list = [result, now, task_id, *COMPLETABLE_FROM_STATUSES]
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(
+            f"""
+            UPDATE tasks
+               SET status       = 'done',
+                   result       = ?,
+                   completed_at = ?,
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL
+             WHERE id = ?
+               AND status IN ({status_placeholders}){run_guard}
+            """,
+            params,
+        )
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
@@ -4106,13 +4102,13 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> blocked``."""
+    """Transition ``running -> triage``."""
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'blocked',
+                   SET status       = 'triage',
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL
@@ -4125,7 +4121,7 @@ def block_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'blocked',
+                   SET status       = 'triage',
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL
@@ -4139,7 +4135,7 @@ def block_task(
             return False
         run_id = _end_run(
             conn, task_id,
-            outcome="blocked", status="blocked",
+            outcome="triaged", status="triaged",
             summary=reason,
         )
         # Synthesize a run when blocking a never-claimed task so the
@@ -4147,10 +4143,10 @@ def block_task(
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="blocked",
+                outcome="triaged",
                 summary=reason,
             )
-        _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        _append_event(conn, task_id, "triage_requested", {"reason": reason}, run_id=run_id)
         return True
 
 
@@ -4164,7 +4160,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo` or `triage` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -4181,10 +4177,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "triage"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo' or 'triage'"
         )
 
     if not force:
@@ -4217,7 +4213,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'triage')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -4233,7 +4229,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``triage``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -4245,7 +4241,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('triage', 'scheduled')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -4260,7 +4256,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
+        # Re-gate on parent completion before flipping 'triage' back to
         # 'ready'. Unconditionally setting status='ready' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
         # if parents are still in progress the task must wait in 'todo'
@@ -4281,13 +4277,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('triage', 'scheduled')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
         _append_event(
-            conn, task_id, "unblocked",
+            conn, task_id, "triage_released",
             {"status": new_status} if new_status != "ready" else None,
         )
         if guard_error:
@@ -4763,7 +4759,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'triage')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -4790,7 +4786,7 @@ def schedule_task(
 # ---------------------------------------------------------------------------
 
 # After this many consecutive non-success attempts on a task/profile, the
-# dispatcher stops retrying and parks the task in ``blocked`` with a reason so
+# dispatcher stops retrying and parks the task in ``triage`` with a reason so
 # a human can investigate. Prevents retry storms when a worker repeatedly times
 # out, crashes, or cannot spawn.
 DEFAULT_FAILURE_LIMIT = 2
@@ -5618,7 +5614,7 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
@@ -5629,7 +5625,7 @@ def _record_task_failure(
                 # with claim cleared; just flip to blocked + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = 'triage', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
