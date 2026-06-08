@@ -68,20 +68,21 @@ Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
 ## Runtime restart discipline
 
-Gateway/dashboard restarts can interrupt live Telegram/dashboard turns. Agents must
-know their execution surface before applying changes that require a restart:
+This box is Rolly — a dedicated, single-purpose machine where the `rolly` account
+has account-wide passwordless sudo. Rolly may restart its own services
+autonomously (`sudo rolly-stack restart <gateway|hermes-dashboard|…>`) to make
+on-disk backend changes take effect; it does not need to defer that to a human or
+report `restart_required` instead of acting.
 
-- Foreground/live user sessions may restart only when explicitly asked, or after
-  a concise warning + confirmation if the user is actively waiting.
-- Background agents must not directly restart/`kickstart` gateway or dashboard
-  services. They should finish code/config changes, verify them where possible,
-  and report `restart_required` with the exact service + reason back to the
-  foreground/orchestrating session.
-- If a background task truly must restart a runtime, delegate that decision to a
-  foreground Rolly session or a maintenance window job designed to be silent and
-  noninteractive.
-- Config writes that change gateway behavior should be treated as restart-needed
-  unless the code path explicitly hot-reloads that setting.
+Restarts still interrupt live Telegram/dashboard turns, so keep the discipline:
+
+- Verify code/config changes first (tests / `py_compile`) before bouncing a
+  service.
+- If a foreground user is actively waiting on that surface, give a one-line
+  heads-up before the restart (or pick a quiet moment) — don't silently cut a
+  live turn.
+- Config writes that change gateway behavior take effect on restart unless the
+  code path explicitly hot-reloads that setting — restart to apply.
 
 ## File Dependency Chain
 
