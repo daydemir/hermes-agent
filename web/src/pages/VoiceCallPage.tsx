@@ -672,6 +672,19 @@ export default function VoiceCallPage() {
     }
   }, [addLog]);
 
+  const disableRollyFanout = useCallback(() => {
+    if (!fanoutActiveRef.current && !fanoutCtxRef.current) return;
+    const mic = streamRef.current?.getAudioTracks()[0] ?? null;
+    for (const peer of meetPeerConnectionsRef.current.values()) {
+      void peer.micSender?.replaceTrack(mic).catch(() => undefined);
+    }
+    fanoutActiveRef.current = false;
+    fanoutDestRef.current = null;
+    void fanoutCtxRef.current?.close().catch(() => undefined);
+    fanoutCtxRef.current = null;
+    addLog("system", "Rolly fan-out stopped: peer audio restored to microphone only.");
+  }, [addLog]);
+
   // Meet-mode audio mesh: a per-peer perfect-negotiation state machine over the
   // HTTP long-poll signaling channel. Idempotent peers, ICE candidate buffering,
   // join-index gating of stale offers, impolite-only ICE restart, and per-peer
@@ -1199,6 +1212,7 @@ export default function VoiceCallPage() {
         finishResponse(type === "response.cancelled" ? "cancelled" : "done");
         stopWorkingCue(type === "response.cancelled" ? false : "done");
         if (activeCallModeRef.current === "meet") {
+          disableRollyFanout();
           meetInvokedRef.current = false;
           setRollyListenState("Silent until “Hey Rolly”");
         }
@@ -1223,12 +1237,13 @@ export default function VoiceCallPage() {
         }
         finishResponse("error");
         stopWorkingCue("error");
+        if (activeCallModeRef.current === "meet") disableRollyFanout();
         const messageText = JSON.stringify(event.error ?? event).slice(0, 700);
         addLog("error", messageText);
         persistTranscript("error", messageText, "realtime_error");
       }
     },
-    [addLog, finishResponse, flushPendingHandoffs, handleToolCall, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue, enableRollyFanout],
+    [addLog, disableRollyFanout, finishResponse, flushPendingHandoffs, handleToolCall, persistTranscript, requestResponseCreate, sendRealtimeEvent, speaker, startBoundedWorkingCue, startWorkingCue, stopWorkingCue, enableRollyFanout],
   );
 
   const startCall = useCallback(async (overrideMode?: "solo" | "meet", preserveCallId = false) => {
