@@ -58,7 +58,7 @@ class DiagnosticAction:
 
     * ``reclaim`` / ``reassign`` — POST to the matching /tasks/:id/*
       endpoint; dashboard wires into the existing recovery popover.
-    * ``unblock`` — PATCH status back to ``ready`` (for stuck-blocked
+    * ``unblock`` — PATCH status back to ``staged`` (for stuck-blocked
       diagnostics).
     * ``cli_hint`` — print/copy a shell command (e.g.
       ``hermes -p <profile> auth``). No HTTP side effect.
@@ -143,6 +143,18 @@ def _task_field(task, name, default=None):
     if isinstance(task, dict):
         return task.get(name, default)
     return getattr(task, name, default)
+
+
+def _is_in_progress(task) -> bool:
+    """True when the task is in the active-work status.
+
+    Derives the literal from ``kanban_db.IN_PROGRESS_STATUS`` (single
+    source of truth) rather than hard-coding the status string in every
+    rule. Lazy-imported to match the other kanban_db references in this
+    module and avoid a module-level import cycle.
+    """
+    from hermes_cli import kanban_db
+    return _task_field(task, "status") == kanban_db.IN_PROGRESS_STATUS
 
 
 def _string_set(value) -> set[str]:
@@ -396,7 +408,7 @@ def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
         for pid in payload.get("phantom_cards", []) or []:
             if pid not in phantom_ids:
                 phantom_ids.append(pid)
-    running = _task_field(task, "status") == "running"
+    running = _is_in_progress(task)
     actions: list[DiagnosticAction] = []
     actions.append(DiagnosticAction(
         kind="comment",
@@ -424,10 +436,11 @@ def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 
 def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """A triage task cannot leave triage without an auxiliary helper.
+    """A triage card (stored status ``backlog``) cannot be decomposed
+    without an auxiliary helper.
 
     With the auto-decompose dispatcher (kanban.auto_decompose, default True),
-    triage tasks fan out via ``auxiliary.kanban_decomposer`` and fall back to
+    backlog cards fan out via ``auxiliary.kanban_decomposer`` and fall back to
     ``auxiliary.triage_specifier`` when the decomposer returns ``fanout=false``.
     With auto-decompose off, the user must run ``hermes kanban specify``,
     which only needs ``auxiliary.triage_specifier``.
@@ -440,7 +453,7 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
 
     Config context is required; pass {} from tests to keep the rule silent.
     """
-    if _task_field(task, "status") != "triage":
+    if _task_field(task, "status") != "backlog":
         return []
 
     status = triage_aux_status(cfg)
@@ -550,7 +563,7 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
         for pid in _parse_payload(ev).get("phantom_refs", []) or []:
             if pid not in phantom_refs:
                 phantom_refs.append(pid)
-    running = _task_field(task, "status") == "running"
+    running = _is_in_progress(task)
     return [Diagnostic(
         kind="prose_phantom_refs",
         severity="warning",
@@ -644,7 +657,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
                 suggested=True,
             ))
     actions.extend(_generic_recovery_actions(
-        task, running=_task_field(task, "status") == "running",
+        task, running=_is_in_progress(task),
     ))
 
     severity = "critical" if failures >= threshold * 2 else "error"
@@ -745,7 +758,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             payload={"command": f"hermes kanban log {task_id}"},
             suggested=True,
         ))
-    running = _task_field(task, "status") == "running"
+    running = _is_in_progress(task)
     actions.extend(_generic_recovery_actions(task, running=running))
     severity = "critical" if consecutive >= threshold * 2 else "error"
     # Put the actual error up-front so operators see WHAT broke without
@@ -779,14 +792,15 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
 
 
 def _rule_stuck_in_triage(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Task has been in ``triage`` status for too long without a comment.
+    """Task has been parked in ``backlog`` status for too long without a
+    comment (a triage_requested park that nobody released).
 
     Threshold: cfg["blocked_stale_hours"] (default 24).
     Surfaced as a warning so humans know there's a pending release.
     """
     hours = float(cfg.get("blocked_stale_hours", 24))
     status = _task_field(task, "status")
-    if status != "triage":
+    if status != "backlog":
         return []
     # Find the most recent ``triage_requested`` event.
     last_blocked_ts = 0
@@ -906,7 +920,7 @@ def _rule_triage_release_cycling(task, events, runs, now, cfg) -> list[Diagnosti
 
 
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
-    """Task has been in ``ready`` status for too long without any worker
+    """Task has been in ``staged`` status for too long without any worker
     claiming it.
 
     Threshold: cfg["stranded_threshold_seconds"] (default 1800 = 30 min).
@@ -923,7 +937,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     Pre-rule, all of these silently rotted in ``skipped_nonspawnable`` —
     the dispatcher correctly skipped them (good — no respawn loop) but
     nobody surfaced the fact that operator-actionable work was
-    accumulating. The rule fires when a ready task's promoted-to-ready
+    accumulating. The rule fires when a staged task's promoted-to-staged
     timestamp is older than the threshold AND the assignee is non-empty
     (truly unassigned tasks have their own ``skipped_unassigned`` signal
     on the dispatcher and a different operator response).
@@ -936,7 +950,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         cfg.get("stranded_threshold_seconds", 30 * 60)
     )
     status = _task_field(task, "status")
-    if status != "ready":
+    if status != "staged":
         return []
     # Skip tasks with a live claim — they're being worked on, even if
     # the worker hasn't reported progress yet (run-level liveness

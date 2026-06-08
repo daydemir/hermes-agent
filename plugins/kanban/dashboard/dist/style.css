@@ -988,6 +988,23 @@
   padding-left: 0.5rem;
   border-left: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
 }
+.hermes-kanban-bulk-move-board > button {
+  height: 1.7rem !important;
+  padding: 0 0.5rem !important;
+  font-size: 0.7rem !important;
+  border: 1px solid var(--color-border);
+  cursor: pointer;
+}
+.hermes-kanban-bulk-move-board > button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-foreground) 8%, transparent);
+}
+.hermes-kanban-bulk-move-board {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding-left: 0.5rem;
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+}
 
 /* ---- Dependency editor chips --------------------------------------- */
 
@@ -1922,4 +1939,93 @@
 
 .hermes-kanban-trash-label {
   font-weight: 500;
+}
+
+/* ── In-Progress "Copy CC prompt" button + editor modal ──────────────────── */
+.hermes-kanban-prompt-copy {
+  width: auto;
+  padding: 0 0.5rem;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+.hermes-kanban-prompt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: color-mix(in srgb, #000 55%, transparent);
+}
+.hermes-kanban-prompt-modal {
+  width: min(820px, 100%);
+  /* Defined height (not just max-height) so the textarea actually fills the
+     popup and the actions row stays pinned + visible. dvh tracks the real
+     visible area on mobile (vh would include the URL bar and push Save off
+     the bottom). vh line is the fallback for browsers without dvh. */
+  height: min(680px, 88vh);
+  height: min(680px, 88dvh);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: var(--color-card, #111);
+  color: var(--color-foreground);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.hermes-kanban-prompt-modal-head {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.hermes-kanban-prompt-modal-hint {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+}
+.hermes-kanban-prompt-textarea {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  padding: 0.6rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-card) 80%, transparent);
+  color: var(--color-foreground);
+}
+.hermes-kanban-prompt-modal-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+.hermes-kanban-prompt-btn {
+  padding: 0.35rem 0.8rem;
+  font-size: 0.78rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  background: color-mix(in srgb, var(--color-card) 92%, transparent);
+  color: var(--color-foreground);
+  cursor: pointer;
+}
+.hermes-kanban-prompt-btn:hover {
+  border-color: var(--color-ring);
+}
+.hermes-kanban-prompt-modal-actions button.hermes-kanban-prompt-btn--primary {
+  /* High-contrast filled Save button. A host/Tailwind button rule was winning
+     and forcing background: transparent, which left dark Save text on the dark
+     modal = invisible. Higher specificity + !important + explicit fallbacks fix
+     it regardless of the cascade. */
+  background: var(--color-foreground, #f5e6cc) !important;
+  color: var(--color-card, #0e2423) !important;
+  border-color: var(--color-foreground, #f5e6cc) !important;
 }

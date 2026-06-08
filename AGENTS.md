@@ -873,6 +873,22 @@ Isolation model:
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 
+### Slack notifications from a session (Rolly / Mix Builder)
+
+A Claude Code session working a card notifies humans without anyone watching
+the tmux pane via `hermes send` (bot-token based — no running gateway needed,
+once `SLACK_BOT_TOKEN` is in `~/.hermes/.env`):
+
+```bash
+hermes send --to slack:<#channel-or-Cid> "✅ <card>: done — <one-line summary>"
+hermes send --to slack:<#channel-or-Cid> "❓ <card>: <question blocking progress>"
+```
+
+Replies thread off the message ts: `hermes send --to slack:C0123:<thread_ts> "…"`.
+Two-way (answering Rolly in a thread) is handled by the gateway's Slack adapter
+(`gateway/platforms/slack.py`, Socket Mode — needs `SLACK_APP_TOKEN`). Setup
+guide: `~/rolly-brain/wiki/slack-setup-2026-06-08.md`.
+
 ---
 
 ## Important Policies

@@ -87,26 +87,22 @@
     return body || raw;
   }
 
-  // Rolly uses a deliberately simple card schema: triage -> ready -> done.
-  const COLUMN_ORDER = ["triage", "ready", "done"];
+  // Rolly uses a deliberately simple card schema: backlog -> staged -> in_progress -> done.
+  const COLUMN_ORDER = ["backlog", "staged", "in_progress", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
-    triage: "Triage",
-    todo: "Todo",
-    ready: "Ready",
-    running: "In Progress",
-    blocked: "Blocked",
+    backlog: "Backlog",
+    staged: "Staged",
+    in_progress: "In Progress",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
-    triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
-    ready: "Dependencies satisfied; assign a profile to dispatch",
-    running: "Claimed by a worker — in-flight",
-    blocked: "Worker asked for human input",
+    backlog: "Raw ideas — a specifier will flesh out the spec",
+    staged: "Dependencies satisfied; assign a profile to dispatch",
+    in_progress: "Claimed by a worker — in-flight",
     done: "Completed",
     archived: "Archived",
   };
@@ -153,11 +149,11 @@
   }
 
   const COLUMN_DOT = {
-    triage: "hermes-kanban-dot-triage",
-    todo: "hermes-kanban-dot-todo",
-    ready: "hermes-kanban-dot-ready",
-    running: "hermes-kanban-dot-running",
-    blocked: "hermes-kanban-dot-blocked",
+    // Canonical statuses reuse the existing dot CSS classes (no CSS rebuild):
+    // backlog -> dot-triage, staged -> dot-ready, in_progress -> dot-running.
+    backlog: "hermes-kanban-dot-triage",
+    staged: "hermes-kanban-dot-ready",
+    in_progress: "hermes-kanban-dot-running",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -233,6 +229,15 @@
     } catch (_e) { /* ignore quota / private mode */ }
   }
 
+  // The logged-in dashboard user (slug like "deniz"/"arman"). The host SPA
+  // persists it under this localStorage key (see web/src/lib/rollyIdentity.ts)
+  // and rides it as the X-Rolly-User header; the plugin reuses the same key so
+  // writes (e.g. comments) are attributed to the real user, not "dashboard".
+  function rollyUserSlug() {
+    try { return (window.localStorage.getItem("rolly-dashboard-user") || "").trim() || null; }
+    catch (_e) { return null; }
+  }
+
   function readUrlParam(name) {
     try { return new URLSearchParams(window.location.search).get(name); }
     catch (_e) { return null; }
@@ -299,6 +304,120 @@
     } catch (_e) {
       fallback();
     }
+  }
+
+  // ── Mix Builder "Copy CC prompt" (In Progress column) ──────────────────────
+  // The In-Progress "CC prompt" button copies a ready-to-paste Claude Code
+  // prompt. The ONLY dynamic part is {{CARDS}} — the live In Progress card ids.
+  // TWO templates by board: the Rolly Code board (slug "rolly") uses the Rolly
+  // template; every other board uses the Mix template. Edits prefer an on-disk
+  // backend (GET/PUT /in-progress-prompt-template) and fall back to per-kind
+  // localStorage when that endpoint isn't deployed yet.
+  const CC_PROMPT_LS_PREFIX = "hermes.kanban.ccPromptTemplate.";
+  const DEFAULT_MIX_PROMPT = `You are the MIX BUILDER — a Claude Code session doing coding work for Mix. Work autonomously, commit and push to main (single session, so no merge conflicts), and ask clarifying questions before building anything ambiguous.
+
+## What Mix is
+MIX turns walks through real places into interactive audio stories that know where the listener is — a location-aware audio/story platform where walking, direction, dwell time, and physical place are the interface. Audio-first today (phone + headphones); AR comes later. AI content generation is central to scale: ingest sources, segment by place relevance, assemble route-aware narrative beats. Journalists, museums, artists, and community groups should be able to author place-based stories without building their own app.
+
+## Where the tooling lives
+- Build Mix here: /Users/rolly/Build/mix/mix-mono (monorepo — iOS/AR app, backend/functions, studio). Design system: /Users/rolly/Build/mix/mix-design. Product/strategy corpus: /Users/rolly/Build/mix/mix-assistant.
+- Read AGENTS.md at the repo root FIRST for conventions, the git workflow (push to main), build/test commands, and CI gates. Follow it.
+- CLIs: 'mix-cli' (swift build/run for the iOS/AR app), 'mix-studio-cli' (backend, stories, releases). Deeper product context: /Users/rolly/rolly-brain/wiki/mix-*.md.
+
+## Coding principles (Deniz — non-negotiable)
+DRY, functional, lean, clean, simple. Hard cuts, not band-aids. No fallbacks unless explicitly asked. Fail fast. Compile-time type safe. CLI-driven (core logic in CLIs, UI on top). No loose strings. Minimize global mutable state, side effects, nil checks, force-unwraps. Changes should simplify, not complicate.
+
+## Quality bar for Mix (hold this standard)
+Mix is a consumer product — it must feel polished and reliable. Match the mix-design system; don't invent UI. Audio + location behavior must be smooth and low-latency, never janky. Handle real-world edge cases gracefully: GPS drift, no signal, backgrounding, denied permissions, interrupted audio. No placeholder or dead UI. Ship behind the existing gates (build + tests green). Prefer a small, genuinely shippable slice over a broad half-working one.
+
+## Mix's goal right now
+Ship the audio-first walking-story experience: reliable location-to-story generation, low-latency beats, a creator path for institutions, and an App Store release.
+
+## Your task
+The cards below are In Progress. For EACH card id, run 'hermes kanban show <id>' (full body + comments) and 'hermes kanban context <id>' (worker context). Build to satisfy each card's ACCEPTANCE CRITERIA exactly — treat them as the definition of done. If a card is under-specified or ambiguous, ask before building.
+
+In Progress cards:
+{{CARDS}}`;
+  const DEFAULT_ROLLY_PROMPT = `You are working on ROLLY — Deniz's autonomous AI assistant. Rolly's mission: ensure MIX achieves its goals as fast as possible, and continuously, autonomously improve itself. This board (Rolly Code) is Rolly improving its OWN codebase, tooling, and operations. Work autonomously, commit and push to main, and ask clarifying questions before building anything ambiguous.
+
+## What Rolly is
+Rolly is an AI assistant running on a dedicated Mac mini (this machine). It owns the kanban boards, this dashboard, the gateway (Telegram + voice), and the dev tooling that builds Mix. North star: make Mix succeed faster, and make Rolly itself more capable over time with less human intervention. Bias toward self-improvement — better tooling, automation, and reliability compound.
+
+## What Mix is (what Rolly exists to advance)
+MIX turns walks through real places into interactive audio stories that know where the listener is — a location-aware audio/story platform. Everything on this board should ladder up to shipping and improving Mix.
+
+## Where the tooling lives
+- Rolly's codebase (build here): /Users/rolly/.hermes/hermes-agent (the Hermes agent — gateway, dashboard, kanban, CLIs). The dashboard plugin UI is plugins/kanban/dashboard/. Run tests with scripts/run_tests.sh (or venv/bin/python -m pytest <file>).
+- Read AGENTS.md / CLAUDE.md at the repo root for conventions, the git workflow (push to main), and gates. Follow them.
+- Service control: 'rolly-stack status | restart <svc>' (mutating commands need sudo). Rolly's memory + notes: /Users/rolly/rolly-brain/wiki/.
+
+## Coding principles (Deniz — non-negotiable)
+DRY, functional, lean, clean, simple. Hard cuts, not band-aids. No fallbacks unless explicitly asked. Fail fast. Compile-time type safe. CLI-driven (core logic in CLIs, UI on top). No loose strings. Minimize global mutable state, side effects, nil checks, force-unwraps. Changes should simplify, not complicate.
+
+## Your task
+The cards below are In Progress. For EACH card id, run 'hermes kanban show <id>' (full body + comments) and 'hermes kanban context <id>' (worker context). Build to satisfy each card's ACCEPTANCE CRITERIA exactly — treat them as the definition of done. If a card is under-specified or ambiguous, ask before building.
+
+In Progress cards:
+{{CARDS}}`;
+  function ccPromptKind(boardSlug) { return boardSlug === "rolly" ? "rolly" : "mix"; }
+  function ccPromptDefault(kind) { return kind === "rolly" ? DEFAULT_ROLLY_PROMPT : DEFAULT_MIX_PROMPT; }
+  function ccPromptLocal(kind) {
+    try { const v = window.localStorage.getItem(CC_PROMPT_LS_PREFIX + kind); if (v != null) return v; } catch (e) {}
+    return ccPromptDefault(kind);
+  }
+  function ccPromptSaveLocal(kind, text) {
+    try {
+      if (text == null) window.localStorage.removeItem(CC_PROMPT_LS_PREFIX + kind);
+      else window.localStorage.setItem(CC_PROMPT_LS_PREFIX + kind, text);
+    } catch (e) { /* private mode / disabled storage — non-fatal */ }
+  }
+  // Persist a template: write to disk via the backend when available, and
+  // always mirror to localStorage so it survives even if the endpoint is down.
+  function ccPromptSave(boardSlug, kind, text, onDone) {
+    ccPromptSaveLocal(kind, text);
+    SDK.fetchJSON(withBoard(`${API}/in-progress-prompt-template`, boardSlug), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template: text }),
+    }).then(function () { if (onDone) onDone(true); }).catch(function () { if (onDone) onDone(false); });
+  }
+  function buildCcPrompt(template, column) {
+    const tasks = (column && column.tasks) ? column.tasks : [];
+    const list = tasks.length
+      ? tasks.map(function (tk) { return "- " + tk.id + (tk.title ? " — " + tk.title : ""); }).join("\n")
+      : "(none — the In Progress column is empty)";
+    return (template || "").replace("{{CARDS}}", list);
+  }
+  function CcPromptEditor(props) {
+    const [text, setText] = useState(props.initialText || ccPromptDefault(props.kind));
+    const [saving, setSaving] = useState(false);
+    return h("div", { className: "hermes-kanban-prompt-overlay", onClick: props.onClose },
+      h("div", { className: "hermes-kanban-prompt-modal", onClick: function (e) { e.stopPropagation(); } },
+        h("div", { className: "hermes-kanban-prompt-modal-head" },
+          h("strong", null, "In-Progress prompt — " + (props.kind === "rolly" ? "Rolly Code" : "Mix")),
+          h("div", { className: "hermes-kanban-prompt-modal-hint" },
+            "Static template for this board's Claude Code prompt. {{CARDS}} is replaced with the live In Progress card ids when you copy. Saved on disk (shared) when available, otherwise in this browser.")),
+        h("textarea", {
+          className: "hermes-kanban-prompt-textarea",
+          spellCheck: false,
+          value: text,
+          onChange: function (e) { setText(e.target.value); },
+        }),
+        h("div", { className: "hermes-kanban-prompt-modal-actions" },
+          h("button", { type: "button", disabled: saving,
+            className: "hermes-kanban-prompt-btn hermes-kanban-prompt-btn--primary",
+            onClick: function () {
+              setSaving(true);
+              ccPromptSave(props.boardSlug, props.kind, text, function () {
+                setSaving(false);
+                if (props.onSaved) props.onSaved(text);
+                props.onClose();
+              });
+            } }, saving ? "Saving…" : "Save"),
+          h("button", { type: "button", className: "hermes-kanban-prompt-btn",
+            onClick: function () { setText(ccPromptDefault(props.kind)); } }, "Reset to default"),
+          h("button", { type: "button", className: "hermes-kanban-prompt-btn",
+            onClick: props.onClose }, "Cancel"))));
   }
 
   function withBoard(url, board) {
@@ -535,7 +654,7 @@
     const { t } = useI18n();
     const [board, setBoard] = useState(() => readUrlParam("board") || readSelectedBoard() || null);
     const path = window.location.pathname.replace(/\/$/, "");
-    const isPriorityListRoute = path === "/kanban" || path === "/kanban/list" || path === "/kanban/priority";
+    const isPriorityListRoute = path === "/kanban/list" || path === "/kanban/priority";
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
 
@@ -1042,6 +1161,41 @@
         });
     }, [selectedIds, loadBoard, board, t]);
 
+    // Move the selected cards to another board (a real cross-DB move).
+    const moveSelectedToBoard = useCallback(function (targetSlug) {
+      if (selectedIds.size === 0 || !targetSlug || targetSlug === board) return;
+      const ids = Array.from(selectedIds);
+      // Optimistic: drop the moved cards from the current board view.
+      setBoardData(function (b) {
+        if (!b) return b;
+        const columns = b.columns.map(function (col) {
+          return Object.assign({}, col, {
+            tasks: col.tasks.filter(function (tk) { return !selectedIds.has(tk.id); }),
+          });
+        });
+        return Object.assign({}, b, { columns });
+      });
+      SDK.fetchJSON(withBoard(`${API}/tasks/move-to-board`, board), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_ids: ids, target_board: targetSlug }),
+      })
+        .then(function (res) {
+          const failed = (res && res.failed) || [];
+          if (failed.length > 0) {
+            setError(`Move: ${failed.length} of ${ids.length} failed: ` +
+              failed.slice(0, 3).map(function (f) { return `${f.id} (${f.error})`; }).join("; "));
+          }
+          setSelectedIds(new Set());
+          setLastSelectedId(null);
+          loadBoard();
+        })
+        .catch(function (e) {
+          setError(String(e.message || e));
+          loadBoard();
+        });
+    }, [selectedIds, loadBoard, board]);
+
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
@@ -1170,7 +1324,10 @@
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
          assignees: (boardData && boardData.assignees) || [],
+         boardList: boardList,
+         currentBoard: board,
          onApply: applyBulk,
+         onMoveToBoard: moveSelectedToBoard,
          onClear: clearSelected,
          onSelectAllVisible: selectAllVisible,
          onDelete: deleteSelected,
@@ -1191,6 +1348,7 @@
           },
         }) : h(BoardColumns, {
           board: filteredBoard,
+          boardSlug: board,
           assignees: ((boardData && boardData.users) || []).length > 0
             ? boardData.users
             : ((boardData && boardData.assignees) || []),
@@ -1212,7 +1370,7 @@
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
-          boardSlug: board,
+          boardSlug: path.startsWith("/kanban/cards/") ? (readUrlParam("board") || null) : board,
           onClose: closeTask,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
@@ -1348,7 +1506,7 @@
   // Action kinds supported today:
   //   reclaim   → POST /tasks/:id/reclaim
   //   reassign  → POST /tasks/:id/reassign (with profile picker)
-  //   unblock   → PATCH /tasks/:id  body: {status: "ready"}
+  //   unblock   → PATCH /tasks/:id  body: {status: "staged"}
   //   comment   → scroll to the comment input at the bottom of the drawer
   //   cli_hint  → copy payload.command to clipboard
   //   open_docs → open payload.url in a new tab
@@ -1446,7 +1604,7 @@
         SDK.fetchJSON(url, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "ready" }),
+          body: JSON.stringify({ status: "staged" }),
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
@@ -1931,7 +2089,14 @@
     const list = props.boardList || [];
     const current = list.find(function (b) { return b.slug === props.board; });
     const currentName = current && current.name ? current.name : props.board;
-    const currentTotal = current ? current.total : 0;
+    const activeCountFrom = function (counts) {
+      return Object.entries(counts || {}).reduce(function (n, entry) {
+        const status = entry[0];
+        const count = entry[1] || 0;
+        return n + (status === "done" || status === "archived" ? 0 : count);
+      }, 0);
+    };
+    const currentActiveTotal = current ? activeCountFrom(current.counts) : 0;
     const hasMultipleBoards = list.length > 1;
 
     // Hide entirely when only the default board exists AND it's empty —
@@ -1968,14 +2133,15 @@
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
               list.map(function (b) {
-                const label = b.total > 0
-                  ? `${b.name || b.slug} · ${b.total}`
+                const activeTotal = activeCountFrom(b.counts);
+                const label = activeTotal > 0
+                  ? `${b.name || b.slug} · ${activeTotal}`
                   : (b.name || b.slug);
                 return h(SelectOption, { key: b.slug, value: b.slug }, label);
               }),
             ),
             h("span", { className: "text-xs text-muted-foreground" },
-              `${currentTotal || 0} task${currentTotal === 1 ? "" : "s"}`),
+              `${currentActiveTotal || 0} task${currentActiveTotal === 1 ? "" : "s"}`),
           ),
         ),
         h("div", { className: "flex-1" }),
@@ -2137,11 +2303,11 @@
     return h("div", { className: "flex flex-wrap items-end gap-3" },
       h("div", { className: "hermes-kanban-view-tabs" },
         h("a", {
-          href: "/kanban/board",
+          href: "/kanban",
           className: cn("hermes-kanban-view-tab", !props.isPriorityListRoute ? "hermes-kanban-view-tab--active" : ""),
         }, "Board"),
         h("a", {
-          href: "/kanban",
+          href: "/kanban/list",
           className: cn("hermes-kanban-view-tab", props.isPriorityListRoute ? "hermes-kanban-view-tab--active" : ""),
         }, "Priority list"),
       ),
@@ -2225,19 +2391,23 @@
     const [assignee, setAssignee] = useState("");
     const [reclaimFirst, setReclaimFirst] = useState(false);
     const [priority, setPriority] = useState("");
+    const [moveBoard, setMoveBoard] = useState("");
+    const moveTargets = (props.boardList || []).filter(function (b) {
+      return b.slug !== props.currentBoard && b.slug !== "default" && !b.archived;
+    });
     return h("div", { className: "hermes-kanban-bulk" },
       h("span", { className: "hermes-kanban-bulk-count" },
         `${props.count} ${tx(t, "selected", "selected")}`),
       h(Button, {
-        onClick: function () { props.onApply({ status: "triage" }); },
+        onClick: function () { props.onApply({ status: "backlog" }); },
         size: "sm",
-        title: "Move selected tasks to Triage.",
-      }, "→ triage"),
+        title: "Move selected tasks to Backlog.",
+      }, "→ backlog"),
       h(Button, {
-        onClick: function () { props.onApply({ status: "ready" }); },
+        onClick: function () { props.onApply({ status: "staged" }); },
         size: "sm",
-        title: "Move selected tasks to Ready. Ready cards are prepared for manual execution.",
-      }, "→ ready"),
+        title: "Move selected tasks to Staged. Staged cards are prepared for manual execution.",
+      }, "→ staged"),
       h(Button, {
         onClick: function () {
           props.onApply({ status: "done" },
@@ -2296,6 +2466,32 @@
           title: "Apply the selected assignee to all selected tasks.",
         }, tx(t, "apply", "Apply")),
       ),
+      moveTargets.length > 0 ? h("div", { className: "hermes-kanban-bulk-move-board",
+                 title: "Move the selected cards to another board (a real move — the cards leave this board)." },
+        h(Select, Object.assign({
+          value: moveBoard,
+          className: "h-7 text-xs",
+        }, selectChangeHandler(setMoveBoard)),
+          h(SelectOption, { value: "" }, "— move to board —"),
+          moveTargets.map(function (b) {
+            return h(SelectOption, { key: b.slug, value: b.slug }, b.name || b.slug);
+          }),
+        ),
+        h(Button, {
+          onClick: function () {
+            if (!moveBoard) return;
+            const target = moveTargets.find(function (b) { return b.slug === moveBoard; });
+            const label = (target && target.name) || moveBoard;
+            if (window.confirm(`Move ${props.count} card(s) to "${label}"?`)) {
+              props.onMoveToBoard(moveBoard);
+              setMoveBoard("");
+            }
+          },
+          disabled: !moveBoard,
+          size: "sm",
+          title: "Move the selected cards to the chosen board.",
+        }, tx(t, "move", "Move")),
+      ) : null,
       h("label", { className: "hermes-kanban-bulk-reclaim-first", title: "Reclaim any active claims before reassigning" },
         h(Checkbox, {
           checked: reclaimFirst,
@@ -2458,6 +2654,7 @@
         return h(Column, {
           key: col.name,
           column: col,
+          boardSlug: props.boardSlug,
           laneByProfile: props.laneByProfile,
           selectedIds: props.selectedIds,
           failedIds: props.failedIds,
@@ -2524,7 +2721,7 @@
     };
 
     const lanes = useMemo(function () {
-      if (!props.laneByProfile || props.column.name !== "running") return null;
+      if (!props.laneByProfile || props.column.name !== "in_progress") return null;
       const byProfile = {};
       for (const tk of props.column.tasks) {
         const key = tk.assignee || "(unassigned)";
@@ -2535,6 +2732,16 @@
       });
     }, [props.column, props.laneByProfile]);
 
+    const [promptOpen, setPromptOpen] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const ccKind = ccPromptKind(props.boardSlug);
+    const [ccTemplate, setCcTemplate] = useState(function () { return ccPromptLocal(ccKind); });
+    useEffect(function () {
+      if (props.column.name !== "in_progress" || !props.boardSlug) return;
+      SDK.fetchJSON(withBoard(`${API}/in-progress-prompt-template`, props.boardSlug))
+        .then(function (d) { if (d && typeof d.template === "string" && d.template) setCcTemplate(d.template); })
+        .catch(function () { /* on-disk endpoint not deployed yet — keep local/default */ });
+    }, [props.boardSlug, props.column.name]);
     const colHelp = getColumnHelp(t, props.column.name);
     const colLabel = getColumnLabel(t, props.column.name);
 
@@ -2573,6 +2780,23 @@
           title: tx(t, "createTask", "Create task in this column"),
           onClick: function () { setShowCreate(function (v) { return !v; }); },
         }, showCreate ? "×" : "+"),
+        props.column.name === "in_progress" ? h("button", {
+          type: "button",
+          className: "hermes-kanban-column-add hermes-kanban-prompt-copy",
+          title: "Copy a Claude Code prompt for every card in this column",
+          onClick: function () {
+            copyTextToClipboard(buildCcPrompt(ccTemplate, props.column), function () {
+              setCopied(true);
+              window.setTimeout(function () { setCopied(false); }, 1600);
+            });
+          },
+        }, copied ? "Copied ✓" : "⧉ CC prompt") : null,
+        props.column.name === "in_progress" ? h("button", {
+          type: "button",
+          className: "hermes-kanban-column-add",
+          title: "Edit the In-Progress prompt template",
+          onClick: function () { setPromptOpen(true); },
+        }, "✎") : null,
       ),
       h("div", { className: "hermes-kanban-column-sub" },
         colHelp || ""),
@@ -2584,6 +2808,13 @@
           props.onCreate(body).then(function () { setShowCreate(false); });
         },
         onCancel: function () { setShowCreate(false); },
+      }) : null,
+      promptOpen ? h(CcPromptEditor, {
+        kind: ccKind,
+        boardSlug: props.boardSlug,
+        initialText: ccTemplate,
+        onSaved: function (txt) { setCcTemplate(txt); },
+        onClose: function () { setPromptOpen(false); },
       }) : null,
       h("div", { className: "hermes-kanban-column-body" },
         props.column.tasks.length === 0
@@ -2632,15 +2863,14 @@
   // Staleness tiers — amber after a grace window, red when clearly stuck.
   // Values below are seconds.
   const STALENESS = {
-    ready:   { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
-    running: { amber: 10 * 60,       red: 60 * 60 },
-    blocked: { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
-    todo:    { amber: 7 * 24 * 60 * 60, red: 30 * 24 * 60 * 60 },
+    backlog:     { amber: 7 * 24 * 60 * 60, red: 30 * 24 * 60 * 60 },
+    staged:      { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
+    in_progress: { amber: 10 * 60,       red: 60 * 60 },
   };
 
   function stalenessClass(task) {
     if (!task || !task.age) return "";
-    const age = task.status === "running"
+    const age = task.status === "in_progress"
       ? task.age.started_age_seconds
       : task.age.created_age_seconds;
     const tier = STALENESS[task.status];
@@ -2703,7 +2933,7 @@
     };
 
     const progress = t.progress;
-    const needsAssignee = t.status === "ready" && !t.assignee;
+    const needsAssignee = t.status === "staged" && !t.assignee;
 
     return h("div", {
       ref: cardRef,
@@ -2842,7 +3072,7 @@
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
-        triage: props.columnName === "triage",
+        initial_status: props.columnName,
       };
       if (parent) body.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
@@ -2887,7 +3117,7 @@
           if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); }
           if (e.key === "Escape") props.onCancel();
         },
-        placeholder: props.columnName === "triage"
+        placeholder: props.columnName === "backlog"
           ? tx(t, "triagePlaceholder", "Rough idea — AI will spec it…")
           : tx(t, "taskTitlePlaceholder", "New task title…"),
         autoFocus: true,
@@ -2898,11 +3128,11 @@
         h(Select, Object.assign({
           value: assignee,
           className: "h-7 text-xs flex-1",
-          title: props.columnName === "triage"
+          title: props.columnName === "backlog"
             ? "System user that will spec this task. Leave blank to keep the card unassigned for manual selection."
             : "System user to assign. Leave blank to keep the card unassigned for manual selection.",
         }, selectChangeHandler(setAssignee)),
-          h(SelectOption, { value: "" }, props.columnName === "triage"
+          h(SelectOption, { value: "" }, props.columnName === "backlog"
             ? tx(t, "specifier", "— specifier —")
             : tx(t, "assigneePlaceholder", "— assignee —")),
           (props.assignees || []).map(function (a) {
@@ -3013,11 +3243,21 @@
     // us whether this task is currently subscribed via that platform's home.
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
-    const boardSlug = props.boardSlug;
+    const [resolvedBoardSlug, setResolvedBoardSlug] = useState(function () { return props.boardSlug || null; });
+    const boardSlug = resolvedBoardSlug || props.boardSlug;
+
+    useEffect(function () {
+      if (props.boardSlug) setResolvedBoardSlug(props.boardSlug);
+    }, [props.boardSlug]);
 
     const load = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
-        .then(function (d) { setData(d); setErr(null); setPatchErr(null); })
+        .then(function (d) {
+          setData(d);
+          setErr(null);
+          setPatchErr(null);
+          if (!boardSlug && d && d.board_slug) setResolvedBoardSlug(d.board_slug);
+        })
         .catch(function (e) { setErr(String(e.message || e)); })
         .finally(function () { setLoading(false); });
     }, [props.taskId, boardSlug]);
@@ -3044,9 +3284,15 @@
     const handleComment = function () {
       const body = newComment.trim();
       if (!body) return;
+      // Attribute the comment to the logged-in dashboard user so it shows up
+      // as "deniz"/"arman" rather than the generic "dashboard". Identity rides
+      // the X-Rolly-User header (the dashboard's canonical identity channel).
+      const headers = { "Content-Type": "application/json" };
+      const ru = rollyUserSlug();
+      if (ru) headers["X-Rolly-User"] = ru;
       SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}/comments`, boardSlug), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ body }),
       }).then(function () {
         setNewComment("");
@@ -3595,7 +3841,7 @@
     const events = props.data.events || [];
     const attachments = props.data.attachments || [];
     const links = props.data.links || { parents: [], children: [] };
-    const [activePane, setActivePane] = useState("terminal");
+    const [activePane, setActivePane] = useState("details");
     const chip = function (label, value, title) {
       if (value == null || value === "") return null;
       return h("span", { className: "hermes-kanban-card-chip", title: title || `${label}: ${value}` },
@@ -3650,8 +3896,8 @@
           }))),
         h("div", { className: "hermes-kanban-card-nav-row" },
           h("div", { className: "hermes-kanban-workspace-tabs", role: "tablist" },
-            tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
             tab("details", tx(i18n, "details", "Details")),
+            tab("terminal", tx(i18n, "terminalCc", "Terminal / CC")),
           )),
       ),
       h("div", { style: { display: activePane === "terminal" ? "block" : "none" } },
@@ -4178,11 +4424,11 @@
       }, label);
     };
 
-    // "Specify" appears only when the task is in the Triage column — the
+    // "Specify" appears only when the task is in the Backlog column — the
     // one column where an auxiliary LLM pass is meaningful. Elsewhere
-    // the backend would return ok:false with "not in triage" anyway,
+    // the backend would return ok:false with "not in backlog" anyway,
     // so hiding the button keeps the action row uncluttered.
-    const specifyButton = (task.status === "triage" && props.onSpecify)
+    const specifyButton = (task.status === "backlog" && props.onSpecify)
       ? h(Button, {
           onClick: function () {
             if (specifyBusy) return;
@@ -4216,11 +4462,11 @@
       : null;
 
     // "Decompose" is the orchestrator-driven fan-out. Like Specify, only
-    // makes sense on triage-column tasks — elsewhere the backend short-
+    // makes sense on backlog-column tasks — elsewhere the backend short-
     // circuits with ok:false. When the orchestrator returns fanout:false
     // we render the same single-task message as Specify; when it fans
     // out we report the child count for quick at-a-glance verification.
-    const decomposeButton = (task.status === "triage" && props.onDecompose)
+    const decomposeButton = (task.status === "backlog" && props.onDecompose)
       ? h(Button, {
           onClick: function () {
             if (decomposeBusy) return;
@@ -4267,8 +4513,8 @@
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
         decomposeButton,
-        b("→ triage",  { status: "triage" },   task.status !== "triage", null, "hermes-kanban-lifecycle-ghost"),
-        b("→ ready",   { status: "ready" },    task.status !== "ready", null, "hermes-kanban-lifecycle-ghost"),
+        b("→ backlog", { status: "backlog" }, task.status !== "backlog", null, "hermes-kanban-lifecycle-ghost"),
+        b("→ staged",  { status: "staged" },  task.status !== "staged", null, "hermes-kanban-lifecycle-ghost"),
         b(tx(t, "complete", "Complete"),  { status: "done" },
           task.status !== "done" && task.status !== "archived",
           getDestructiveConfirm(t, "done"),

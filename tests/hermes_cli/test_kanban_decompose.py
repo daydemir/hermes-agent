@@ -105,9 +105,13 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         root = kb.get_task(conn, tid)
         c0 = kb.get_task(conn, outcome.child_ids[0])
         c1 = kb.get_task(conn, outcome.child_ids[1])
-    assert root.status == "todo"
-    assert c0.status == "ready"
-    assert c1.status == "todo"
+    assert root.status == "backlog"
+    # c0 has no internal parents → a parent-free backlog card, which is never
+    # auto-promoted by recompute_ready (a deliberate human jot stays put). c1
+    # has parents=[0] so it is gated in backlog until c0 completes. Both land
+    # and stay in 'backlog'.
+    assert c0.status == "backlog"
+    assert c1.status == "backlog"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
 
@@ -142,8 +146,10 @@ def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
     assert task is not None
-    # specify path with no parents -> recompute_ready flips to 'ready'
-    assert task.status == "ready"
+    # specify path with no parents -> the card is re-stamped in backlog and
+    # STAYS there. A parent-free backlog card is a deliberate human jot and is
+    # never auto-promoted by recompute_ready.
+    assert task.status == "backlog"
     assert task.title == "Tightened title"
     assert task.assignee == "fallback"
 
@@ -312,7 +318,8 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x")  # ready, not triage
+        # Not in the backlog column — decompose only operates on backlog.
+        tid = kb.create_task(conn, title="x", initial_status="staged")
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:

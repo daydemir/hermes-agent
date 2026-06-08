@@ -49,9 +49,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -130,6 +130,51 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+def _resolve_task_board(task_id: str, board: Optional[str]) -> str:
+    """Resolve *task_id* to a board slug.
+
+    A pinned board is honoured only if the task actually lives there — the
+    dashboard drawer deep-link always sends the globally-selected board
+    (e.g. ?board=default/rolly), not the card's real board, so trusting it
+    blindly 404s any card that lives in another board. When the pinned board
+    doesn't contain the task (or no board is pinned) we search every known
+    board so canonical card URLs open regardless of which board the task is on.
+    """
+    normed = _resolve_board(board)
+    if normed is not None:
+        # Fast path: the pinned board actually holds the task -> use it (no scan).
+        conn = _conn(board=normed)
+        try:
+            if kanban_db.get_task(conn, task_id) is not None:
+                return normed
+        finally:
+            conn.close()
+        # Pinned board lacks the task -> fall through to the cross-board search.
+
+    matches: list[str] = []
+    for meta in kanban_db.list_boards(include_archived=True):
+        slug = str(meta.get("slug") or "").strip()
+        if not slug:
+            continue
+        conn = _conn(board=slug)
+        try:
+            if kanban_db.get_task(conn, task_id) is not None:
+                matches.append(slug)
+                if len(matches) > 1:
+                    break
+        finally:
+            conn.close()
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task {task_id} is ambiguous across boards: {', '.join(matches)}",
+        )
+    return matches[0]
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -137,9 +182,10 @@ def _conn(board: Optional[str] = None):
 # Columns shown by the dashboard, in left-to-right order. "archived" is
 # available via a filter toggle rather than a visible column.
 #
-# Rolly's dashboard card schema is deliberately simple: triage -> ready -> done.
-# Legacy/unknown statuses are shown as triage instead of preserving extra lanes.
-BOARD_COLUMNS: list[str] = ["triage", "ready", "done"]
+# The board lanes are backlog -> staged -> in_progress -> done.
+# Unknown statuses fold to backlog instead of preserving extra lanes.
+# Derived from kanban_db.VISIBLE_COLUMNS — the single source of truth.
+BOARD_COLUMNS: list[str] = list(kanban_db.VISIBLE_COLUMNS)
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -423,9 +469,10 @@ def get_board(
             current_step_key=current_step_key,
         )
         if not include_archived:
-            # Completed cards leave the active board/list automatically.
-            # They are still retrievable from the completed/history view.
-            tasks = [t for t in tasks if t.status not in {"done", "archived"}]
+            # Only archived cards leave the active board/list. Done cards stay
+            # so the Done column populates; archived is retrievable via the
+            # include_archived filter / history view.
+            tasks = [t for t in tasks if t.status != "archived"]
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -495,7 +542,7 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "triage"
+            col = t.status if t.status in columns else "backlog"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -557,7 +604,7 @@ def get_task(
         None, description="With run_state_type: exact value for that run column",
     ),
 ):
-    board = _resolve_board(board)
+    board = _resolve_task_board(task_id, board)
     conn = _conn(board=board)
     try:
         if (run_state_type is None) ^ (run_state_name is None):
@@ -587,6 +634,7 @@ def get_task(
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
             "task": task_d,
+            "board_slug": board,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
             "attachments": [_attachment_dict(a) for a in kanban_db.list_attachments(conn, task_id)],
@@ -652,7 +700,7 @@ def _build_rolly_chat_prompt(task_id: str, title: str | None, board: str | None 
 @router.get("/tasks/{task_id}/claude-context")
 def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
     """Return a copy-paste Claude Code launch prompt for a card workspace."""
-    board = _resolve_board(board)
+    board = _resolve_task_board(task_id, board)
     try:
         card_context = build_card_context(task_id, board=board)
         launch = build_claude_card_launch(task_id, board=board)
@@ -679,6 +727,50 @@ def get_task_claude_context(task_id: str, board: Optional[str] = Query(None)):
         # attaches to the single-window session directly.
         "terminal_target": session_name,
     }
+
+
+class PromptTemplateBody(BaseModel):
+    template: str
+
+
+def _cc_prompt_kind(board_slug: Optional[str]) -> str:
+    """The In-Progress "Copy CC prompt" template is one of two: the Rolly Code
+    board (slug ``rolly``) uses the ``rolly`` template; every other board uses
+    ``mix``."""
+    return "rolly" if (board_slug or "").strip() == "rolly" else "mix"
+
+
+def _cc_prompt_path(kind: str) -> Path:
+    return kanban_db.kanban_home() / "kanban" / "prompts" / f"{kind}-in-progress.md"
+
+
+@router.get("/in-progress-prompt-template")
+def get_in_progress_prompt_template(board: Optional[str] = Query(None)):
+    """Return the saved In-Progress prompt template for this board's kind, or
+    ``template: null`` when nothing is saved (the UI then uses its built-in
+    default)."""
+    kind = _cc_prompt_kind(board)
+    path = _cc_prompt_path(kind)
+    template: Optional[str] = None
+    if path.exists():
+        try:
+            template = path.read_text(encoding="utf-8")
+        except OSError:
+            template = None
+    return {"kind": kind, "template": template}
+
+
+@router.put("/in-progress-prompt-template")
+def put_in_progress_prompt_template(
+    body: PromptTemplateBody, board: Optional[str] = Query(None)
+):
+    """Persist the In-Progress prompt template for this board's kind to disk so
+    it survives reloads and is shared across browsers/users."""
+    kind = _cc_prompt_kind(board)
+    path = _cc_prompt_path(kind)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body.template, encoding="utf-8")
+    return {"ok": True, "kind": kind, "path": str(path)}
 
 
 @router.post("/tasks/{task_id}/tmux-session")
@@ -767,17 +859,45 @@ class CreateTaskBody(BaseModel):
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
+    # NOTE: ``triage`` predates ``initial_status`` and forwards to
+    # create_task(triage=...) (parks in backlog). It now conflicts with the
+    # ``initial_status`` default below — quick-add should drop ``triage`` and
+    # use ``initial_status`` instead; deferred as a follow-up card.
     triage: bool = False
+    # Lane a brand-new card lands in. Restricted to the visible board columns
+    # (fail-fast: 'archived'/anything else is rejected 400). Defaults to the
+    # backlog park; the CLI eager-start path uses a different default.
+    initial_status: str = kanban_db.DEFAULT_CREATE_INITIAL_STATUS
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
 
+    @field_validator("initial_status")
+    @classmethod
+    def _validate_initial_status(cls, v: str) -> str:
+        if v not in kanban_db.VISIBLE_COLUMNS:
+            raise ValueError(
+                f"initial_status must be one of "
+                f"{list(kanban_db.VISIBLE_COLUMNS)}, got {v!r}"
+            )
+        return v
+
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    # Fail-fast: only the visible board columns are valid landing lanes.
+    # (The model validator also enforces this; this backstops direct callers.)
+    if payload.initial_status not in kanban_db.VISIBLE_COLUMNS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"initial_status must be one of "
+                f"{list(kanban_db.VISIBLE_COLUMNS)}, got {payload.initial_status!r}"
+            ),
+        )
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(
@@ -792,6 +912,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             priority=payload.priority,
             parents=payload.parents,
             triage=payload.triage,
+            initial_status=payload.initial_status,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
@@ -801,11 +922,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
-        # banner when a `ready` task would otherwise sit idle because no
-        # gateway is running (or dispatch_in_gateway=false). Only emit
-        # for ready+assigned tasks; triage/todo are expected to wait,
-        # and unassigned tasks can't be dispatched regardless.
-        if task and task.status == "ready" and task.assignee:
+        # banner when a dispatch-eligible task would otherwise sit idle
+        # because no gateway is running (or dispatch_in_gateway=false). Only
+        # emit for dispatch-eligible+assigned tasks; backlog cards are expected
+        # to wait, and unassigned tasks can't be dispatched regardless.
+        if task and task.status == kanban_db.DISPATCH_ELIGIBLE_STATUS and task.assignee:
             try:
                 from hermes_cli.kanban import _check_dispatcher_presence
                 running, message = _check_dispatcher_presence()
@@ -981,6 +1102,47 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 
 # ---------------------------------------------------------------------------
+# Shared status-change dispatch (PATCH + bulk)
+# ---------------------------------------------------------------------------
+
+# Statuses written via the direct drag-drop path. ``done`` owns its own verb
+# (complete_task); ``archived`` is handled by archive_task / payload.archive at
+# the call sites. Derived from VISIBLE_COLUMNS so the lane set stays DRY.
+_DIRECT_STATUSES: frozenset[str] = frozenset(kanban_db.VISIBLE_COLUMNS) - {"done"}
+
+
+def _dispatch_status_change(
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Route a canonical board-status change to its underlying verb.
+
+    ``done`` -> complete_task (with structured handoff fields); the remaining
+    visible lanes (``backlog``/``staged``/``in_progress``) -> _set_status_direct.
+    ``archived`` is intentionally NOT handled here — PATCH calls archive_task
+    and bulk uses ``payload.archive``. Raises ``ValueError`` for any other
+    (non-canonical / unknown) status so callers fail fast with a 400.
+
+    Returns the underlying operation's ok bool.
+    """
+    if new_status == "done":
+        return kanban_db.complete_task(
+            conn, task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    if new_status in _DIRECT_STATUSES:
+        return _set_status_direct(conn, task_id, new_status)
+    raise ValueError(f"unknown status: {new_status}")
+
+
+# ---------------------------------------------------------------------------
 # PATCH /tasks/:id  (status / assignee / priority / title / body)
 # ---------------------------------------------------------------------------
 
@@ -1022,42 +1184,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
-            ok = True
-            if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
-            elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
-            elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-            elif s == "ready":
-                # Re-open a blocked/scheduled task, or just an explicit status set.
-                current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
-                else:
-                    # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
-            elif s == "archived":
+            if s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-                )
-            elif s in ("todo", "triage", "scheduled"):
-                ok = _set_status_direct(conn, task_id, s)
             else:
-                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+                try:
+                    ok = _dispatch_status_change(
+                        conn, task_id, s,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e))
             if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
+                # For ``staged``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
-                if s == "ready":
+                if s == "staged":
                     blockers = _parents_blocking_ready(conn, task_id)
                     if blockers:
                         names = ", ".join(
@@ -1067,7 +1210,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         raise HTTPException(
                             status_code=409,
                             detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
+                                f"Cannot move to 'staged': blocked by parent(s) "
                                 f"not done — {names}"
                             ),
                         )
@@ -1162,13 +1305,13 @@ def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
+    structured complete/block/unblock/archive verbs (e.g. backlog<->staged,
+    in_progress<->staged). Appends a ``status`` event row for the live feed.
 
-    When this transitions OFF ``running`` to anything other than the
+    When this transitions OFF ``in_progress`` to anything other than the
     terminal verbs above (which own their own run closing), we close the
     active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
+    orphaned. ``in_progress -> staged`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
     with kanban_db.write_txn(conn):
@@ -1180,10 +1323,10 @@ def _set_status_direct(
         if prev is None:
             return False
 
-        # Guard: don't allow promoting to 'ready' unless all parents are done.
+        # Guard: don't allow promoting to 'staged' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
         # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
-        if new_status == "ready":
+        if new_status == "staged":
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -1195,7 +1338,7 @@ def _set_status_direct(
             ):
                 return False
 
-        was_running = prev["status"] == "running"
+        was_running = prev["status"] == "in_progress"
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
             and new_status not in {"done", "archived"}
@@ -1203,16 +1346,16 @@ def _set_status_direct(
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+            "  claim_lock = CASE WHEN ? = 'in_progress' THEN claim_lock ELSE NULL END, "
+            "  claim_expires = CASE WHEN ? = 'in_progress' THEN claim_expires ELSE NULL END, "
+            "  worker_pid = CASE WHEN ? = 'in_progress' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
             (new_status, new_status, new_status, new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
         run_id = None
-        if was_running and new_status != "running" and prev["current_run_id"]:
+        if was_running and new_status != "in_progress" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
                 conn, task_id,
                 outcome="reclaimed", status="reclaimed",
@@ -1225,17 +1368,17 @@ def _set_status_direct(
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
+            # was sitting in staged solely because that parent used to satisfy
             # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
+            # dashboard does not keep advertising stale-staged work.
             for row in conn.execute(
                 "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
                 (task_id,),
             ).fetchall():
                 child_id = row["child_id"]
                 demoted = conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
+                    "UPDATE tasks SET status = 'backlog' "
+                    "WHERE id = ? AND status = 'staged'",
                     (child_id,),
                 )
                 if demoted.rowcount == 1:
@@ -1246,7 +1389,7 @@ def _set_status_direct(
                             child_id,
                             json.dumps(
                                 {
-                                    "status": "todo",
+                                    "status": "backlog",
                                     "reason": "parent_reopened",
                                     "parent": task_id,
                                 }
@@ -1255,7 +1398,7 @@ def _set_status_direct(
                         ),
                     )
     # If we re-opened something, children may have gone stale.
-    if new_status in {"done", "ready"}:
+    if new_status in {"done", "staged"}:
         kanban_db.recompute_ready(conn)
     return True
 
@@ -1264,13 +1407,28 @@ def _set_status_direct(
 # Comments
 # ---------------------------------------------------------------------------
 
+def _author_from(header_user: Optional[str], body_author: Optional[str]) -> str:
+    """Resolve a human author for a dashboard write: the logged-in user
+    (``X-Rolly-User`` header) wins, then an explicit body author, then the
+    "dashboard" fallback. Blank values are ignored."""
+    for candidate in (header_user, body_author):
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return "dashboard"
+
+
 class CommentBody(BaseModel):
     body: str
-    author: Optional[str] = "dashboard"
+    author: Optional[str] = None
 
 
 @router.post("/tasks/{task_id}/comments")
-def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query(None)):
+def add_comment(
+    task_id: str,
+    payload: CommentBody,
+    board: Optional[str] = Query(None),
+    x_rolly_user: Optional[str] = Header(None),
+):
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body is required")
     board = _resolve_board(board)
@@ -1278,9 +1436,12 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        kanban_db.add_comment(
-            conn, task_id, author=payload.author or "dashboard", body=payload.body,
-        )
+        # Attribute the comment to the logged-in dashboard user. The identity
+        # rides the ``X-Rolly-User`` header (the dashboard's canonical identity
+        # channel); an explicit body author overrides; "dashboard" is the
+        # last-resort fallback when neither is present.
+        author = _author_from(x_rolly_user, payload.author)
+        kanban_db.add_comment(conn, task_id, author=author, body=payload.body)
         return {"ok": True}
     finally:
         conn.close()
@@ -1366,36 +1527,14 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
-                    if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
+                    try:
+                        ok = _dispatch_status_change(
+                            conn, tid, s,
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
                         )
-                    elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
-                    elif s == "ready":
-                        cur = kanban_db.get_task(conn, tid)
-                        if cur and cur.status in ("blocked", "scheduled"):
-                            ok = kanban_db.unblock_task(conn, tid)
-                        else:
-                            ok = _set_status_direct(conn, tid, "ready")
-                    elif s == "running":
-                        entry.update(
-                            ok=False,
-                            error=(
-                                "Cannot set status to 'running' directly; "
-                                "use the dispatcher/claim path"
-                            ),
-                        )
-                        results.append(entry)
-                        continue
-                    elif s == "scheduled":
-                        ok = kanban_db.schedule_task(conn, tid)
-                    elif s in {"todo", "triage"}:
-                        ok = _set_status_direct(conn, tid, s)
-                    else:
+                    except ValueError:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)
                         continue
@@ -1434,6 +1573,39 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         return {"results": results}
     finally:
         conn.close()
+
+
+class MoveToBoardBody(BaseModel):
+    task_ids: list[str]
+    target_board: str
+
+
+@router.post("/tasks/move-to-board")
+def move_tasks_to_board(payload: MoveToBoardBody, board: Optional[str] = Query(None)):
+    """Move each task in ``payload.task_ids`` to ``payload.target_board``.
+
+    Boards are independent SQLite DBs, so this is a real cross-DB row move
+    (carrying tasks/comments/events/acceptance-criteria, dropping the
+    board-local links/runs/attachments/notify-subs) — not a status change.
+
+    ``board`` (query param) pins the SOURCE board. Iteration is
+    independent: a per-id failure (id not found, target missing,
+    id collision, target == source) is recorded in ``failed`` rather than
+    aborting the batch. Always returns 200 with a per-id summary.
+    """
+    ids = [i for i in (payload.task_ids or []) if i]
+    if not ids:
+        raise HTTPException(status_code=400, detail="task_ids is required")
+    src = _resolve_board(board)
+    moved: list[str] = []
+    failed: list[dict] = []
+    for tid in ids:
+        try:
+            kanban_db.move_task_to_board(tid, payload.target_board, board=src)
+            moved.append(tid)
+        except Exception as exc:  # per-id error must not kill the batch
+            failed.append({"id": tid, "error": str(exc)})
+    return {"moved": moved, "failed": failed}
 
 
 # ---------------------------------------------------------------------------
@@ -1537,7 +1709,7 @@ def list_active_workers(
     """Return every currently-running worker on the board.
 
     A worker is a ``task_runs`` row whose ``ended_at`` is NULL and whose
-    ``worker_pid`` is non-NULL, belonging to a task with ``status='running'``.
+    ``worker_pid`` is non-NULL, belonging to a task with ``status='in_progress'``.
 
     Returns ``{workers: [...], count: N, checked_at: <epoch>}``.  Each
     worker entry carries enough context for the dashboard to link back to
@@ -1565,7 +1737,7 @@ def list_active_workers(
             JOIN tasks t ON t.id = r.task_id
             WHERE r.ended_at IS NULL
               AND r.worker_pid IS NOT NULL
-              AND t.status = 'running'
+              AND t.status = 'in_progress'
             ORDER BY r.started_at ASC
             """,
         ).fetchall()
@@ -1974,7 +2146,7 @@ def get_home_channels(
     homes = _configured_home_channels()
     subscribed_homes: set[tuple[str, str, str]] = set()
     if task_id:
-        board = _resolve_board(board)
+        board = _resolve_task_board(task_id, board)
         conn = _conn(board=board)
         try:
             subs = kanban_db.list_notify_subs(conn, task_id)
@@ -2010,7 +2182,7 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
                    f"Set one from the messenger via /sethome, or configure "
                    f"gateway.platforms.{platform}.home_channel in config.yaml.",
         )
-    board = _resolve_board(board)
+    board = _resolve_task_board(task_id, board)
     conn = _conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -2039,7 +2211,7 @@ def unsubscribe_home(task_id: str, platform: str, board: Optional[str] = Query(N
             status_code=404,
             detail=f"No home channel configured for platform {platform!r}.",
         )
-    board = _resolve_board(board)
+    board = _resolve_task_board(task_id, board)
     conn = _conn(board=board)
     try:
         kanban_db.remove_notify_sub(
@@ -2198,17 +2370,18 @@ def _board_counts(slug: str) -> dict[str, int]:
 def list_boards(include_archived: bool = Query(False)):
     """Return the dashboard-visible boards with task counts and the active slug.
 
-    The dashboard is intentionally rolly-only now: the legacy ``default``
-    board may still exist for back-compat / direct API access, but it should
-    not appear as a selectable option in the UI.
+    All real boards (rolly, mix, …) are selectable in the UI. Only the legacy
+    back-compat ``default`` board is hidden — it may still exist for direct API
+    access but should not appear as a selectable option.
     """
     boards = kanban_db.list_boards(include_archived=include_archived)
-    rolly_only = [b for b in boards if b["slug"] == "rolly"]
-    if rolly_only:
-        boards = rolly_only
-        current = "rolly"
-    else:
-        current = kanban_db.get_current_board()
+    visible = [b for b in boards if b["slug"] != "default"]
+    if visible:
+        boards = visible
+    current = kanban_db.get_current_board()
+    slugs = {b["slug"] for b in boards}
+    if current not in slugs:
+        current = "rolly" if "rolly" in slugs else (boards[0]["slug"] if boards else current)
     for b in boards:
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])

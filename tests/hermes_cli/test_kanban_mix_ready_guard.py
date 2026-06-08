@@ -82,7 +82,7 @@ def test_promote_refuses_mix_card_missing_ready_fields(conn):
         triage=True,
     )
     assert kb.specify_triage_task(conn, tid)
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
 
     ok, err = kb.promote_task(conn, tid, actor="tester")
 
@@ -91,19 +91,29 @@ def test_promote_refuses_mix_card_missing_ready_fields(conn):
     assert "missing verification" in message
     assert "missing source/provenance" in message
     assert "missing human approval" in message
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
 
 
 def test_promote_allows_complete_human_approved_mix_card(conn):
+    # A parent-free backlog card is never auto-promoted, so to exercise the
+    # ready guard's ALLOW path we make the card eligible for promotion: give it
+    # a (non-mix) parent and complete the parent. recompute_ready then evaluates
+    # the dependency-unlocked card; the guard allows it (complete acceptance +
+    # verification + provenance + human approval) and it lands in 'staged'.
+    parent = kb.create_task(conn, title="upstream work")
     tid = kb.create_task(
         conn,
         title="MIX lead outreach",
         body=COMPLETE_MIX_BODY,
         tenant="mix",
         triage=True,
+        parents=[parent],
     )
-    assert kb.specify_triage_task(conn, tid)
-    assert _status(conn, tid) == "ready"
+    assert _status(conn, tid) == "backlog"
+
+    assert kb.complete_task(conn, parent, result="done")
+
+    assert _status(conn, tid) == "staged"
 
 
 def test_recompute_ready_keeps_incomplete_mix_card_in_todo(conn):
@@ -116,21 +126,33 @@ def test_recompute_ready_keeps_incomplete_mix_card_in_todo(conn):
     )
 
     assert kb.specify_triage_task(conn, tid)
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
     assert kb.recompute_ready(conn) == 0
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
 
 
 def test_recompute_ready_suppresses_duplicate_unchanged_ready_guard_events(conn):
+    # A parent-free backlog card is never evaluated by the ready guard during
+    # recompute_ready (it is never a promotion candidate). To exercise the
+    # guard's duplicate-suppression we make the card a promotion candidate:
+    # give it a (non-mix) parent and complete the parent. recompute_ready then
+    # evaluates the dependency-unlocked card, the guard blocks it (incomplete
+    # body), and emits exactly ONE ready_guard_blocked event no matter how many
+    # times we recompute while the reason is unchanged.
+    parent = kb.create_task(conn, title="upstream work")
     tid = kb.create_task(
         conn,
         title="MIX passive ready review",
         body=INCOMPLETE_MIX_BODY,
         tenant="mix",
         triage=True,
+        parents=[parent],
     )
 
-    assert kb.specify_triage_task(conn, tid)
+    # Completing the parent runs recompute_ready once (first guard event).
+    assert kb.complete_task(conn, parent, result="done")
+    assert _status(conn, tid) == "backlog"
+    # Further recompute passes block again but suppress the duplicate event.
     assert kb.recompute_ready(conn) == 0
     assert kb.recompute_ready(conn) == 0
 
@@ -169,12 +191,12 @@ def test_claim_demotes_direct_sql_ready_mix_card_missing_approval(conn):
         tenant="mix",
         triage=True,
     )
-    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    conn.execute("UPDATE tasks SET status='staged' WHERE id=?", (tid,))
 
     claimed = kb.claim_task(conn, tid, claimer="test:1")
 
     assert claimed is None
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
     event = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claim_rejected' ORDER BY id DESC LIMIT 1",
         (tid,),
@@ -194,7 +216,7 @@ def test_generic_approval_placeholders_do_not_satisfy_ready_gate(conn, placehold
     )
 
     assert kb.specify_triage_task(conn, tid)
-    assert _status(conn, tid) == "todo"
+    assert _status(conn, tid) == "backlog"
     ok, err = kb.promote_task(conn, tid, actor="tester")
 
     assert ok is False
@@ -202,12 +224,20 @@ def test_generic_approval_placeholders_do_not_satisfy_ready_gate(conn, placehold
 
 
 def test_non_mix_card_ready_flow_is_unchanged(conn):
+    # A non-mix card is not subject to the ready guard. To exercise the normal
+    # dependency-unlock promotion (the guard must NOT interfere) we make it a
+    # promotion candidate: give it a parent and complete the parent. The card
+    # then promotes straight to 'staged' — no guard block.
+    parent = kb.create_task(conn, title="upstream work")
     tid = kb.create_task(
         conn,
         title="Generic lead outreach",
         body="Acceptance:\n- exists",
         triage=True,
+        parents=[parent],
     )
+    assert _status(conn, tid) == "backlog"
 
-    assert kb.specify_triage_task(conn, tid)
-    assert _status(conn, tid) == "ready"
+    assert kb.complete_task(conn, parent, result="done")
+
+    assert _status(conn, tid) == "staged"

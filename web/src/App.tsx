@@ -99,7 +99,7 @@ import {
 } from "@/lib/rollyIdentity";
 
 function RootRedirect() {
-  return <Navigate to="/sessions" replace />;
+  return <Navigate to="/kanban" replace />;
 }
 
 function RollyIdentityGate({ currentUser, onSelect }: { currentUser: string; onSelect: (slug: string) => void }) {

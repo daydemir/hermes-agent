@@ -70,7 +70,7 @@ def test_board_empty(client):
     data = r.json()
     # Rolly's dashboard schema is intentionally simple.
     names = [c["name"] for c in data["columns"]]
-    assert names == ["triage", "ready", "done"]
+    assert names == ["backlog", "staged", "in_progress", "done"]
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
@@ -80,6 +80,43 @@ def test_board_empty(client):
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
+
+
+def test_comment_author_is_logged_in_user(client):
+    """A dashboard comment is attributed to the logged-in user (X-Rolly-User
+    header), an explicit body author overrides, and "dashboard" is the
+    last-resort fallback when neither is supplied."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "talk to me"})
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+
+    # Logged-in user → attributed to that user, not "dashboard".
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/comments",
+        json={"body": "from deniz"},
+        headers={"X-Rolly-User": "deniz"},
+    )
+    assert r.status_code == 200, r.text
+
+    # No identity at all → falls back to "dashboard".
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/comments",
+        json={"body": "anonymous"},
+    )
+    assert r.status_code == 200, r.text
+
+    # Explicit body author with no header → uses the body author.
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/comments",
+        json={"body": "by arman", "author": "arman"},
+    )
+    assert r.status_code == 200, r.text
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()
+    by_body = {c["body"]: c["author"] for c in detail["comments"]}
+    assert by_body["from deniz"] == "deniz"
+    assert by_body["anonymous"] == "dashboard"
+    assert by_body["by arman"] == "arman"
 
 
 def test_create_task_appears_on_board(client):
@@ -96,18 +133,18 @@ def test_create_task_appears_on_board(client):
     task = r.json()["task"]
     assert task["title"] == "Research LLM caching"
     assert task["assignee"] == "researcher"
-    assert task["status"] == "ready"  # no parents -> immediately ready
+    assert task["status"] == "backlog"  # every create defaults to the backlog jot
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
     task_id = task["id"]
 
-    # Board now lists it under 'ready'.
+    # Board now lists it under 'backlog'.
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    ready = next(c for c in data["columns"] if c["name"] == "ready")
-    assert len(ready["tasks"]) == 1
-    assert ready["tasks"][0]["id"] == task_id
+    backlog = next(c for c in data["columns"] if c["name"] == "backlog")
+    assert len(backlog["tasks"]) == 1
+    assert backlog["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
 
@@ -137,7 +174,9 @@ def test_board_assignees_include_rolly_user_registry(client, kanban_home):
     assert data["users"] == ["deniz", "arman"]
 
 
-def test_completed_tasks_hidden_by_default_but_available_in_history(client):
+def test_completed_tasks_shown_in_done_column_archived_hidden(client):
+    """Done cards populate the Done column on the default board; only
+    archived cards leave the active board (retrievable via history)."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "finish me", "priority": 4})
     assert r.status_code == 200, r.text
     task_id = r.json()["task"]["id"]
@@ -148,13 +187,15 @@ def test_completed_tasks_hidden_by_default_but_available_in_history(client):
     )
     assert r.status_code == 200, r.text
 
+    # Done cards stay on the default board so the Done column populates.
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    assert task_id not in {
-        t["id"] for col in data["columns"] for t in col["tasks"]
-    }
+    done = next(c for c in data["columns"] if c["name"] == "done")
+    assert [t["id"] for t in done["tasks"]] == [task_id]
+    assert done["tasks"][0]["completed_at"] is not None
 
+    # History view (include_archived) also shows the done card.
     r = client.get("/api/plugins/kanban/board?include_archived=true")
     assert r.status_code == 200
     data = r.json()
@@ -426,23 +467,31 @@ def test_dashboard_has_simple_columns_and_priority_list_route():
     js = bundle.read_text()
     css = style.read_text()
 
-    assert 'const COLUMN_ORDER = ["triage", "ready", "done"]' in js
+    assert 'const COLUMN_ORDER = ["backlog", "staged", "in_progress", "done"]' in js
     assert "function PriorityList" in js
-    assert 'path === "/kanban" || path === "/kanban/list" || path === "/kanban/priority"' in js
-    assert 'href: "/kanban/board"' in js
-    assert 'href: "/kanban"' in js
+    # Board is the default view: "/kanban" renders the board, and only the
+    # explicit list/priority paths render the priority list.
+    assert 'path === "/kanban/list" || path === "/kanban/priority"' in js
+    assert 'href: "/kanban"' in js  # Board tab
+    assert 'href: "/kanban/list"' in js  # Priority-list tab
     assert 'task.status !== "done" && task.status !== "archived"' in js
     assert "h(OrchestrationPanel, null)" not in js
     assert 'tx(t, "nudgeDispatcher", "Nudge dispatcher")' not in js
-    assert "Ready cards are prepared for manual execution" in js
+    assert "Staged cards are prepared for manual execution" in js
     assert "assign a profile when you are ready to run this manually" in js
     assert "Higher-priority cards appear earlier in the priority list" in js
     assert 'className: "hermes-kanban-priority-list"' in js
     assert ".hermes-kanban-priority-list" in css
 
 
-def test_legacy_statuses_bucket_into_triage(client):
-    """The dashboard hard-cuts old workflow states into the simple card schema."""
+def test_legacy_statuses_migrate_into_canonical_columns(client):
+    """The hard-cut migrates old workflow states into the simple card schema.
+
+    ``STATUS_MIGRATION`` collapses legacy statuses to the four canonical
+    columns: triage/todo -> backlog, scheduled/ready -> staged,
+    running/review -> in_progress. A row stamped with a legacy status is
+    re-stamped to its canonical lane on the next board read.
+    """
 
     task = client.post(
         "/api/plugins/kanban/tasks",
@@ -462,8 +511,9 @@ def test_legacy_statuses_bucket_into_triage(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
-    assert list(columns) == ["triage", "ready", "done"]
-    assert any(t["id"] == task["id"] for t in columns["triage"])
+    assert list(columns) == ["backlog", "staged", "in_progress", "done"]
+    # scheduled -> staged per STATUS_MIGRATION.
+    assert any(t["id"] == task["id"] for t in columns["staged"])
 
 
 def test_complete_triage_card_via_patch(client):
@@ -483,7 +533,7 @@ def test_complete_triage_card_via_patch(client):
     try:
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status = 'triage' WHERE id = ?", (task["id"],),
+                "UPDATE tasks SET status = 'backlog' WHERE id = ?", (task["id"],),
             )
     finally:
         conn.close()
@@ -571,6 +621,19 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
 
 
+def test_dashboard_board_header_count_excludes_completed_tasks():
+    """The top board header should count only non-completed tasks."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "activeCountFrom(b.counts)" in js
+    assert "currentActiveTotal" in js
+    assert 'status === "done" || status === "archived" ? 0 : count' in js
+    assert "current.total" not in js
+
+
 def test_dashboard_card_assignment_uses_system_user_dropdown():
     """Card assignment controls should pick system users from a dropdown."""
 
@@ -654,7 +717,7 @@ def test_task_detail_includes_links_and_events(client):
         "/api/plugins/kanban/tasks",
         json={"title": "child", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"  # parent not done yet
+    assert child["status"] == "backlog"  # parent not done yet
 
     # Detail for the child shows the parent link.
     r = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
@@ -676,6 +739,25 @@ def test_task_detail_404_on_unknown(client):
     assert r.status_code == 404
 
 
+def test_task_detail_without_board_param_can_find_other_board(client):
+    kb.create_board("other")
+    other_conn = kb.connect(board="other")
+    try:
+        task_id = kb.create_task(other_conn, title="other-board-task")
+    finally:
+        other_conn.close()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["task"]["id"] == task_id
+    assert data["board_slug"] == "other"
+
+    ctx = client.get(f"/api/plugins/kanban/tasks/{task_id}/claude-context")
+    assert ctx.status_code == 200, ctx.text
+    assert ctx.json()["task_id"] == task_id
+
+
 # ---------------------------------------------------------------------------
 # PATCH /tasks/:id — status transitions
 # ---------------------------------------------------------------------------
@@ -690,12 +772,13 @@ def test_patch_status_complete(client):
     assert r.status_code == 200
     assert r.json()["task"]["status"] == "done"
 
-    # Completed cards leave the active board automatically, but remain in history.
+    # Done cards stay in the Done column on the default board (only archived
+    # cards leave); they are also present in the include_archived history view.
     default_done = next(
         c for c in client.get("/api/plugins/kanban/board").json()["columns"]
         if c["name"] == "done"
     )
-    assert not any(x["id"] == t["id"] for x in default_done["tasks"])
+    assert any(x["id"] == t["id"] for x in default_done["tasks"])
     history_done = next(
         c for c in client.get("/api/plugins/kanban/board?include_archived=true").json()["columns"]
         if c["name"] == "done"
@@ -703,48 +786,55 @@ def test_patch_status_complete(client):
     assert any(x["id"] == t["id"] for x in history_done["tasks"])
 
 
-def test_patch_block_then_unblock(client):
+def test_patch_status_backlog_then_staged(client):
+    """Canonical drag-drop moves: a card created in backlog can be pushed to
+    staged via a direct status PATCH, and back. The legacy ``blocked`` status
+    string is no longer a valid PATCH value (it 400s — see
+    test_patch_invalid_status / test_patch_blocked_status_rejected)."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    r = client.patch(
-        f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "blocked", "block_reason": "need input"},
-    )
-    assert r.status_code == 200
-    assert r.json()["task"]["status"] == "blocked"
+    assert t["status"] == "backlog"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "ready"},
+        json={"status": "staged"},
     )
     assert r.status_code == 200
-    assert r.json()["task"]["status"] == "ready"
+    assert r.json()["task"]["status"] == "staged"
+
+    # Push it back to backlog (the new "park" path; block_task also lands here
+    # but is driven by its own verb, not a status string).
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "backlog"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "backlog"
 
 
-def test_patch_schedule_then_unblock(client):
+def test_patch_legacy_status_strings_rejected(client):
+    """Legacy workflow status strings (``blocked``, ``scheduled``) no longer
+    exist as PATCH inputs after the hard cut — they 400 like any other
+    unknown status. The canonical columns are backlog/staged/in_progress/done.
+    """
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    r = client.patch(
-        f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "scheduled", "block_reason": "run tomorrow"},
-    )
-    assert r.status_code == 200
-    assert r.json()["task"]["status"] == "scheduled"
+    for legacy in ("blocked", "scheduled"):
+        r = client.patch(
+            f"/api/plugins/kanban/tasks/{t['id']}",
+            json={"status": legacy},
+        )
+        assert r.status_code == 400, (legacy, r.text)
+        assert legacy in r.json()["detail"]
 
+    # The card never moved — still in its created backlog lane.
     columns = client.get("/api/plugins/kanban/board").json()["columns"]
-    assert [c["name"] for c in columns] == ["triage", "ready", "done"]
-    triage = next(c for c in columns if c["name"] == "triage")
-    assert any(x["id"] == t["id"] for x in triage["tasks"])
-
-    r = client.patch(
-        f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "ready"},
-    )
-    assert r.status_code == 200
-    assert r.json()["task"]["status"] == "ready"
+    assert [c["name"] for c in columns] == ["backlog", "staged", "in_progress", "done"]
+    backlog = next(c for c in columns if c["name"] == "backlog")
+    assert any(x["id"] == t["id"] for x in backlog["tasks"])
 
 
 def test_patch_drag_drop_move_todo_to_ready(client):
     """Direct status write: the drag-drop path for statuses without a
-    dedicated verb (e.g. manually promoting todo -> ready).
+    dedicated verb (e.g. manually promoting backlog -> staged).
 
     Promoting a child whose parent is not done is rejected (409).
     Promoting a child whose parent IS done is accepted (200)."""
@@ -753,19 +843,19 @@ def test_patch_drag_drop_move_todo_to_ready(client):
         "/api/plugins/kanban/tasks",
         json={"title": "c", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"
+    assert child["status"] == "backlog"
 
     # Rejected: parent not done yet.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{child['id']}",
-        json={"status": "ready"},
+        json={"status": "staged"},
     )
     assert r.status_code == 409
 
     # The 409 detail must name the blocking parent so the dashboard can
     # render an actionable toast instead of a silent no-op (#26744).
     detail = r.json()["detail"]
-    assert "Cannot move to 'ready'" in detail
+    assert "Cannot move to 'staged'" in detail
     assert parent["id"] in detail
     assert "'p'" in detail
     assert "status=" in detail
@@ -781,9 +871,9 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     )
     assert r.status_code == 200
 
-    # Now child auto-promoted by recompute_ready — already ready.
+    # Now child auto-promoted by recompute_ready — already staged.
     child_after = client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]
-    assert child_after["status"] == "ready"
+    assert child_after["status"] == "staged"
 
 
 def test_reopening_parent_demotes_ready_child(client):
@@ -798,7 +888,7 @@ def test_reopening_parent_demotes_ready_child(client):
         "/api/plugins/kanban/tasks",
         json={"title": "c", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child["status"] == "todo"
+    assert child["status"] == "backlog"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
@@ -809,18 +899,18 @@ def test_reopening_parent_demotes_ready_child(client):
     child_after_done = client.get(
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
-    assert child_after_done["status"] == "ready"
+    assert child_after_done["status"] == "staged"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "todo"},
+        json={"status": "backlog"},
     )
     assert r.status_code == 200
 
     child_after_reopen = client.get(
         f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
-    assert child_after_reopen["status"] == "todo"
+    assert child_after_reopen["status"] == "backlog"
 
 
 def test_patch_reassign(client):
@@ -857,31 +947,26 @@ def test_patch_invalid_status(client):
     assert r.status_code == 400
 
 
-def test_patch_status_running_rejected(client):
-    """Dashboard PATCH cannot transition a task directly to 'running'.
-
-    The only legitimate path into 'running' is through the dispatcher's
-    ``claim_task`` — which atomically creates a ``task_runs`` row,
-    claim_lock, expiry, and worker-PID metadata. Allowing a direct set
-    creates orphaned 'running' tasks with no run row or claim, which
-    violate the board's run-history invariants. See issue #19535.
+def test_patch_status_in_progress_allowed(client):
+    """Post-hard-cut, the dashboard PATCH may move a card directly to
+    'in_progress' via the direct-set path (the dispatcher claim path is
+    off in practice). The board reflects the new lane immediately.
     """
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
-        json={"status": "running"},
+        json={"status": "in_progress"},
     )
-    assert r.status_code == 400
-    assert "running" in r.json()["detail"]
-    # Task's status should still be its pre-request value — the direct-set
-    # was rejected before any mutation.
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["status"] == "in_progress"
+    # The card now sits in the in_progress column.
     board = client.get("/api/plugins/kanban/board").json()
     statuses = {
         tt["id"]: col["name"]
         for col in board["columns"]
         for tt in col["tasks"]
     }
-    assert statuses.get(t["id"]) != "running"
+    assert statuses.get(t["id"]) == "in_progress"
 
 
 # ---------------------------------------------------------------------------
@@ -1004,47 +1089,50 @@ def test_create_triage_lands_in_triage_column(client):
     )
     assert r.status_code == 200
     task = r.json()["task"]
-    assert task["status"] == "triage"
+    assert task["status"] == "backlog"
 
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
-    assert len(triage["tasks"]) == 1
-    assert triage["tasks"][0]["title"] == "rough idea, spec me"
+    backlog = next(c for c in r.json()["columns"] if c["name"] == "backlog")
+    assert len(backlog["tasks"]) == 1
+    assert backlog["tasks"][0]["title"] == "rough idea, spec me"
 
 
-def test_triage_task_not_promoted_to_ready(client):
-    """Triage tasks must stay in triage even when they have no parents."""
+def test_triage_task_stays_in_backlog(client):
+    """A parent-free backlog card is a deliberate human jot and is NEVER
+    auto-promoted. recompute_ready only promotes a backlog card that has
+    ≥1 parent with all parents done. So a parent-free triage card stays put
+    in 'backlog' even after the dispatcher runs recompute_ready."""
     client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "must stay put", "triage": True},
     )
-    # Run the dispatcher — it should NOT promote the triage task.
+    # Run the dispatcher — recompute_ready must NOT touch the parent-free card.
     client.post("/api/plugins/kanban/dispatch?dry_run=false&max=4")
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
-    ready = next(c for c in r.json()["columns"] if c["name"] == "ready")
-    assert len(triage["tasks"]) == 1
-    assert len(ready["tasks"]) == 0
+    backlog = next(c for c in r.json()["columns"] if c["name"] == "backlog")
+    staged = next(c for c in r.json()["columns"] if c["name"] == "staged")
+    assert len(backlog["tasks"]) == 1
+    assert len(staged["tasks"]) == 0
 
 
 def test_patch_status_triage_works(client):
-    """A user (or specifier) can push a task back into triage, and out of it."""
+    """A user (or specifier) can push a task back into backlog, and out of it."""
     t = client.post(
         "/api/plugins/kanban/tasks", json={"title": "x"},
     ).json()["task"]
-    # Normal creation is 'ready'; push to triage.
+    # Normal creation is 'staged'; push to backlog.
     r = client.patch(
-        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "triage"},
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "backlog"},
     )
     assert r.status_code == 200
-    assert r.json()["task"]["status"] == "triage"
+    assert r.json()["task"]["status"] == "backlog"
 
-    # Now promote to todo.
+    # Now promote forward out of backlog.
     r = client.patch(
-        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "todo"},
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "staged"},
     )
     assert r.status_code == 200
-    assert r.json()["task"]["status"] == "todo"
+    assert r.json()["task"]["status"] == "staged"
 
 
 # ---------------------------------------------------------------------------
@@ -1064,17 +1152,17 @@ def test_board_progress_rollup(client):
         "/api/plugins/kanban/tasks",
         json={"title": "b", "parents": [parent["id"]]},
     ).json()["task"]
-    # Children start as "todo" because the parent isn't done yet.  Set the
-    # parent to done so children auto-promote to ready via recompute_ready.
+    # Children start as "backlog" because the parent isn't done yet.  Set the
+    # parent to done so children auto-promote to staged via recompute_ready.
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
         json={"status": "done"},
     )
     assert r.status_code == 200
-    # Verify children are now ready.
+    # Verify children are now staged.
     for cid in (child_a["id"], child_b["id"]):
         t = client.get(f"/api/plugins/kanban/tasks/{cid}").json()["task"]
-        assert t["status"] == "ready", f"{cid} should be ready after parent done"
+        assert t["status"] == "staged", f"{cid} should be staged after parent done"
 
     # 0/2 done (visible from the completed/history view because the parent is done).
     r = client.get("/api/plugins/kanban/board?include_archived=true")
@@ -1291,20 +1379,20 @@ def test_bulk_status_ready(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
     c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
-    # Parent-less tasks land in "ready" already; push them to blocked first.
+    # Parent-less tasks land in "staged" already; push them to blocked first.
     for tid in (a["id"], b["id"], c2["id"]):
         client.patch(f"/api/plugins/kanban/tasks/{tid}",
                      json={"status": "blocked", "block_reason": "wait"})
 
     r = client.post("/api/plugins/kanban/tasks/bulk",
-                    json={"ids": [a["id"], b["id"], c2["id"]], "status": "ready"})
+                    json={"ids": [a["id"], b["id"], c2["id"]], "status": "staged"})
     assert r.status_code == 200
     results = r.json()["results"]
     assert all(r["ok"] for r in results)
-    # All three are now ready.
+    # All three are now staged.
     board = client.get("/api/plugins/kanban/board").json()
-    ready = next(col for col in board["columns"] if col["name"] == "ready")
-    ids = {t["id"] for t in ready["tasks"]}
+    staged = next(col for col in board["columns"] if col["name"] == "staged")
+    ids = {t["id"] for t in staged["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
 
 
@@ -1338,21 +1426,21 @@ def test_bulk_status_done_forwards_completion_summary(client):
         conn.close()
 
 
-def test_bulk_status_running_rejected(client):
-    """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
+def test_bulk_status_in_progress_allowed(client):
+    """Bulk updates match single-task PATCH: direct 'in_progress' is allowed
+    after the hard cut and moves the card into the in_progress column."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
 
     r = client.post(
         "/api/plugins/kanban/tasks/bulk",
-        json={"ids": [t["id"]], "status": "running"},
+        json={"ids": [t["id"]], "status": "in_progress"},
     )
 
     assert r.status_code == 200
     results = r.json()["results"]
     assert len(results) == 1
     assert results[0]["id"] == t["id"]
-    assert results[0]["ok"] is False
-    assert "running" in results[0]["error"]
+    assert results[0]["ok"] is True
 
     board = client.get("/api/plugins/kanban/board").json()
     statuses = {
@@ -1360,7 +1448,7 @@ def test_bulk_status_running_rejected(client):
         for col in board["columns"]
         for tt in col["tasks"]
     }
-    assert statuses.get(t["id"]) != "running"
+    assert statuses.get(t["id"]) == "in_progress"
 
 
 def test_dashboard_done_actions_prompt_for_completion_summary():
@@ -1632,7 +1720,12 @@ def test_patch_status_done_without_summary_still_works(client):
 
 def test_patch_status_archive_closes_running_run(client):
     """PATCH to archived while running must close the in-flight run."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
+    # claim_task only claims a staged card, so create it staged (create
+    # defaults to backlog post-hard-cut).
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "z", "assignee": "worker", "initial_status": "staged"},
+    )
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1659,7 +1752,11 @@ def test_patch_status_archive_closes_running_run(client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    # claim_task only claims a staged card; create it staged explicitly.
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "e", "assignee": "worker", "initial_status": "staged"},
+    )
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1740,8 +1837,10 @@ def test_create_task_with_toolset_name_in_skills_is_rejected(client):
 # ---------------------------------------------------------------------------
 
 def test_create_task_includes_warning_when_no_dispatcher(client, monkeypatch):
-    """ready+assigned task + no gateway -> response has `warning` field
-    so the dashboard UI can surface a banner."""
+    """staged (dispatch-eligible) + assigned task + no gateway -> response has
+    `warning` field so the dashboard UI can surface a banner. The warning only
+    fires for dispatch-eligible cards (status=staged); a backlog jot is
+    expected to wait, so it gets no banner."""
     # Force the dispatcher probe to report "not running".
     monkeypatch.setattr(
         "hermes_cli.kanban._check_dispatcher_presence",
@@ -1749,10 +1848,11 @@ def test_create_task_includes_warning_when_no_dispatcher(client, monkeypatch):
     )
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "warn-me", "assignee": "worker"},
+        json={"title": "warn-me", "assignee": "worker", "initial_status": "staged"},
     )
     assert r.status_code == 200
     data = r.json()
+    assert data["task"]["status"] == "staged"
     assert data.get("warning")
     assert "gateway" in data["warning"].lower()
 
@@ -2159,7 +2259,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, future, 99999, t),
         )
@@ -2183,20 +2283,20 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["ok"] is True
     assert body["task_id"] == t
 
-    # Confirm the task is back to ready.
+    # Confirm the task is back to staged.
     conn2 = kb.connect()
     try:
         row = conn2.execute(
             "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "staged"
         assert row["claim_lock"] is None
     finally:
         conn2.close()
 
 
 def test_reclaim_endpoint_409_for_non_running_task(client):
-    """Reclaiming a task that's already ready returns 409."""
+    """Reclaiming a task that's already staged returns 409."""
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="ready", assignee="x")
@@ -2242,7 +2342,7 @@ def test_reassign_endpoint_409_on_running_without_reclaim(client):
     try:
         t = kb.create_task(conn, title="running", assignee="orig")
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=? WHERE id=?",
+            "UPDATE tasks SET status='in_progress', claim_lock=? WHERE id=?",
             (secrets.token_hex(4), t),
         )
         conn.commit()
@@ -2265,7 +2365,7 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
         t = kb.create_task(conn, title="running", assignee="orig")
         lock = secrets.token_hex(4)
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, int(time.time()) + 3600, 1234, t),
         )
@@ -2292,7 +2392,7 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
         row = conn2.execute(
             "SELECT status, assignee FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "staged"
         assert row["assignee"] == "new"
     finally:
         conn2.close()
@@ -2327,12 +2427,16 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     r = client.get("/api/plugins/kanban/diagnostics")
     assert r.status_code == 200
     data = r.json()
-    assert data["count"] == 1
-    row = data["diagnostics"][0]
-    assert row["task_id"] == parent
-    assert row["diagnostics"][0]["kind"] == "hallucinated_cards"
-    assert row["diagnostics"][0]["severity"] == "error"
-    assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
+    # The parent carries the hallucinated_cards diagnostic. (Backlog cards
+    # also surface a triage_aux_unavailable warning in a test env with no
+    # auxiliary client configured, so we target the parent's row + the
+    # specific error diagnostic rather than asserting a board-wide count.)
+    row = next(d for d in data["diagnostics"] if d["task_id"] == parent)
+    halluc = next(
+        d for d in row["diagnostics"] if d["kind"] == "hallucinated_cards"
+    )
+    assert halluc["severity"] == "error"
+    assert "t_ffff00001234" in halluc["data"]["phantom_ids"]
 
 
 def test_diagnostics_endpoint_severity_filter(client):
@@ -2356,19 +2460,29 @@ def test_diagnostics_endpoint_severity_filter(client):
     finally:
         conn.close()
 
-    # warning filter is at-or-above → both the warning AND the error pass.
+    # warning filter is at-or-above → both tasks pass (p1 prose-warning, p2
+    # error). p2 also carries a backlog ``triage_aux_unavailable`` warning in
+    # this no-aux-client test env, so we assert on the task set + per-task
+    # severities rather than a raw total-diagnostic count.
     r = client.get("/api/plugins/kanban/diagnostics?severity=warning")
     assert r.status_code == 200
     data = r.json()
-    assert data["count"] == 2
     task_ids = {row["task_id"] for row in data["diagnostics"]}
     assert task_ids == {p1, p2}
+    p2_row = next(row for row in data["diagnostics"] if row["task_id"] == p2)
+    p2_kinds = {d["kind"] for d in p2_row["diagnostics"]}
+    assert "repeated_failures" in p2_kinds  # the error survives the warning filter
 
-    # error filter is at-or-above → only the error passes (warning is below).
+    # error filter is at-or-above → only the error passes (warnings are below).
+    # p1 (prose warning only) drops out; p2 keeps its error but sheds the
+    # backlog triage warning.
     r = client.get("/api/plugins/kanban/diagnostics?severity=error")
     data = r.json()
-    assert data["count"] == 1
-    assert data["diagnostics"][0]["task_id"] == p2
+    err_task_ids = {row["task_id"] for row in data["diagnostics"]}
+    assert err_task_ids == {p2}
+    p2_err_row = next(row for row in data["diagnostics"] if row["task_id"] == p2)
+    assert all(d["severity"] == "error" for d in p2_err_row["diagnostics"])
+    assert {d["kind"] for d in p2_err_row["diagnostics"]} == {"repeated_failures"}
 
 
 def test_board_exposes_diagnostics_list_and_summary(client):
@@ -2429,7 +2543,7 @@ def test_specify_happy_path(client, monkeypatch):
         "/api/plugins/kanban/tasks",
         json={"title": "one-liner", "triage": True},
     ).json()["task"]
-    assert t["status"] == "triage"
+    assert t["status"] == "backlog"
 
     _patch_specifier_response(
         monkeypatch,
@@ -2450,7 +2564,7 @@ def test_specify_happy_path(client, monkeypatch):
 
     # Task should have moved off the triage column.
     detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
-    assert detail["status"] in {"todo", "ready"}
+    assert detail["status"] in {"backlog", "staged"}
     assert detail["title"] == "Polished"
     assert "**Goal**" in (detail["body"] or "")
 
@@ -2458,9 +2572,16 @@ def test_specify_happy_path(client, monkeypatch):
 def test_specify_non_triage_returns_ok_false_not_http_error(client, monkeypatch):
     """The endpoint intentionally returns ``{ok: false, reason: ...}`` for
     "task not in triage" rather than a 4xx — the dashboard renders the
-    reason inline so the user can fix it without a page reload."""
-    # Create a normal (ready) task — not in triage.
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    reason inline so the user can fix it without a page reload.
+
+    A staged card is not in the backlog/triage lane, so specify rejects it.
+    (Create defaults to backlog now, so we must stage the card explicitly to
+    make it non-triage.)"""
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "initial_status": "staged"},
+    ).json()["task"]
+    assert t["status"] == "staged"
 
     _patch_specifier_response(monkeypatch, content="unused")
 
@@ -2495,9 +2616,9 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
     assert body["ok"] is False
     assert "auxiliary client" in body["reason"]
 
-    # Task must stay in triage — nothing was touched.
+    # Task must stay in backlog — nothing was touched.
     detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
-    assert detail["status"] == "triage"
+    assert detail["status"] == "backlog"
 
 
 def test_board_endpoint_accepts_explicit_board_default_param(client):
@@ -2510,22 +2631,22 @@ def test_board_endpoint_accepts_explicit_board_default_param(client):
     current-file resolution.
     Regression: #21819.
     """
-    # Create a task on the default board.
+    # Create a task on the default board (lands in backlog by default).
     t = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "on-default-board"},
     ).json()["task"]
-    assert t["status"] == "ready"
+    assert t["status"] == "backlog"
 
     # Request with explicit board=default — must succeed and include the task.
     r = client.get("/api/plugins/kanban/board?board=default")
     assert r.status_code == 200
     data = r.json()
-    ready = next((c for c in data["columns"] if c["name"] == "ready"), None)
-    assert ready is not None, "no 'ready' column in default board response"
-    task_ids = [task["id"] for task in ready["tasks"]]
+    backlog = next((c for c in data["columns"] if c["name"] == "backlog"), None)
+    assert backlog is not None, "no 'backlog' column in default board response"
+    task_ids = [task["id"] for task in backlog["tasks"]]
     assert t["id"] in task_ids, (
-        f"task {t['id']} not found in ready column of default board "
+        f"task {t['id']} not found in backlog column of default board "
         f"(got tasks: {task_ids}). The board=default param was likely ignored."
     )
 
@@ -2558,10 +2679,13 @@ def test_dashboard_bulk_actions_include_reclaim_first():
 
     assert "reclaim_first: reclaimFirst" in dist
     assert "hermes-kanban-bulk-reclaim-first" in dist
-    assert '"→ triage"' in dist
-    assert '"→ ready"' in dist
+    assert '"→ backlog"' in dist
+    assert '"→ staged"' in dist
     assert '"Complete"' in dist
+    # Legacy lane labels are gone after the hard cut.
     assert '"→ todo"' not in dist
+    assert '"→ triage"' not in dist
+    assert '"→ ready"' not in dist
 
 
 def test_dashboard_shift_click_range_selection_exists():

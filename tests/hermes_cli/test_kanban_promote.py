@@ -37,7 +37,7 @@ def conn(kanban_home):
 
 
 def _stuck_todo(conn, *, parents_done=True, n_parents=1):
-    """Build the #28822 scenario: child in 'todo' whose parents may
+    """Build the #28822 scenario: child in 'backlog' whose parents may
     have closed as 'done' without the auto-promote logic firing.
     """
     parent_ids = [
@@ -47,7 +47,7 @@ def _stuck_todo(conn, *, parents_done=True, n_parents=1):
     child_id = kb.create_task(
         conn, title="child", parents=parent_ids, assignee="setup"
     )
-    assert kb.get_task(conn, child_id).status == "todo"
+    assert kb.get_task(conn, child_id).status == "backlog"
     if parents_done:
         for pid in parent_ids:
             conn.execute(
@@ -60,7 +60,7 @@ def test_promote_stuck_todo_succeeds(conn):
     child, _ = _stuck_todo(conn, parents_done=True)
     ok, err = kb.promote_task(conn, child, actor="tester")
     assert ok and err is None
-    assert kb.get_task(conn, child).status == "ready"
+    assert kb.get_task(conn, child).status == "staged"
 
 
 def test_promote_refuses_when_parent_not_done(conn):
@@ -69,7 +69,7 @@ def test_promote_refuses_when_parent_not_done(conn):
     assert ok is False
     assert err is not None and "unsatisfied parent dependencies" in err
     assert parents[0] in err
-    assert kb.get_task(conn, child).status == "todo"
+    assert kb.get_task(conn, child).status == "backlog"
 
 
 def test_promote_with_force_bypasses_dependency_check(conn):
@@ -78,7 +78,7 @@ def test_promote_with_force_bypasses_dependency_check(conn):
         conn, child, actor="tester", reason="recovery", force=True
     )
     assert ok and err is None
-    assert kb.get_task(conn, child).status == "ready"
+    assert kb.get_task(conn, child).status == "staged"
 
 
 def test_promote_emits_audit_event(conn):
@@ -119,7 +119,7 @@ def test_promote_dry_run_does_not_mutate(conn):
     child, _ = _stuck_todo(conn, parents_done=True)
     ok, err = kb.promote_task(conn, child, actor="tester", dry_run=True)
     assert ok and err is None
-    assert kb.get_task(conn, child).status == "todo"
+    assert kb.get_task(conn, child).status == "backlog"
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM task_events "
         "WHERE task_id = ? AND kind = 'promoted_manual'",
@@ -136,11 +136,11 @@ def test_promote_dry_run_reports_dependency_failure(conn):
 
 
 def test_promote_rejects_non_todo_status(conn):
-    tid = kb.create_task(conn, title="standalone")
-    assert kb.get_task(conn, tid).status == "ready"
+    tid = kb.create_task(conn, title="standalone", initial_status="staged")
+    assert kb.get_task(conn, tid).status == "staged"
     ok, err = kb.promote_task(conn, tid, actor="tester")
     assert ok is False
-    assert "'ready'" in err and "promote only applies" in err
+    assert "'staged'" in err and "promote only applies" in err
 
 
 def test_promote_rejects_unknown_task(conn):
@@ -151,12 +151,12 @@ def test_promote_rejects_unknown_task(conn):
 
 def test_promote_blocked_task_works(conn):
     tid = kb.create_task(conn, title="t")
-    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+    conn.execute("UPDATE tasks SET status='backlog' WHERE id=?", (tid,))
     ok, err = kb.promote_task(
         conn, tid, actor="tester", reason="ready now"
     )
     assert ok and err is None
-    assert kb.get_task(conn, tid).status == "ready"
+    assert kb.get_task(conn, tid).status == "staged"
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
         assert c in out
     with kb.connect() as conn:
         for c in children:
-            assert kb.get_task(conn, c).status == "ready"
+            assert kb.get_task(conn, c).status == "staged"
 
 
 def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
@@ -207,7 +207,7 @@ def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
     assert good in captured.out  # good one promoted
     assert "t_nope" in captured.err and "not found" in captured.err
     with kb.connect() as conn:
-        assert kb.get_task(conn, good).status == "ready"
+        assert kb.get_task(conn, good).status == "staged"
 
 
 def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):

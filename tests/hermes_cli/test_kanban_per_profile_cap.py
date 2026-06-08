@@ -38,9 +38,9 @@ def test_no_cap_all_tasks_dispatched(isolated_kanban_home_with_profiles):
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"a{i}", assignee="alpha", initial_status="staged")
         for i in range(3):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            kb.create_task(conn, title=f"b{i}", assignee="beta", initial_status="staged")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=True)
     assert len(res.spawned) == 8
@@ -54,9 +54,9 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"a{i}", assignee="alpha", initial_status="staged")
         for i in range(3):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            kb.create_task(conn, title=f"b{i}", assignee="beta", initial_status="staged")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -71,22 +71,22 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
 
 
 def test_pre_existing_running_counts_against_cap(isolated_kanban_home_with_profiles):
-    """A task already in 'running' status when dispatch_once starts counts
+    """A task already in 'in_progress' status when dispatch_once starts counts
     toward the per-profile cap. With 1 alpha pre-running and cap=1, NO new
     alpha tasks should spawn; beta is independent so 1 beta spawns."""
     kb = isolated_kanban_home_with_profiles
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        running_alpha = kb.create_task(conn, title="running alpha", assignee="alpha")
+        running_alpha = kb.create_task(conn, title="running alpha", assignee="alpha", initial_status="staged")
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status = 'running', claim_lock = 'test:1' WHERE id = ?",
+                "UPDATE tasks SET status = 'in_progress', claim_lock = 'test:1' WHERE id = ?",
                 (running_alpha,),
             )
         for i in range(2):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"a{i}", assignee="alpha", initial_status="staged")
         for i in range(2):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            kb.create_task(conn, title=f"b{i}", assignee="beta", initial_status="staged")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -108,7 +108,7 @@ def test_invalid_cap_treated_as_no_cap(isolated_kanban_home_with_profiles, cap):
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(3):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"a{i}", assignee="alpha", initial_status="staged")
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -125,7 +125,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     kb = isolated_kanban_home_with_profiles
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
+        ids = [kb.create_task(conn, title=f"a{i}", assignee="alpha", initial_status="staged") for i in range(3)]
 
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:
@@ -137,7 +137,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res1.skipped_per_profile_capped) == 2
 
     # Simulate the running task completing — set it back to done so the
-    # 'running' count drops
+    # 'in_progress' count drops
     spawned_id = res1.spawned[0][0]
     with kb.connect_closing() as conn:
         with kb.write_txn(conn):

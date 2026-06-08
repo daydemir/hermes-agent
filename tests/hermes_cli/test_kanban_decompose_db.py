@@ -35,7 +35,7 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
 def test_decompose_creates_children_and_promotes_root(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="ship a feature")
-        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).status == "backlog"
 
     children = [
         {"title": "research", "body": "look at prior art", "assignee": "researcher", "parents": []},
@@ -57,14 +57,15 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
         c0 = kb.get_task(conn, child_ids[0])
         c1 = kb.get_task(conn, child_ids[1])
 
-    # Root flipped to todo with orchestrator assignee, gated by children.
-    assert root.status == "todo"
+    # Root flipped to backlog with orchestrator assignee, gated by children.
+    assert root.status == "backlog"
     assert root.assignee == "orchestrator"
-    # First child has no internal parents → ready on recompute_ready.
-    assert c0.status == "ready"
+    # First child has no internal parents → a parent-free backlog card, which
+    # recompute_ready never auto-promotes (a deliberate human jot stays put).
+    assert c0.status == "backlog"
     assert c0.assignee == "researcher"
-    # Second child has parents=[0] → stays in todo until c0 completes.
-    assert c1.status == "todo"
+    # Second child has parents=[0] → stays in backlog until c0 completes.
+    assert c1.status == "backlog"
     assert c1.assignee == "engineer"
 
 
@@ -82,7 +83,10 @@ def test_decompose_returns_none_when_task_missing(kanban_home):
 
 def test_decompose_returns_none_when_task_not_in_triage(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="already a real task")  # not triage
+        # Not in the backlog column — decompose only operates on backlog.
+        tid = kb.create_task(
+            conn, title="already a real task", initial_status="staged"
+        )
         result = kb.decompose_triage_task(
             conn,
             tid,

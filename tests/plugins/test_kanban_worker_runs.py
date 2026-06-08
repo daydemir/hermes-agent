@@ -98,7 +98,7 @@ def test_workers_active_with_running_task(client):
     try:
         task_id = kb.create_task(conn, title="active-worker", assignee="alice")
         conn.execute(
-            "UPDATE tasks SET status='running' WHERE id=?", (task_id,),
+            "UPDATE tasks SET status='in_progress' WHERE id=?", (task_id,),
         )
         _insert_run(conn, task_id, worker_pid=12345)
     finally:
@@ -111,7 +111,7 @@ def test_workers_active_with_running_task(client):
     w = body["workers"][0]
     assert w["task_id"] == task_id
     assert w["worker_pid"] == 12345
-    assert w["task_status"] == "running"
+    assert w["task_status"] == "in_progress"
     assert w["task_title"] == "active-worker"
     assert w["task_assignee"] == "alice"
 
@@ -121,7 +121,7 @@ def test_workers_active_excludes_ended_runs(client):
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="ended-run", assignee="bob")
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.execute("UPDATE tasks SET status='in_progress' WHERE id=?", (task_id,))
         _insert_run(conn, task_id, worker_pid=99999, ended_at=int(time.time()) - 60)
     finally:
         conn.close()
@@ -136,7 +136,7 @@ def test_workers_active_excludes_runs_without_pid(client):
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="no-pid", assignee="carol")
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.execute("UPDATE tasks SET status='in_progress' WHERE id=?", (task_id,))
         _insert_run(conn, task_id, worker_pid=None)
     finally:
         conn.close()
@@ -307,9 +307,9 @@ def test_inspect_run_live_pid(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
-    """Create a task in 'running' state with a matching open task_runs row.
+    """Create a task in 'in_progress' state with a matching open task_runs row.
 
-    Mirrors what dispatcher_claim does: stamps tasks.status='running',
+    Mirrors what dispatcher_claim does: stamps tasks.status='in_progress',
     tasks.claim_lock, tasks.worker_pid; inserts task_runs row with the
     same claim_lock so reclaim_task's preconditions are satisfied.
     """
@@ -317,7 +317,7 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
     lock = secrets.token_hex(8)
     future = int(time.time()) + 3600
     conn.execute(
-        "UPDATE tasks SET status='running', claim_lock=?, "
+        "UPDATE tasks SET status='in_progress', claim_lock=?, "
         "claim_expires=?, worker_pid=? WHERE id=?",
         (lock, future, worker_pid, task_id),
     )
@@ -389,7 +389,7 @@ def test_terminate_run_ok(client, monkeypatch):
     assert sent == [(33333, sent[0][1])]
     assert sent[0][1] is not None  # claim_lock was non-null
 
-    # Task is back to ready, claim cleared.
+    # Task is back to staged, claim cleared.
     conn = kb.connect()
     try:
         row = conn.execute(
@@ -398,7 +398,7 @@ def test_terminate_run_ok(client, monkeypatch):
         ).fetchone()
     finally:
         conn.close()
-    assert row["status"] == "ready"
+    assert row["status"] == "staged"
     assert row["claim_lock"] is None
     assert row["worker_pid"] is None
 
@@ -408,8 +408,8 @@ def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="ghost-run", assignee="ken")
-        # Task left in default 'ready' state with no claim_lock — task_run
-        # exists but reclaim_task will refuse because status != 'running'
+        # Task left in default 'staged' state with no claim_lock — task_run
+        # exists but reclaim_task will refuse because status != 'in_progress'
         # and claim_lock is NULL.
         run_id = _insert_run(conn, task_id, worker_pid=44444)
     finally:

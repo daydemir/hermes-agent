@@ -31,10 +31,10 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None):
     )
 
 
-def test_specify_promotes_triage_to_todo(kanban_home):
+def test_specify_re_stamps_triage_card(kanban_home):
     with kb.connect() as conn:
         tid = _create_triage(conn, title="rough idea")
-        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).status == "backlog"
     with kb.connect() as conn:
         ok = kb.specify_triage_task(
             conn,
@@ -46,8 +46,11 @@ def test_specify_promotes_triage_to_todo(kanban_home):
     assert ok is True
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
-    # No parents → recompute_ready should have flipped it past todo to ready.
-    assert task.status == "ready"
+    # No parents → specify_triage_task re-stamps in backlog and STAYS there.
+    # recompute_ready never auto-promotes a parent-free backlog card (a
+    # deliberate human jot); only a card with ≥1 parent, all done, is promoted.
+    # The title/body are re-stamped.
+    assert task.status == "backlog"
     assert task.title == "Refined: rough idea"
     assert "**Goal**" in (task.body or "")
 
@@ -60,8 +63,8 @@ def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
         child = _create_triage(conn, title="child idea")
         kb.link_tasks(conn, parent, child)
         # After linking with an open parent, triage status should still be
-        # 'triage' (linking doesn't touch triage tasks).
-        assert kb.get_task(conn, child).status == "triage"
+        # 'backlog' (linking doesn't touch parked tasks).
+        assert kb.get_task(conn, child).status == "backlog"
     with kb.connect() as conn:
         ok = kb.specify_triage_task(
             conn,
@@ -72,20 +75,20 @@ def test_specify_with_open_parent_lands_in_todo_not_ready(kanban_home):
     assert ok is True
     with kb.connect() as conn:
         t = kb.get_task(conn, child)
-    # Parent still open → specified child sits in 'todo', not 'ready'.
-    assert t.status == "todo"
+    # Parent still open → specified child sits in 'backlog', not 'staged'.
+    assert t.status == "backlog"
 
 
 def test_specify_refuses_non_triage_task(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="normal task")
-        assert kb.get_task(conn, tid).status == "ready"
+        tid = kb.create_task(conn, title="normal task", initial_status="staged")
+        assert kb.get_task(conn, tid).status == "staged"
     with kb.connect() as conn:
         ok = kb.specify_triage_task(conn, tid, body="won't apply")
     assert ok is False
     with kb.connect() as conn:
-        # Status unchanged.
-        assert kb.get_task(conn, tid).status == "ready"
+        # Status unchanged — specify only operates on the backlog column.
+        assert kb.get_task(conn, tid).status == "staged"
 
 
 def test_specify_returns_false_for_unknown_id(kanban_home):
@@ -143,7 +146,7 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
 
 def test_specify_skips_comment_when_nothing_changed(kanban_home):
     # Create triage task with title and body already set; pass identical
-    # values to specify. Should promote to todo but skip audit comment.
+    # values to specify. Should promote past backlog but skip audit comment.
     with kb.connect() as conn:
         tid = _create_triage(conn, title="same", body="same body")
     with kb.connect() as conn:
@@ -157,7 +160,7 @@ def test_specify_skips_comment_when_nothing_changed(kanban_home):
     assert ok is True
     with kb.connect() as conn:
         # Promoted.
-        assert kb.get_task(conn, tid).status in {"todo", "ready"}
+        assert kb.get_task(conn, tid).status in {"backlog", "staged"}
         # No audit comment because neither field changed.
         assert kb.list_comments(conn, tid) == []
 
@@ -174,11 +177,20 @@ def test_specify_with_only_body_preserves_title(kanban_home):
 
 
 def test_specify_second_call_noop_false(kanban_home):
-    # Promoting twice must not crash and the second call returns False
-    # because the task is no longer in triage.
+    # Specifying twice must not crash and the second call returns False
+    # because the card has left the backlog column. A parent-free jot would
+    # stay in backlog forever, so give the card a done parent: recompute_ready
+    # promotes it out of backlog after the first specify, so the second call
+    # finds it no longer in the backlog column.
     with kb.connect() as conn:
+        parent = kb.create_task(conn, title="done parent")
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
         tid = _create_triage(conn, title="once")
+        kb.link_tasks(conn, parent, tid)
+        assert kb.get_task(conn, tid).status == "backlog"
     with kb.connect() as conn:
         assert kb.specify_triage_task(conn, tid, body="spec") is True
+        # Done parent → recompute_ready promoted it out of backlog.
+        assert kb.get_task(conn, tid).status == "staged"
     with kb.connect() as conn:
         assert kb.specify_triage_task(conn, tid, body="spec again") is False

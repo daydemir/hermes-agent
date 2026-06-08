@@ -100,20 +100,22 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         assert kb.DEFAULT_FAILURE_LIMIT == 2
-        # One default-limit failure → still ready, counter grows.
+        # One default-limit failure → still staged, counter grows.
         res1 = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
         assert tid not in res1.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        assert task.status == "staged"
         assert task.consecutive_failures == 1
 
         # Second default-limit failure trips the guard.
         res2 = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
         assert tid in res2.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "backlog"
         assert task.consecutive_failures >= 2
         assert task.last_failure_error and "no PATH" in task.last_failure_error
     finally:
@@ -137,7 +139,9 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         # Two failures + one success.
         kb.dispatch_once(conn, spawn_fn=_flaky_spawn, failure_limit=5)
         kb.dispatch_once(conn, spawn_fn=_flaky_spawn, failure_limit=5)
@@ -148,8 +152,8 @@ def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assign
         # Counter STAYS at 2 — spawn succeeded but run isn't complete yet.
         assert task.consecutive_failures == 2
         assert task.last_failure_error is not None
-        # Task is now running with a pid.
-        assert task.status == "running"
+        # Task is now in_progress with a pid.
+        assert task.status == "in_progress"
         assert task.worker_pid == 99999
     finally:
         conn.close()
@@ -217,6 +221,7 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         # caller is asking for failure_limit=10.
         tid = kb.create_task(
             conn, title="one-shot", assignee="worker", max_retries=1,
+            initial_status="staged",
         )
         task = kb.get_task(conn, tid)
         assert task.max_retries == 1, "per-task override must persist"
@@ -232,7 +237,7 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         )
         assert tripped is True, "should auto-block on first failure"
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "backlog"
         assert task.consecutive_failures == 1
 
         # gave_up event should record where the threshold came from
@@ -252,8 +257,9 @@ def test_per_task_max_retries_allows_more_than_default(kanban_home, all_assignee
     try:
         tid = kb.create_task(
             conn, title="flaky-retry", assignee="worker", max_retries=5,
+            initial_status="staged",
         )
-        # Four failures — still below the per-task threshold, should stay ready.
+        # Four failures — still below the per-task threshold, should stay staged.
         for i in range(1, 5):
             kb.claim_task(conn, tid)
             tripped = kb._record_task_failure(
@@ -268,7 +274,7 @@ def test_per_task_max_retries_allows_more_than_default(kanban_home, all_assignee
             )
             assert tripped is False, f"shouldn't trip at failure {i} with max_retries=5"
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", f"at failure {i} status was {task.status}"
+            assert task.status == "staged", f"at failure {i} status was {task.status}"
 
         # Fifth failure trips the per-task limit.
         kb.claim_task(conn, tid)
@@ -281,7 +287,7 @@ def test_per_task_max_retries_allows_more_than_default(kanban_home, all_assignee
         )
         assert tripped is True
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "backlog"
         assert task.consecutive_failures == 5
     finally:
         conn.close()
@@ -292,7 +298,9 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
     supplied ``failure_limit`` — the gateway config tier."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="standard", assignee="worker")
+        tid = kb.create_task(
+            conn, title="standard", assignee="worker", initial_status="staged",
+        )
         task = kb.get_task(conn, tid)
         assert task.max_retries is None
 
@@ -321,7 +329,7 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         )
         assert tripped is True
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "backlog"
 
         events = kb.list_events(conn, tid)
         gave_up = [e for e in events if e.kind == "gave_up"]
@@ -342,6 +350,7 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         tid = kb.create_task(
             conn, title="x", assignee="worker",
             workspace_kind="dir", workspace_path="/tmp/kanban_e2e_dir",
+            initial_status="staged",
         )
         with kb.write_txn(conn):
             conn.execute(
@@ -350,14 +359,14 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         res = kb.dispatch_once(conn, failure_limit=3)
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 1
-        assert task.status == "ready"
+        assert task.status == "staged"
         assert task.last_failure_error and "workspace" in task.last_failure_error
         # Run twice more → auto-blocked.
         kb.dispatch_once(conn, failure_limit=3)
         res = kb.dispatch_once(conn, failure_limit=3)
         assert tid in res.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "backlog"
     finally:
         conn.close()
 
@@ -486,13 +495,13 @@ def test_board_stats(kanban_home):
     conn = kb.connect()
     try:
         a = kb.create_task(conn, title="a", assignee="x")
-        b = kb.create_task(conn, title="b", assignee="y")
+        b = kb.create_task(conn, title="b", assignee="y", initial_status="staged")
         kb.complete_task(conn, a, result="done")
         stats = kb.board_stats(conn)
-        assert stats["by_status"]["ready"] == 1
+        assert stats["by_status"]["staged"] == 1
         assert stats["by_status"]["done"] == 1
         assert stats["by_assignee"]["x"]["done"] == 1
-        assert stats["by_assignee"]["y"]["ready"] == 1
+        assert stats["by_assignee"]["y"]["staged"] == 1
         assert stats["oldest_ready_age_seconds"] is not None
     finally:
         conn.close()
@@ -953,6 +962,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             tid = kb.create_task(
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,  # one second cap
+                initial_status="staged",
             )
             # Spawn by hand: claim + set pid + set active run start to the past.
             kb.claim_task(conn, tid)
@@ -976,7 +986,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             assert killed and killed[0][0] == os.getpid()
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
+            assert task.status == "staged",                 f"timed-out task should reset to staged, got {task.status}"
             assert task.worker_pid is None
             assert task.last_heartbeat_at is None
 
@@ -1012,6 +1022,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
             tid = kb.create_task(
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,
+                initial_status="staged",
             )
             for expected_failures in (1, 2):
                 kb.claim_task(conn, tid)
@@ -1022,7 +1033,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
                 task = kb.get_task(conn, tid)
                 assert task.consecutive_failures == expected_failures
             task = kb.get_task(conn, tid)
-            assert task.status == "blocked"
+            assert task.status == "backlog"
             events = kb.list_events(conn, tid)
             assert [e.kind for e in events].count("timed_out") == 2
             gave_up = [e for e in events if e.kind == "gave_up"]
@@ -1038,7 +1049,9 @@ def test_max_runtime_none_means_no_cap(kanban_home):
     of how long it runs."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="uncapped", assignee="worker")
+        tid = kb.create_task(
+            conn, title="uncapped", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, os.getpid())
         # Backdate aggressively; no cap means we don't care.
@@ -1050,7 +1063,7 @@ def test_max_runtime_none_means_no_cap(kanban_home):
         timed_out = kb.enforce_max_runtime(conn)
         assert timed_out == []
         task = kb.get_task(conn, tid)
-        assert task.status == "running"
+        assert task.status == "in_progress"
     finally:
         conn.close()
 
@@ -1067,7 +1080,7 @@ def test_create_task_persists_max_runtime(kanban_home):
 
 def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
     """enforce_max_runtime + dispatch_once integrate cleanly — a timed-out
-    task goes through ``timed_out`` → ``ready`` and dispatch_once can then
+    task goes through ``timed_out`` → ``staged`` and dispatch_once can then
     re-spawn it without re-reporting the timeout."""
     import hermes_cli.kanban_db as _kb
     # Leave _pid_alive=True so the crash detector doesn't steal the task
@@ -1087,6 +1100,7 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         tid = kb.create_task(
             conn, title="timeout-me", assignee="worker",
             max_runtime_seconds=1,
+            initial_status="staged",
         )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, os.getpid())
@@ -1113,9 +1127,9 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         # (already released). Confirm the loop doesn't re-report it.
         res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: None)
         task = kb.get_task(conn, tid)
-        # After timeout, task is back in 'ready' and will be re-spawned
+        # After timeout, task is back in 'staged' and will be re-spawned
         # by the same pass. That's the intended behaviour.
-        assert task.status in {"ready", "running"}
+        assert task.status in {"staged", "in_progress"}
     finally:
         conn.close()
 
@@ -1127,7 +1141,9 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
 def test_heartbeat_on_running_task(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         ok = kb.heartbeat_worker(conn, tid, note="step 3/10")
         assert ok is True
@@ -1144,7 +1160,7 @@ def test_heartbeat_on_running_task(kanban_home):
 def test_heartbeat_refused_when_not_running(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x")   # lands in ready, not running
+        tid = kb.create_task(conn, title="x")   # lands in backlog, not in_progress
         ok = kb.heartbeat_worker(conn, tid)
         assert ok is False
         task = kb.get_task(conn, tid)
@@ -1156,7 +1172,9 @@ def test_heartbeat_refused_when_not_running(kanban_home):
 def test_cli_heartbeat_verb(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -1202,7 +1220,9 @@ def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_
         raise RuntimeError("nope")
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         for _ in range(5):
             kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
         events = kb.list_events(conn, tid)
@@ -1220,7 +1240,9 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         return 98765
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.dispatch_once(conn, spawn_fn=_spawn_returns_pid)
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
@@ -1320,7 +1342,7 @@ def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        # writer has a ready task; on_board_only has a task but no profile dir.
+        # writer has a backlog task; on_board_only has a task but no profile dir.
         kb.create_task(conn, title="a", assignee="writer")
         kb.create_task(conn, title="b", assignee="on_board_only")
         data = kb.known_assignees(conn)
@@ -1333,9 +1355,9 @@ def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
     assert by_name["researcher"]["on_disk"] is True
     assert by_name["researcher"]["counts"] == {}
     assert by_name["writer"]["on_disk"] is True
-    assert by_name["writer"]["counts"] == {"ready": 1}
+    assert by_name["writer"]["counts"] == {"backlog": 1}
     assert by_name["on_board_only"]["on_disk"] is False
-    assert by_name["on_board_only"]["counts"] == {"ready": 1}
+    assert by_name["on_board_only"]["counts"] == {"backlog": 1}
 
 
 def test_cli_assignees_json(kanban_home):
@@ -1401,7 +1423,9 @@ def test_run_created_on_claim(kanban_home):
     """claim_task opens a new task_runs row and points current_run_id at it."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         assert kb.get_task(conn, tid).current_run_id is None
 
         claimed = kb.claim_task(conn, tid)
@@ -1428,7 +1452,9 @@ def test_run_closed_on_complete_with_summary(kanban_home):
     persists summary + metadata."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         ok = kb.complete_task(
             conn, tid,
@@ -1459,7 +1485,9 @@ def test_run_summary_falls_back_to_result(kanban_home):
     single-run workflows don't need to pass the same string twice."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="only-arg")
         r = kb.latest_run(conn, tid)
@@ -1474,7 +1502,9 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
 
         # Attempt 1: claim then force the claim to be stale by backdating
         # claim_expires, then let release_stale_claims reclaim it.
@@ -1519,7 +1549,10 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="retry guarded", assignee="worker")
+        tid = kb.create_task(
+            conn, title="retry guarded", assignee="worker",
+            initial_status="staged",
+        )
 
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
@@ -1538,7 +1571,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
             expected_run_id=run1.id,
         )
         task = kb.get_task(conn, tid)
-        assert task.status == "running"
+        assert task.status == "in_progress"
         assert task.current_run_id == run2.id
 
         assert kb.complete_task(
@@ -1560,7 +1593,10 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="retry heartbeat guarded", assignee="worker")
+        tid = kb.create_task(
+            conn, title="retry heartbeat guarded", assignee="worker",
+            initial_status="staged",
+        )
 
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
@@ -1575,13 +1611,13 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert not kb.heartbeat_worker(conn, tid, note="late", expected_run_id=run1.id)
         assert not kb.block_task(conn, tid, reason="late block", expected_run_id=run1.id)
         task = kb.get_task(conn, tid)
-        assert task.status == "running"
+        assert task.status == "in_progress"
         assert task.current_run_id == run2.id
         assert task.last_heartbeat_at is None
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "backlog"
     finally:
         conn.close()
 
@@ -1589,7 +1625,9 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 def test_run_on_block_with_reason(kanban_home):
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         kb.block_task(conn, tid, reason="needs API key")
 
@@ -1610,7 +1648,9 @@ def test_run_on_spawn_failure_records_failed_runs(kanban_home, all_assignees_spa
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         for _ in range(5):
             kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
 
@@ -1630,7 +1670,9 @@ def test_event_rows_carry_run_id(kanban_home):
     task-scoped ones."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         # task-scoped: 'created' — no run yet
         # run-scoped: 'claimed' + 'completed'
         kb.claim_task(conn, tid)
@@ -1655,7 +1697,9 @@ def test_build_worker_context_includes_prior_attempts(kanban_home):
     + summary in its context so it can skip the failed path."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="port x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="port x", assignee="worker", initial_status="staged",
+        )
 
         # Attempt 1: blocked with a reason.
         kb.claim_task(conn, tid)
@@ -1702,12 +1746,15 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
 
 
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
-    """An existing 'running' task from before task_runs existed should
+    """An existing 'in_progress' task from before task_runs existed should
     get a synthesized run row so subsequent operations (complete,
     heartbeat) have something to write to."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="pre-migration", assignee="worker")
+        tid = kb.create_task(
+            conn, title="pre-migration", assignee="worker",
+            initial_status="staged",
+        )
         # Simulate legacy: set running + claim_lock directly, leave
         # current_run_id NULL and delete the run row the claim created.
         kb.claim_task(conn, tid)
@@ -1881,7 +1928,9 @@ def test_archive_of_running_task_closes_run(kanban_home):
     outcome='reclaimed', not orphan it."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         run = kb.latest_run(conn, tid)
         assert run.ended_at is None
@@ -1905,7 +1954,7 @@ def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
-        # Never claimed. Move to ready (task starts in 'ready' here).
+        # Never claimed. Move to staged (task starts in 'staged' here).
         assert kb.archive_task(conn, tid) is True
         runs = kb.list_runs(conn, tid)
         assert runs == []  # No run was ever opened; archive didn't fabricate one.
@@ -1914,7 +1963,7 @@ def test_archive_of_ready_task_does_not_create_spurious_run(kanban_home):
 
 
 def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
-    """Dashboard drag-drop running->ready must close the active run.
+    """Dashboard drag-drop in_progress->staged must close the active run.
 
     Importing _set_status_direct directly to simulate the PATCH handler
     without spinning up FastAPI.
@@ -1923,17 +1972,19 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         open_run = kb.latest_run(conn, tid)
         assert open_run.ended_at is None
         prev_run_id = open_run.id
 
         # Simulate yanking the worker back to the queue.
-        assert _set_status_direct(conn, tid, "ready") is True
+        assert _set_status_direct(conn, tid, "staged") is True
 
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        assert task.status == "staged"
         assert task.current_run_id is None
         closed = kb.get_run(conn, prev_run_id)
         assert closed.ended_at is not None
@@ -1943,16 +1994,16 @@ def test_dashboard_direct_status_change_off_running_closes_run(kanban_home):
 
 
 def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanban_home):
-    """todo -> ready on an unclaimed task must not create any run rows."""
+    """backlog -> staged on an unclaimed task must not create any run rows."""
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x")
-        # Force to todo for the sake of the test.
-        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        # Force to backlog for the sake of the test.
+        conn.execute("UPDATE tasks SET status='backlog' WHERE id=?", (tid,))
         conn.commit()
-        assert _set_status_direct(conn, tid, "ready") is True
+        assert _set_status_direct(conn, tid, "staged") is True
         assert kb.list_runs(conn, tid) == []
     finally:
         conn.close()
@@ -1961,8 +2012,12 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
 def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="a", assignee="worker")
-        b = kb.create_task(conn, title="b", assignee="worker")
+        a = kb.create_task(
+            conn, title="a", assignee="worker", initial_status="staged",
+        )
+        b = kb.create_task(
+            conn, title="b", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, a); kb.claim_task(conn, b)
     finally:
         conn.close()
@@ -1982,8 +2037,8 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     # The tasks must still be running (no partial apply).
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, a).status == "running"
-        assert kb.get_task(conn, b).status == "running"
+        assert kb.get_task(conn, a).status == "in_progress"
+        assert kb.get_task(conn, b).status == "in_progress"
     finally:
         conn.close()
 
@@ -2039,12 +2094,12 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
 # -------------------------------------------------------------------------
 
 def test_complete_never_claimed_task_synthesizes_run(kanban_home):
-    """complete_task on a ready (never-claimed) task must persist the
+    """complete_task on a staged (never-claimed) task must persist the
     handoff instead of silently dropping summary/metadata."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="skip claim", assignee="worker")
-        # Task is in 'ready' state with no run opened.
+        # Task is in 'staged' state with no run opened.
         assert kb.list_runs(conn, tid) == []
         ok = kb.complete_task(
             conn, tid,
@@ -2073,7 +2128,7 @@ def test_complete_never_claimed_task_synthesizes_run(kanban_home):
 
 
 def test_block_never_claimed_task_synthesizes_run(kanban_home):
-    """block_task on a ready task must persist --reason on a synthetic run."""
+    """block_task on a staged task must persist --reason on a synthetic run."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="drop this", assignee="worker")
@@ -2111,7 +2166,9 @@ def test_event_dataclass_carries_run_id(kanban_home):
     downstream consumers (notifier, dashboard) can group by attempt."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
+        tid = kb.create_task(
+            conn, title="x", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id
         kb.complete_task(conn, tid, summary="done")
@@ -2134,7 +2191,10 @@ def test_unseen_events_for_sub_includes_run_id(kanban_home):
     """Gateway notifier path must also surface run_id on events."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="notify test", assignee="worker")
+        tid = kb.create_task(
+            conn, title="notify test", assignee="worker",
+            initial_status="staged",
+        )
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram",
             chat_id="12345", thread_id="",
@@ -2156,17 +2216,20 @@ def test_unseen_events_for_sub_includes_run_id(kanban_home):
 
 def test_claim_task_recovers_from_invariant_leak(kanban_home):
     """Belt-and-suspenders: if a prior run somehow leaked (stranded
-    current_run_id on a ready task), claim_task should recover rather
+    current_run_id on a staged task), claim_task should recover rather
     than strand it further."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="invariant test", assignee="worker")
+        tid = kb.create_task(
+            conn, title="invariant test", assignee="worker",
+            initial_status="staged",
+        )
         # Manually engineer the invariant violation: create a run, then
-        # flip status back to 'ready' without closing the run.
+        # flip status back to 'staged' without closing the run.
         kb.claim_task(conn, tid)
         leaked_run_id = kb.latest_run(conn, tid).id
         conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
             "claim_expires = NULL "
             "WHERE id = ?", (tid,),
         )
@@ -2213,7 +2276,10 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr}"
     import json as _json
     out = _json.loads(r.stdout)
-    assert out["status"] == "ready"
+    # Post hard-cut, every create path defaults to 'backlog' (cards are
+    # deliberate jots; staging is explicit). The point of this test is
+    # auto-init, not the landing column.
+    assert out["status"] == "backlog"
     # DB file exists now.
     assert (home / "kanban.db").exists()
 
@@ -2279,15 +2345,18 @@ def test_unblock_invariant_recovery(kanban_home):
     code path left it dangling. Engineer the leak, verify recovery."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="unblock invariant", assignee="worker")
-        # Start on running, then open a run, then force to 'blocked' but
+        tid = kb.create_task(
+            conn, title="unblock invariant", assignee="worker",
+            initial_status="staged",
+        )
+        # Start on in_progress, then open a run, then force to 'backlog' but
         # leave current_run_id pointing at the open run — simulate the
         # invariant violation erosika flagged.
         kb.claim_task(conn, tid)
         leaked_run_id = kb.latest_run(conn, tid).id
         # Force the bad state.
         conn.execute(
-            "UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,),
+            "UPDATE tasks SET status = 'backlog' WHERE id = ?", (tid,),
         )
         conn.commit()
         # current_run_id is still set; run is still open.
@@ -2297,7 +2366,7 @@ def test_unblock_invariant_recovery(kanban_home):
         # Unblock — the defensive recovery must close the leaked run.
         assert kb.unblock_task(conn, tid) is True
         task = kb.get_task(conn, tid)
-        assert task.status == "ready"
+        assert task.status == "staged"
         assert task.current_run_id is None
         leaked = kb.get_run(conn, leaked_run_id)
         assert leaked.outcome == "reclaimed"
@@ -2319,9 +2388,9 @@ def test_unblock_normal_path_no_spurious_run(kanban_home):
         runs_after = len(kb.list_runs(conn, tid))
         # No new run created by the happy-path unblock.
         assert runs_after == runs_before
-        # Task in ready with cleared pointer.
+        # Task in staged with cleared pointer.
         t = kb.get_task(conn, tid)
-        assert t.status == "ready"
+        assert t.status == "staged"
         assert t.current_run_id is None
     finally:
         conn.close()
@@ -2336,7 +2405,7 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-    # Fresh DB, one task left in 'running' with a claim but no run row.
+    # Fresh DB, one task left in 'in_progress' with a claim but no run row.
     # Simulates a pre-runs-era DB.
     kb.init_db()
     conn = kb.connect()
@@ -2344,7 +2413,7 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
         tid = kb.create_task(conn, title="legacy inflight", assignee="worker")
         now = int(time.time())
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock='old', "
+            "UPDATE tasks SET status='in_progress', claim_lock='old', "
             "claim_expires=?, started_at=?, current_run_id=NULL WHERE id=?",
             (now + 900, now, tid),
         )
@@ -2593,14 +2662,16 @@ def test_build_worker_context_caps_prior_attempts(kanban_home):
     blowing the prompt."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="retry", assignee="worker")
+        tid = kb.create_task(
+            conn, title="retry", assignee="worker", initial_status="staged",
+        )
         # Force 25 closed runs
         for i in range(25):
             kb.claim_task(conn, tid)
             kb._end_run(conn, tid, outcome="reclaimed",
                         summary=f"attempt {i} summary")
             conn.execute(
-                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "UPDATE tasks SET status='staged', claim_lock=NULL, "
                 "claim_expires=NULL WHERE id=?", (tid,),
             )
             conn.commit()
@@ -2682,12 +2753,14 @@ def test_build_worker_context_caps_huge_summary(kanban_home):
     worker prompt. Per-field cap truncates with a visible ellipsis."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="giant", assignee="worker")
+        tid = kb.create_task(
+            conn, title="giant", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         huge = "X" * (1024 * 1024)  # 1 MB
         kb._end_run(conn, tid, outcome="reclaimed", summary=huge)
         conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "UPDATE tasks SET status='staged', claim_lock=NULL, "
             "claim_expires=NULL WHERE id=?", (tid,),
         )
         conn.commit()
@@ -3442,14 +3515,21 @@ def _make_create_ns(**overrides):
 
 
 def test_cli_create_warns_when_no_gateway(kanban_home, monkeypatch, capsys):
-    """ready+assigned task + no gateway -> warning on stderr."""
+    """staged+assigned task + no gateway -> warning on stderr.
+
+    Post hard-cut the warning only fires for dispatch-eligible (staged)
+    assigned cards; a default backlog jot can't be dispatched yet, so the
+    task must be created directly in 'staged' to exercise the warning path.
+    """
     from hermes_cli import kanban as kb_cli
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
-    ns = _make_create_ns(title="warn-me", assignee="worker")
+    ns = _make_create_ns(
+        title="warn-me", assignee="worker", initial_status="staged",
+    )
     assert kb_cli._cmd_create(ns) == 0
     captured = capsys.readouterr()
     # Stderr has the warning prefix + guidance.
@@ -3843,11 +3923,11 @@ def test_complete_with_phantom_created_cards_raises_and_audits(kanban_home):
             )
         assert excinfo.value.phantom == [phantom_id]
 
-        # Task still in prior state (ready, not done).
+        # Task still in prior state (backlog, not done).
         row = conn.execute(
             "SELECT status FROM tasks WHERE id=?", (parent,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "backlog"
 
         # Audit event landed.
         kinds = [
@@ -3932,22 +4012,28 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
     try:
         # Two parallel completing tasks so we can exercise both retry
         # shapes without status interference.
-        parent_a = kb.create_task(conn, title="retry-empty", assignee="alice")
+        parent_a = kb.create_task(
+            conn, title="retry-empty", assignee="alice",
+            initial_status="staged",
+        )
         kb.claim_task(conn, parent_a)
-        parent_b = kb.create_task(conn, title="retry-corrected", assignee="alice")
+        parent_b = kb.create_task(
+            conn, title="retry-corrected", assignee="alice",
+            initial_status="staged",
+        )
         kb.claim_task(conn, parent_b)
         real = kb.create_task(
             conn, title="real-child", assignee="x", created_by="alice",
         )
 
-        # First attempt: phantom in the list rejects, task stays running.
+        # First attempt: phantom in the list rejects, task stays in_progress.
         with pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(
                 conn, parent_a,
                 summary="oops",
                 created_cards=["t_phantomdeadbeef"],
             )
-        assert kb.get_task(conn, parent_a).status == "running"
+        assert kb.get_task(conn, parent_a).status == "in_progress"
 
         # Retry with [] (escape hatch): gate is skipped, completion lands.
         ok = kb.complete_task(
@@ -3966,7 +4052,7 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
                 summary="oops",
                 created_cards=[real, "t_anotherphantom"],
             )
-        assert kb.get_task(conn, parent_b).status == "running"
+        assert kb.get_task(conn, parent_b).status == "in_progress"
 
         ok = kb.complete_task(
             conn, parent_b,
@@ -4069,7 +4155,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, future, 12345, t),
         )
@@ -4092,7 +4178,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
             (t,),
         ).fetchone()
-        assert row["status"] == "ready"
+        assert row["status"] == "staged"
         assert row["claim_lock"] is None
         assert row["worker_pid"] is None
 
@@ -4132,7 +4218,7 @@ def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
     try:
         t = kb.create_task(conn, title="running", assignee="orig")
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=? WHERE id=?",
+            "UPDATE tasks SET status='in_progress', claim_lock=? WHERE id=?",
             ("live", t),
         )
         conn.commit()
@@ -4157,7 +4243,7 @@ def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, future, 99999, t),
         )
@@ -4179,7 +4265,7 @@ def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
             "SELECT assignee, status FROM tasks WHERE id=?", (t,),
         ).fetchone()
         assert row["assignee"] == "new-profile"
-        assert row["status"] == "ready"
+        assert row["status"] == "staged"
     finally:
         conn.close()
 
@@ -4208,6 +4294,7 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         tid = kb.create_task(
             conn, title="overrun", assignee="worker",
             max_runtime_seconds=1,
+            initial_status="staged",
         )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, os.getpid())
@@ -4235,8 +4322,8 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         after = kb.get_task(conn, tid)
         assert after.consecutive_failures == 1
         assert "elapsed" in (after.last_failure_error or "")
-        # Task status flipped back to ready (not yet past threshold).
-        assert after.status == "ready"
+        # Task status flipped back to staged (not yet past threshold).
+        assert after.status == "staged"
     finally:
         conn.close()
 
@@ -4269,7 +4356,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
             # Fresh claim + "started long ago" each iteration.
             with kb.write_txn(conn):
                 conn.execute(
-                    "UPDATE tasks SET status='running', claim_lock=?, "
+                    "UPDATE tasks SET status='in_progress', claim_lock=?, "
                     "claim_expires=?, worker_pid=?, started_at=? "
                     "WHERE id=?",
                     (
@@ -4305,8 +4392,8 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should
         # be auto-blocked, not looping forever as ``ready``.
-        assert final.status == "blocked", \
-            f"expected blocked after 3 timeouts, got {final.status}"
+        assert final.status == "backlog", \
+            f"expected backlog after 3 timeouts, got {final.status}"
         assert final.consecutive_failures >= 3
         # ``gave_up`` event emitted (plus 3 ``timed_out`` events).
         kinds = [
@@ -4325,7 +4412,9 @@ def test_detect_crashed_workers_increments_counter(kanban_home):
     """A single crash increments the consecutive_failures counter."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="crashy", assignee="worker")
+        tid = kb.create_task(
+            conn, title="crashy", assignee="worker", initial_status="staged",
+        )
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, 99999)  # fake pid — not alive
 
@@ -4333,7 +4422,7 @@ def test_detect_crashed_workers_increments_counter(kanban_home):
 
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 1
-        assert task.status == "ready"
+        assert task.status == "staged"
     finally:
         conn.close()
 
@@ -4352,7 +4441,9 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="quiet", assignee="worker")
+        tid = kb.create_task(
+            conn, title="quiet", assignee="worker", initial_status="staged",
+        )
         host_prefix = _kb._claimer_id().split(":", 1)[0]
         lock = f"{host_prefix}:mock"
         kb.claim_task(conn, tid, claimer=lock)
@@ -4372,7 +4463,7 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
 
         assert tid in result_crashed, "should be detected as crashed"
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked", (
+        assert task.status == "backlog", (
             f"protocol violation should auto-block on first occurrence, "
             f"got status={task.status}"
         )
@@ -4404,7 +4495,9 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="crashy", assignee="worker")
+        tid = kb.create_task(
+            conn, title="crashy", assignee="worker", initial_status="staged",
+        )
         host_prefix = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
         fake_pid = 999997
@@ -4420,7 +4513,7 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
             _kb._pid_alive = original_alive
 
         task = kb.get_task(conn, tid)
-        assert task.status == "ready", (
+        assert task.status == "staged", (
             f"single non-zero crash shouldn't auto-block, got {task.status}"
         )
         assert task.consecutive_failures == 1
@@ -4442,7 +4535,7 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         lock = secrets.token_hex(4)
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status='running', claim_lock=?, "
+                "UPDATE tasks SET status='in_progress', claim_lock=?, "
                 "claim_expires=?, worker_pid=?, consecutive_failures=4, "
                 "last_failure_error='prior issue' WHERE id=?",
                 (lock, int(time.time()) + 3600, 12345, tid),
@@ -4465,7 +4558,7 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
-        assert task.status == "ready"
+        assert task.status == "staged"
     finally:
         conn.close()
 
@@ -4477,7 +4570,10 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
+        t = kb.create_task(
+            conn, title="stale-dispatch", assignee="worker",
+            initial_status="staged",
+        )
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, 99999)  # fake PID — avoid killing test
 
@@ -4498,7 +4594,7 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
             stale_timeout_seconds=14400,
         )
         assert t in res.stale, "Stale task should appear in result.stale"
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "staged"
 
 
 def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch):
@@ -4507,7 +4603,10 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
     # from reclaiming. Only stale detection (disabled via timeout=0) is tested.
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="skip-stale", assignee="worker")
+        t = kb.create_task(
+            conn, title="skip-stale", assignee="worker",
+            initial_status="staged",
+        )
         kb.claim_task(conn, t)
         # Claim sets worker_pid to 0 initially. Set it to os.getpid() so the
         # crash detector sees a live PID and skips it.
@@ -4530,4 +4629,4 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
             stale_timeout_seconds=0,
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
-        assert kb.get_task(conn, t).status == "running"
+        assert kb.get_task(conn, t).status == "in_progress"

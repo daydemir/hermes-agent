@@ -96,17 +96,71 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "triage"}
+# ---------------------------------------------------------------------------
+# Board status: SINGLE SOURCE OF TRUTH
+# ---------------------------------------------------------------------------
+# Ordered canonical board statuses. EVERYTHING (valid set, visible columns,
+# labels, icons, the data migration) derives from this tuple — do not
+# redefine status strings anywhere else (kanban.py, plugin_api.py, the dist
+# bundle and en.ts import/mirror these; agent tool enums derive from them).
+BOARD_STATUSES: tuple[str, ...] = ("backlog", "staged", "in_progress", "done", "archived")
+
+# Columns the dashboard/CLI render left-to-right. ``archived`` is hidden
+# unless include_archived.
+VISIBLE_COLUMNS: tuple[str, ...] = ("backlog", "staged", "in_progress", "done")
+
+# Human labels — the ONLY place column labels are defined; FE fallback dict
+# and en.ts mirror these values.
+STATUS_LABELS: dict[str, str] = {
+    "backlog": "Backlog",
+    "staged": "Staged",
+    "in_progress": "In Progress",
+    "done": "Done",
+    "archived": "Archived",
+}
+
+# Accepted stored statuses (fail-fast: nothing else is valid post-migration).
+VALID_STATUSES = set(BOARD_STATUSES)
+
+# create_task gate: the active columns a brand-new card may be created in.
+# A bare create defaults to backlog (jot); the dashboard "+" on a column
+# creates directly into that column (backlog/staged/in_progress). 'done' and
+# 'archived' are terminal and never valid as an initial status.
+VALID_INITIAL_STATUSES = {"backlog", "staged", "in_progress"}
+
+# Default initial status for every create path (dashboard quick-add, agent
+# tool, CLI). New cards land in backlog; staging is a deliberate move.
+DEFAULT_CREATE_INITIAL_STATUS = "backlog"
+# Alias kept for the CLI call site — same single source of truth.
+DEFAULT_CLI_INITIAL_STATUS = DEFAULT_CREATE_INITIAL_STATUS
+
+# Dispatch-eligible pre-run status (was 'ready').
+DISPATCH_ELIGIBLE_STATUS = "staged"
+# Active-work status (was 'running').
+IN_PROGRESS_STATUS = "in_progress"
+
+# Legacy -> canonical data migration map. DRY source for the one-shot
+# tasks.status backfill. Note: review and running both collapse to
+# in_progress; triage and todo both collapse to backlog; ready and
+# scheduled both collapse to staged. ('blocked' was never a stored status —
+# block_task wrote 'triage'.)
+STATUS_MIGRATION: dict[str, str] = {
+    "triage": "backlog",
+    "todo": "backlog",
+    "scheduled": "staged",
+    "ready": "staged",
+    "running": "in_progress",
+    "review": "in_progress",
+    "done": "done",
+    "archived": "archived",
+}
 # Statuses a card can be completed *from* (``complete_task``). A worker only
-# ever completes from ``running``, but a human closing a card via the
+# ever completes from ``in_progress``, but a human closing a card via the
 # dashboard "Complete" button or ``hermes kanban complete`` can legitimately
-# close one from any non-terminal column — including ``triage``/``todo``/
-# ``scheduled``/``review`` (e.g. marking a triage card "won't fix"). Only the
-# terminal states are excluded: ``done`` (already closed) and ``archived``
-# (off the board). Previously this was limited to running/ready/blocked, so
-# completing a triage card was a silent no-op that surfaced as a 409 in the
-# dashboard and "cannot complete (… terminal state)" on the CLI (#28xxx).
+# close one from any non-terminal column — ``backlog``/``staged``/
+# ``in_progress`` (e.g. marking a backlog card "won't fix"). Only the terminal
+# states are excluded: ``done`` (already closed) and ``archived`` (off the
+# board), so completing a parked card is never a silent no-op.
 COMPLETABLE_FROM_STATUSES = tuple(sorted(VALID_STATUSES - {"done", "archived"}))
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1078,6 +1132,18 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_acceptance_criteria (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    verifier TEXT NOT NULL CHECK (verifier IN ('Rolly','User')),
+    passed INTEGER NOT NULL DEFAULT 0,
+    evidence TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1088,6 +1154,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_acceptance_task       ON task_acceptance_criteria(task_id, position);
 """
 
 
@@ -1687,7 +1754,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
 
-    # One-shot backfill: any task that is 'running' before runs existed
+    # One-shot board-status hard cut (legacy -> canonical). Idempotent: an
+    # existence probe short-circuits once every row holds a canonical status,
+    # so we never open a write txn on an already-migrated board. This matters
+    # because connect() runs this on EVERY open — opening BEGIN IMMEDIATE here
+    # unconditionally would both contend for the write lock with the live
+    # gateway and, on a default (deferred) isolation connection that already
+    # has an implicit txn open, raise "cannot start a transaction within a
+    # transaction". Reversible via the pre-cut snapshot backups.
+    _task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "status" in _task_cols:
+        _legacy = [s for s, c in STATUS_MIGRATION.items() if s != c]
+        _has_legacy = conn.execute(
+            "SELECT 1 FROM tasks WHERE status IN (%s) LIMIT 1"
+            % ",".join("?" * len(_legacy)),
+            _legacy,
+        ).fetchone()
+        if _has_legacy:
+            # No explicit BEGIN IMMEDIATE here: the production connection runs
+            # in autocommit (isolation_level=None) so each UPDATE commits on its
+            # own, and the UPDATEs are idempotent + independent. Wrapping in
+            # write_txn would nest a BEGIN IMMEDIATE inside any implicit
+            # transaction a deferred-isolation caller already has open and raise
+            # "cannot start a transaction within a transaction".
+            for legacy, canonical in STATUS_MIGRATION.items():
+                if legacy == canonical:
+                    continue  # done/archived are identity — skip the no-op UPDATE
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE status = ?",
+                    (canonical, legacy),
+                )
+
+    # One-shot backfill: any task that is 'in_progress' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
     # calls have something to write to. Wrapped in write_txn to serialize
@@ -1703,7 +1801,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
-                "WHERE status = 'running' AND current_run_id IS NULL"
+                "WHERE status = 'in_progress' AND current_run_id IS NULL"
             ).fetchall()
             for row in inflight:
                 started = row["started_at"] or int(time.time())
@@ -2102,17 +2200,17 @@ def create_task(
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
-    initial_status: str = "running",
+    initial_status: str = DEFAULT_CREATE_INITIAL_STATUS,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
-    Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
-    If ``triage=True``, status is forced to ``triage`` regardless of
+    Returns the new task id.  Status is ``staged`` when there are no
+    parents (or all parents already ``done``), otherwise ``backlog``.
+    If ``triage=True``, status is forced to ``backlog`` regardless of
     parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    ``staged`` once the spec is fleshed out.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -2231,29 +2329,27 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in triage for human-ops review or for a
-                # specifier.
-                if initial_status in {"blocked", "triage"} or triage:
-                    task_status = "triage"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                # Determine the create status. ``triage`` forces the backlog
+                # park lane; otherwise the card lands in the requested active
+                # column (default backlog). A card with un-done parents cannot
+                # be staged or worked yet, so it is held in backlog until
+                # recompute_ready promotes it once every parent completes.
+                if triage:
+                    task_status = "backlog"
                 else:
-                    task_status = "ready"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                    task_status = initial_status
+                if parents:
+                    missing = _find_missing_parents(conn, parents)
+                    if missing:
+                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                    if task_status != "backlog":
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
+                        if any(r["status"] not in ("done", "archived") for r in rows):
+                            task_status = "backlog"
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2285,12 +2381,12 @@ def create_task(
                         session_id,
                     ),
                 )
-                if task_status == "ready":
+                if task_status == "staged":
                     guard_error = _mix_ready_guard_error(conn, task_id)
                     if guard_error:
-                        task_status = "todo"
+                        task_status = "backlog"
                         conn.execute(
-                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                            "UPDATE tasks SET status = 'backlog' WHERE id = ? AND status = 'staged'",
                             (task_id,),
                         )
                         _append_mix_ready_guard_event(conn, task_id, guard_error)
@@ -2419,7 +2515,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if row["claim_lock"] is not None and row["status"] == "in_progress":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
@@ -2458,13 +2554,13 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
+        # If child was staged but parent is not yet done, demote child to backlog.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
         if parent_status != "done":
             conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'backlog' WHERE id = ? AND status = 'staged'",
                 (child_id,),
             )
         _append_event(
@@ -2898,7 +2994,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     ``recompute_ready`` must *not* auto-promote it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='triage'`` by the circuit breaker or by direct
+    was set to ``status='backlog'`` by the circuit breaker or by direct
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
     """
@@ -2914,17 +3010,19 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` / ``triage`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote a dependency-parked ``backlog`` task to ``staged`` once all of
+    its parents are ``done``/``archived`` (a child unlocks when its parents
+    complete).
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``triage`` tasks are also considered for promotion (so a task
-    parked in triage purely by a parent dependency unlocks itself when the
-    parent completes), *except* in two cases:
+    A **no-parent** backlog card is a deliberate human jot and is NEVER
+    auto-promoted — it stays in backlog until a human stages it. Promotion of
+    a dependency-parked card is additionally skipped in two cases:
 
     1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay in triage until an explicit
+       ``kanban_block`` — those stay in backlog until an explicit
        ``kanban_unblock`` (#28712).
 
     2. The task's ``consecutive_failures`` has reached the effective
@@ -2948,12 +3046,12 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'triage')"
+            "FROM tasks WHERE status = 'backlog'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "triage" and _has_sticky_block(conn, task_id):
+            if cur_status == "backlog" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -2965,14 +3063,20 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # Only auto-promote a card that was parked BY a parent dependency
+            # which is now satisfied (dependency unlock). A no-parent backlog
+            # card is a deliberate human jot — it must stay in backlog until a
+            # human stages it. Without the ``parents and`` guard, recompute_ready
+            # (which runs on every card create/move/complete) would sweep the
+            # whole backlog into staged on any board without a readiness guard.
+            if parents and all(p["status"] in ("done", "archived") for p in parents):
                 guard_error = _mix_ready_guard_error(conn, task_id)
                 if guard_error:
                     _append_mix_ready_guard_event(
                         conn, task_id, guard_error, suppress_duplicate=True,
                     )
                     continue
-                if cur_status == "triage":
+                if cur_status == "backlog":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
@@ -2989,16 +3093,10 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'triage'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'staged' WHERE id = ? AND status = 'backlog'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
@@ -3015,21 +3113,21 @@ def claim_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``ready -> running``.
+    """Atomically transition ``staged -> in_progress``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``staged`` status).
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        # Structural invariant: never transition ready -> running while any
+        # Structural invariant: never transition staged -> in_progress while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
+        # release_stale_claims, manual SQL) set status='staged'. If a racy
         # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
+        # 'backlog' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         undone = conn.execute(
@@ -3040,8 +3138,8 @@ def claim_task(
         ).fetchone()
         if undone:
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'backlog' "
+                "WHERE id = ? AND status = 'staged'",
                 (task_id,),
             )
             _append_event(
@@ -3052,8 +3150,8 @@ def claim_task(
         guard_error = _mix_ready_guard_error(conn, task_id)
         if guard_error:
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'backlog' "
+                "WHERE id = ? AND status = 'staged'",
                 (task_id,),
             )
             _append_event(
@@ -3066,7 +3164,7 @@ def claim_task(
         # it when the CAS resets the pointer below. No-op when the invariant
         # holds (the common case).
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'staged'",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -3084,12 +3182,12 @@ def claim_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
+               SET status        = 'in_progress',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'ready'
+               AND status = 'staged'
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -3141,14 +3239,14 @@ def claim_review_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
+    """Atomically transition ``in_progress -> in_progress``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``review`` status).
+    already claimed (or is not in ``in_progress`` status).
 
-    Unlike ``claim_task`` (which handles ``ready -> running``), this
+    Unlike ``claim_task`` (which handles ``staged -> in_progress``), this
     does NOT check parent dependencies — the task already passed that
-    gate on its original ``todo -> ready -> running`` transition.
+    gate on its original ``backlog -> staged -> in_progress`` transition.
 
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
@@ -3160,12 +3258,12 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
+               SET status        = 'in_progress',
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
-               AND status = 'review'
+               AND status = 'in_progress'
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -3203,7 +3301,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "in_progress"},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -3226,7 +3324,7 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            "WHERE id = ? AND status = 'in_progress' AND claim_lock = ?",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -3245,7 +3343,7 @@ def release_stale_claims(
     *,
     signal_fn=None,
 ) -> int:
-    """Reset any ``running`` task whose claim has expired.
+    """Reset any ``in_progress`` task whose claim has expired.
 
     A stale-by-TTL claim whose host-local worker PID is still alive is
     *extended* (with a ``claim_extended`` event) instead of being
@@ -3276,7 +3374,7 @@ def release_stale_claims(
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE status = 'in_progress' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
@@ -3302,7 +3400,7 @@ def release_stale_claims(
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
-                    "WHERE id = ? AND status = 'running' "
+                    "WHERE id = ? AND status = 'in_progress' "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ?",
@@ -3339,9 +3437,9 @@ def release_stale_claims(
         )
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "WHERE id = ? AND status = 'in_progress' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (row["id"], row["claim_lock"], now),
             )
@@ -3385,7 +3483,7 @@ def reclaim_task(
     reason: Optional[str] = None,
     signal_fn=None,
 ) -> bool:
-    """Operator-driven reclaim: release the claim and reset to ``ready``.
+    """Operator-driven reclaim: release the claim and reset to ``staged``.
 
     Unlike :func:`release_stale_claims` which only acts on tasks whose
     ``claim_expires`` has passed, this function reclaims immediately
@@ -3394,7 +3492,7 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state (not in_progress, or doesn't exist).
     """
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
@@ -3402,8 +3500,8 @@ def reclaim_task(
     ).fetchone()
     if not row:
         return False
-    if row["status"] != "running" and row["claim_lock"] is None:
-        # Nothing to reclaim — already ready / blocked / done.
+    if row["status"] != "in_progress" and row["claim_lock"] is None:
+        # Nothing to reclaim — already staged / blocked / done.
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
@@ -3411,9 +3509,9 @@ def reclaim_task(
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'triage') "
+            "WHERE id = ? AND status IN ('in_progress', 'staged', 'backlog') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
@@ -3624,11 +3722,11 @@ def complete_task(
 
     A card can be completed from any non-terminal status (see
     :data:`COMPLETABLE_FROM_STATUSES` — everything except ``done`` and
-    ``archived``). A worker completes from ``running``, but a human
+    ``archived``). A worker completes from ``in_progress``, but a human
     closing a card via the dashboard "Complete" button or
     ``hermes kanban complete <id>`` may close one straight from
-    ``triage``/``todo``/``scheduled``/``ready``/``blocked``/``review``
-    without a claim/start/complete sequence — e.g. marking a triage card
+    ``backlog``/``staged``/``in_progress``
+    without a claim/start/complete sequence — e.g. marking a backlog card
     "won't fix". When ``expected_run_id`` is given (the worker path) the
     close is additionally pinned to that run via ``current_run_id`` so a
     stale worker can't complete a task reclaimed out from under it.
@@ -3717,7 +3815,7 @@ def complete_task(
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
-        # If complete_task was called on a never-claimed task (ready or
+        # If complete_task was called on a never-claimed task (staged or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
@@ -4102,18 +4200,23 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> triage``."""
+    """Block a card: any active column (backlog/staged/in_progress) -> backlog.
+
+    Emits a sticky ``triage_requested`` event so ``recompute_ready`` will not
+    auto-promote it back until an explicit ``unblock_task``. Blocking a card
+    already parked in backlog keeps it in backlog but still makes it sticky.
+    """
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'triage',
+                   SET status       = 'backlog',
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('backlog', 'staged', 'in_progress')
                 """,
                 (task_id,),
             )
@@ -4121,12 +4224,12 @@ def block_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'triage',
+                   SET status       = 'backlog',
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('backlog', 'staged', 'in_progress')
                    AND current_run_id = ?
                 """,
                 (task_id, int(expected_run_id)),
@@ -4160,7 +4263,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `triage` task to `ready`.
+    """Manually promote a `backlog` task to `staged`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -4177,10 +4280,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "triage"):
+    if cur_status not in ("backlog",):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'triage'"
+            f"'backlog'"
         )
 
     if not force:
@@ -4212,8 +4315,8 @@ def promote_task(
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'triage')",
+            "UPDATE tasks SET status = 'staged' "
+            "WHERE id = ? AND status = 'backlog'",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -4229,7 +4332,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``triage``/``scheduled`` -> ready or todo.
+    """Transition ``backlog``/``staged`` -> staged or backlog.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -4241,7 +4344,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('triage', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('backlog', 'staged')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -4256,10 +4359,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'triage' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
+        # Re-gate on parent completion before flipping 'backlog' back to
+        # 'staged'. Unconditionally setting status='staged' here bypasses the
         # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
+        # if parents are still in progress the task must wait in 'backlog'
         # until recompute_ready picks it up. RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         undone_parents = conn.execute(
@@ -4268,23 +4371,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        new_status = "backlog" if undone_parents else "staged"
         guard_error = None
-        if new_status == "ready":
+        if new_status == "staged":
             guard_error = _mix_ready_guard_error(conn, task_id)
             if guard_error:
-                new_status = "todo"
+                new_status = "backlog"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('triage', 'scheduled')",
+            "WHERE id = ? AND status IN ('backlog', 'staged')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
         _append_event(
             conn, task_id, "triage_released",
-            {"status": new_status} if new_status != "ready" else None,
+            {"status": new_status} if new_status != "staged" else None,
         )
         if guard_error:
             _append_mix_ready_guard_event(conn, task_id, guard_error)
@@ -4300,15 +4403,15 @@ def specify_triage_task(
     assignee: Optional[str] = None,
     author: Optional[str] = None,
 ) -> bool:
-    """Flesh out a triage task and promote it to ``todo``.
+    """Flesh out a backlog task and re-stamp it in ``backlog``.
 
     Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
-    False when the task is missing or not in the ``triage`` column — callers
+    and re-stamps ``status: backlog -> backlog`` in a single write txn. Returns
+    False when the task is missing or not in the ``backlog`` column — callers
     should surface that as "nothing to specify" rather than an error.
 
-    ``todo`` (not ``ready``) is the correct landing column: ``recompute_ready``
-    promotes parent-free / parent-done todos to ``ready`` on the next
+    ``backlog`` (not ``staged``) is the correct landing column: ``recompute_ready``
+    promotes parent-free / parent-done backlog cards to ``staged`` on the next
     dispatcher tick, which keeps the normal parent-gating behaviour intact
     for specified tasks that happen to have open parents.
 
@@ -4321,12 +4424,12 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'backlog'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        sets: list[str] = ["status = 'backlog'"]
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -4344,7 +4447,7 @@ def specify_triage_task(
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
+            f"WHERE id = ? AND status = 'backlog'",
             tuple(params),
         )
         if cur.rowcount != 1:
@@ -4363,7 +4466,7 @@ def specify_triage_task(
                     author.strip(),
                     "Specified — updated "
                     + ", ".join(changed_fields)
-                    + " and promoted to todo.",
+                    + " and re-stamped in backlog.",
                     int(time.time()),
                 ),
             )
@@ -4376,8 +4479,8 @@ def specify_triage_task(
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
-    # with no open parents flips straight to 'ready' here instead of
-    # idling in 'todo' until the next sweep.
+    # with no open parents flips straight to 'staged' here instead of
+    # idling in 'backlog' until the next sweep.
     recompute_ready(conn)
     return True
 
@@ -4391,10 +4494,10 @@ def decompose_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
 ) -> Optional[list[str]]:
-    """Fan a triage task out into child tasks and promote the root to ``todo``.
+    """Fan a backlog task out into child tasks and re-stamp the root in ``backlog``.
 
     The root task stays alive and becomes the parent of every child —
-    when all children reach ``done``, the root promotes to ``ready`` and
+    when all children reach ``done``, the root promotes to ``staged`` and
     its assignee (typically the orchestrator profile) wakes back up to
     judge completion or spawn more work.
 
@@ -4410,7 +4513,7 @@ def decompose_triage_task(
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
       - The root task does not exist
-      - The root task is not in ``triage``
+      - The root task is not in ``backlog``
       - A cycle would result (caller built a bad graph)
 
     Validation of titles/assignees happens inside the same write_txn as
@@ -4444,7 +4547,7 @@ def decompose_triage_task(
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
     # the entire sibling graph before touching the DB.  A cycle silently
-    # deadlocks every involved child in 'todo' because recompute_ready()
+    # deadlocks every involved child in 'backlog' because recompute_ready()
     # can never promote them.
     _in_deg = [0] * len(children)
     _adj: list[list[int]] = [[] for _ in range(len(children))]
@@ -4466,7 +4569,7 @@ def decompose_triage_task(
 
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
-    # ``todo``, or nothing changes. We deliberately do NOT call any
+    # ``backlog``, or nothing changes. We deliberately do NOT call any
     # kb helper that opens its own write_txn (create_task, link_tasks,
     # add_comment) from inside this block — see architecture.md
     # write_txn pitfalls. Instead we inline the INSERTs and
@@ -4479,14 +4582,14 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None:
             return None
-        if root_row["status"] != "triage":
+        if root_row["status"] != "backlog":
             return None
         tenant = root_row["tenant"]
 
-        # Create children. Status is 'todo' regardless of parents — we
+        # Create children. Status is 'backlog' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # promotes parent-free children to 'staged'.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -4496,7 +4599,7 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', 'scratch', ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, 'backlog', 'scratch', ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -4539,8 +4642,8 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
+        # Flip the root: backlog -> backlog, set assignee to the orchestrator.
+        sets = ["status = 'backlog'"]
         params: list[Any] = []
         if root_assignee is not None:
             sets.append("assignee = ?")
@@ -4573,10 +4676,10 @@ def decompose_triage_task(
             },
         )
 
-    # Outside the write_txn: promote parent-free children to 'ready'
+    # Outside the write_txn: promote parent-free children to 'staged'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
+    # stay in 'backlog' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
@@ -4656,6 +4759,251 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
+
+
+# Per-task tables that travel with the card when it moves to another board.
+# ``tasks`` and ``task_acceptance_criteria`` have TEXT primary keys, so their
+# ids are preserved verbatim with ``INSERT ... SELECT *``. ``task_comments``
+# and ``task_events`` have AUTOINCREMENT integer PKs, so they are inserted
+# with an explicit column list that OMITS ``id`` (the target assigns fresh
+# row ids; the human-meaningful ``task_id`` linkage is what matters).
+#
+# Tables intentionally DROPPED on a cross-board move (deleted from the source,
+# not carried): ``task_links`` (parent/child relationships are board-local —
+# the linked cards don't exist on the target), ``task_runs`` (attempt history
+# is tied to the source board's dispatcher/workspaces), and
+# ``kanban_notify_subs`` (gateway subscriptions are bound to the source).
+# ``task_attachments`` is NOT here — it is carried specially (rows + on-disk
+# blobs) by ``move_task_to_board`` so a moved card keeps its files.
+# Each entry: (table, match_column, columns). ``match_column`` is the column
+# used to select this task's rows (``id`` for the task row itself, ``task_id``
+# for child tables). ``columns`` is an explicit column list for tables whose
+# PK is an AUTOINCREMENT integer (so the PK is omitted and reassigned on the
+# target); ``None`` means ``SELECT *`` (TEXT-PK tables that keep their id).
+_MOVE_CARRIED_TABLES: tuple[tuple[str, str, Optional[str]], ...] = (
+    ("tasks", "id", None),
+    ("task_acceptance_criteria", "task_id", None),
+    ("task_comments", "task_id", "task_id, author, body, created_at"),
+    ("task_events", "task_id", "task_id, run_id, kind, payload, created_at"),
+)
+_MOVE_DROPPED_TABLES: tuple[str, ...] = (
+    "task_links",
+    "task_runs",
+    "kanban_notify_subs",
+)
+# Carried with bespoke handling (see ``move_task_to_board``): the metadata
+# row's AUTOINCREMENT id is reassigned on the target and ``stored_path`` is
+# rewritten to the target board's attachments dir, then the blob file is moved
+# to follow it.
+_MOVE_ATTACHMENT_COLS: tuple[str, ...] = (
+    "task_id",
+    "filename",
+    "stored_path",
+    "content_type",
+    "size",
+    "uploaded_by",
+    "created_at",
+)
+
+
+def move_task_to_board(
+    task_id: str,
+    target_board: str,
+    *,
+    board: Optional[str] = None,
+) -> dict:
+    """Move ONE task from the source board to ``target_board`` (cross-DB).
+
+    Boards are independent SQLite databases (one ``kanban.db`` per board),
+    so this is a real row migration across files — not a status change. The
+    source board is resolved the same way as every other ``kanban_db``
+    function: the ``board`` kwarg, falling back to the active board.
+
+    Carried to the target (then deleted from the source): ``tasks``,
+    ``task_comments``, ``task_events``, ``task_acceptance_criteria``. The
+    task's TEXT ``id`` is preserved. ``task_attachments`` is also carried —
+    both the metadata rows and the on-disk blobs follow the card to the
+    target board's attachments dir (a missing blob file is logged and
+    skipped, never failing the move). Dropped (deleted from the source,
+    not carried): ``task_links``, ``task_runs``, ``kanban_notify_subs`` —
+    see ``_MOVE_DROPPED_TABLES`` for why each is board-local.
+
+    Raises ``ValueError`` (fail-fast) if the task is not found on the source
+    board, the target board does not exist, the target equals the source, or
+    a task with the same id already exists on the target.
+
+    Returns ``{"task_id", "from_board", "to_board"}``.
+    """
+    from_slug = _normalize_board_slug(board) or get_current_board()
+    to_slug = _normalize_board_slug(target_board)
+    if to_slug is None:
+        raise ValueError("target_board is required")
+    if to_slug == from_slug:
+        raise ValueError(
+            f"target board {to_slug!r} is the same as the source board; nothing to move"
+        )
+    if not board_exists(to_slug):
+        raise ValueError(f"target board {to_slug!r} does not exist")
+
+    src_path = kanban_db_path(board=from_slug)
+    dst_path = kanban_db_path(board=to_slug)
+
+    # Ensure BOTH databases are fully initialized (all tables + additive
+    # migrations) before we ATTACH and copy. ``init_db`` is idempotent and
+    # routes through the same connect/migration path as the rest of the code,
+    # so the target is guaranteed to have every column the source has.
+    init_db(board=from_slug)
+    init_db(board=to_slug)
+
+    # (src, dst) blob paths to move after the DB txn commits — collected while
+    # carrying the attachment rows, performed best-effort once the rows are
+    # durably on the target so a filesystem error can't lose committed data.
+    blob_moves: list[tuple[Path, Path]] = []
+
+    # ATTACH cannot run inside an open transaction, so attach first, then open
+    # the IMMEDIATE write transaction, then detach after commit.
+    conn = connect(board=from_slug)
+    try:
+        conn.execute("ATTACH DATABASE ? AS target", (str(dst_path),))
+        try:
+            with write_txn(conn):
+                if not conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone():
+                    raise ValueError(
+                        f"task {task_id!r} not found on board {from_slug!r}"
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM target.tasks WHERE id = ?", (task_id,)
+                ).fetchone():
+                    raise ValueError(
+                        f"task {task_id!r} already exists on target board {to_slug!r}"
+                    )
+                # Carry the kept tables into the target, preserving TEXT ids and
+                # letting AUTOINCREMENT ids be reassigned on the target.
+                for table, match_col, columns in _MOVE_CARRIED_TABLES:
+                    tgt_cols = {
+                        row["name"]
+                        for row in conn.execute(f"PRAGMA target.table_info({table})")
+                    }
+                    if columns is None:
+                        candidate = [
+                            row["name"]
+                            for row in conn.execute(f"PRAGMA main.table_info({table})")
+                        ]
+                    else:
+                        candidate = [c.strip() for c in columns.split(",")]
+                    # Only carry columns present on BOTH boards. Boards can drift
+                    # (an older board carries vestigial legacy columns that a
+                    # freshly-created board never got), and a blind
+                    # INSERT...SELECT * across that gap fails with a
+                    # column-count mismatch.
+                    collist = ", ".join(c for c in candidate if c in tgt_cols)
+                    conn.execute(
+                        f"INSERT INTO target.{table} ({collist}) "
+                        f"SELECT {collist} FROM main.{table} WHERE {match_col} = ?",
+                        (task_id,),
+                    )
+                # Carry file attachments: copy each metadata row (reassigning the
+                # AUTOINCREMENT id on the target) with ``stored_path`` rewritten
+                # to the target board's per-task attachments dir, and record the
+                # blob to move so the file follows the card.
+                att_tgt_cols = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA target.table_info(task_attachments)")
+                }
+                att_cols = [c for c in _MOVE_ATTACHMENT_COLS if c in att_tgt_cols]
+                att_select = ", ".join(_MOVE_ATTACHMENT_COLS)
+                att_placeholders = ", ".join("?" for _ in att_cols)
+                tgt_att_dir = task_attachments_dir(task_id, board=to_slug)
+                for row in conn.execute(
+                    f"SELECT {att_select} FROM main.task_attachments WHERE task_id = ?",
+                    (task_id,),
+                ).fetchall():
+                    old_path = Path(row["stored_path"])
+                    new_path = tgt_att_dir / old_path.name
+                    values = [
+                        str(new_path) if c == "stored_path" else row[c]
+                        for c in att_cols
+                    ]
+                    conn.execute(
+                        f"INSERT INTO target.task_attachments ({', '.join(att_cols)}) "
+                        f"VALUES ({att_placeholders})",
+                        values,
+                    )
+                    blob_moves.append((old_path, new_path))
+                # Delete the dropped tables from the source (not carried).
+                conn.execute(
+                    "DELETE FROM main.task_links WHERE parent_id = ? OR child_id = ?",
+                    (task_id, task_id),
+                )
+                for table in _MOVE_DROPPED_TABLES:
+                    if table == "task_links":
+                        continue
+                    conn.execute(
+                        f"DELETE FROM main.{table} WHERE task_id = ?", (task_id,)
+                    )
+                # Delete the carried rows from the source. Child tables first,
+                # the ``tasks`` row last.
+                conn.execute(
+                    "DELETE FROM main.task_acceptance_criteria WHERE task_id = ?",
+                    (task_id,),
+                )
+                conn.execute(
+                    "DELETE FROM main.task_comments WHERE task_id = ?", (task_id,)
+                )
+                conn.execute(
+                    "DELETE FROM main.task_events WHERE task_id = ?", (task_id,)
+                )
+                conn.execute(
+                    "DELETE FROM main.task_attachments WHERE task_id = ?", (task_id,)
+                )
+                conn.execute("DELETE FROM main.tasks WHERE id = ?", (task_id,))
+        finally:
+            conn.execute("DETACH DATABASE target")
+    finally:
+        conn.close()
+
+    # Move the blob files to follow the card now that the rows are committed on
+    # the target. Best-effort: a missing source file is logged and skipped (the
+    # row already carried — the metadata row is the source of truth, matching
+    # the rest of the attachment code), and no filesystem error fails the move.
+    for old_path, new_path in blob_moves:
+        try:
+            if old_path.is_file():
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_path), str(new_path))
+            else:
+                _log.warning(
+                    "move_task_to_board: attachment blob missing, carried row only: %s",
+                    old_path,
+                )
+        except OSError as exc:
+            _log.warning(
+                "move_task_to_board: failed to move attachment blob %s -> %s: %s",
+                old_path,
+                new_path,
+                exc,
+            )
+    # Best-effort: drop the now-empty source per-task attachments dir.
+    try:
+        src_att_dir = task_attachments_dir(task_id, board=from_slug)
+        if src_att_dir.is_dir() and not any(src_att_dir.iterdir()):
+            src_att_dir.rmdir()
+    except OSError:
+        pass
+
+    # Re-derive readiness on both boards: the source loses a (possibly
+    # blocking) card, and the target gains one. Done on fresh connections
+    # so each board's own dispatcher view stays consistent.
+    for slug in (from_slug, to_slug):
+        rc = connect(board=slug)
+        try:
+            recompute_ready(rc)
+        finally:
+            rc.close()
+
+    return {"task_id": task_id, "from_board": from_slug, "to_board": to_slug}
 
 
 # ---------------------------------------------------------------------------
@@ -4744,22 +5092,24 @@ def schedule_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Park a task in ``scheduled`` so it is waiting on time, not human input.
+    """Park a task in ``staged`` so it is waiting on time, not human input.
 
-    ``scheduled`` tasks are intentionally not dispatchable; an external cron,
-    human action, or automation can later call ``unblock_task`` to re-gate them
-    to ``ready`` (or ``todo`` if parents are still incomplete).
+    FLAG: the old dedicated ``scheduled`` parking lane has collapsed into
+    ``staged`` (now dispatchable); the constant is remapped here and the
+    lane redesign is deferred. An external cron, human action, or automation
+    can later call ``unblock_task`` to re-gate them to ``staged`` (or
+    ``backlog`` if parents are still incomplete).
     """
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
-               SET status       = 'scheduled',
+               SET status       = 'staged',
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'triage')
+               AND status IN ('backlog', 'staged', 'in_progress')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
@@ -5107,20 +5457,20 @@ def heartbeat_worker(
     actual work process is stuck; periodic heartbeats catch that.
 
     Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    should be heartbeating (not in_progress, or claim expired).
     """
     now = int(time.time())
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status = 'in_progress'",
                 (now, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                "WHERE id = ? AND status = 'in_progress' AND current_run_id = ?",
                 (now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
@@ -5151,7 +5501,7 @@ def enforce_max_runtime(
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
-    ``timed_out`` event and drops the task back to ``ready`` so the next
+    ``timed_out`` event and drops the task back to ``staged`` so the next
     dispatcher tick re-spawns it — unless the spawn-failure circuit
     breaker has already given up, in which case the task stays blocked
     where ``_record_spawn_failure`` parked it.
@@ -5171,7 +5521,7 @@ def enforce_max_runtime(
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'in_progress' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -5216,10 +5566,10 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status = 'in_progress'",
                 (tid,),
             )
             if cur.rowcount == 1:
@@ -5269,7 +5619,7 @@ def detect_stale_running(
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
+    """Reclaim ``in_progress`` tasks that show no progress (heartbeat) within the
     staleness window.
 
     A task is considered stale when BOTH of these hold:
@@ -5280,11 +5630,11 @@ def detect_stale_running(
     2. Its ``last_heartbeat_at`` is older than
        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
 
-    On reclaim the task is reset to ``ready``, the run is closed with
+    On reclaim the task is reset to ``staged``, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
     terminated.
 
-    Only considers ``status='running'`` tasks. Blocked tasks are never
+    Only considers ``status='in_progress'`` tasks. Blocked tasks are never
     candidates.  Returns the list of reclaimed task IDs.
 
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
@@ -5304,11 +5654,11 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'in_progress'"
     ).fetchall()
 
     for row in rows:
-        # Skip if no started_at (shouldn't happen for running, but be safe).
+        # Skip if no started_at (shouldn't happen for in_progress, but be safe).
         if row["active_started_at"] is None:
             continue
 
@@ -5332,10 +5682,10 @@ def detect_stale_running(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status = 'in_progress'",
                 (tid,),
             )
             if cur.rowcount != 1:
@@ -5394,9 +5744,9 @@ def _error_fingerprint(error_text: str) -> str:
 
 
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
-    """Reclaim ``running`` tasks whose worker PID is no longer alive.
+    """Reclaim ``in_progress`` tasks whose worker PID is no longer alive.
 
-    Appends a ``crashed`` event and drops the task back to ``ready``.
+    Appends a ``crashed`` event and drops the task back to ``staged``.
     Different from ``release_stale_claims``: this checks liveness
     immediately rather than waiting for the claim TTL.
 
@@ -5406,7 +5756,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     dispatcher (the whole design is single-host).
 
     When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
+    the task was still ``in_progress`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
     ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
     on the first occurrence — retrying a worker whose CLI keeps
@@ -5423,7 +5773,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status = 'in_progress' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -5446,7 +5796,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             kind, code = _classify_worker_exit(pid)
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
+                # ``in_progress`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
                 # help.
                 protocol_violation = True
@@ -5475,9 +5825,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running'",
+                "WHERE id = ? AND status = 'in_progress'",
                 (row["id"],),
             )
             if cur.rowcount == 1:
@@ -5564,15 +5914,15 @@ def _record_task_failure(
     Modes:
 
     * ``release_claim=True, end_run=True`` — spawn-failure path.
-      Caller has a running task with an open run; this transitions
-      it back to ``ready`` (or ``blocked`` when the breaker trips),
+      Caller has an in-progress task with an open run; this transitions
+      it back to ``staged`` (or ``backlog`` when the breaker trips),
       releases the claim, and closes the run with ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
-      Caller has ALREADY flipped the task to ``ready`` and closed the
+      Caller has ALREADY flipped the task to ``staged`` and closed the
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
-      ``ready → blocked`` and a ``gave_up`` event is emitted.
+      ``staged → backlog`` and a ``gave_up`` event is emitted.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -5612,22 +5962,22 @@ def _record_task_failure(
         if failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
-                # Spawn path: still running, also clear claim state.
+                # Spawn path: still in_progress, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'triage', claim_lock = NULL, "
+                    "UPDATE tasks SET status = 'backlog', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('in_progress', 'staged')",
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
+                # Timeout/crash path: task is already at ``staged``
+                # with claim cleared; just flip to backlog + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'triage', "
+                    "UPDATE tasks SET status = 'backlog', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('staged', 'in_progress')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -5660,16 +6010,16 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: transition in_progress → staged + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = 'staged', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
+                    "WHERE id = ? AND status = 'in_progress'",
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready`` via
+                # Timeout/crash path: task is already at ``staged`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
@@ -5824,7 +6174,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
+    """Return True iff there is at least one staged+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
@@ -5833,13 +6183,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
+    Falls back to "any staged+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
+        "WHERE status = 'staged' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -5856,16 +6206,19 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
+    """Return True iff there is at least one in_progress+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
-    Mirror of :func:`has_spawnable_ready` for the review column —
+    FLAG: the dedicated ``review`` lane is gone (collapsed into
+    ``in_progress``); this helper is now effectively dead/incorrect and is
+    kept only with the status remapped — its removal is deferred as a card.
+    Mirror of :func:`has_spawnable_ready` for the old review column —
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
+        "WHERE status = 'in_progress' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
     if not rows:
@@ -5911,7 +6264,7 @@ def dispatch_once(
     prevents the dispatcher from thrashing forever on an unfixable task.
 
     ``max_spawn`` is a **live concurrency cap**, not a per-tick spawn budget:
-    it counts tasks already in ``status='running'`` plus this tick's spawns
+    it counts tasks already in ``status='in_progress'`` plus this tick's spawns
     against the limit. So ``max_spawn=4`` means "at most 4 workers running
     at any time across the whole board" — matching the gateway's stated
     intent ("limit concurrent kanban tasks"). With a per-tick interpretation
@@ -5943,33 +6296,33 @@ def dispatch_once(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
+    # Count tasks already in_progress so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
     # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
+    # board, since "in_progress" tasks aren't reclaimed by completion alone —
+    # they sit in status='in_progress' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
     running_count = 0
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'"
             ).fetchone()[0]
         )
 
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "WHERE status = 'staged' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
-    # Honour kanban.max_in_progress: if the board already has enough running
+    # Honour kanban.max_in_progress: if the board already has enough in_progress
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'in_progress'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -5994,7 +6347,7 @@ def dispatch_once(
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE status = 'in_progress' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
@@ -6020,10 +6373,10 @@ def dispatch_once(
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
-            # unassigned ready task and an operator-configured fallback
+            # unassigned staged task and an operator-configured fallback
             # exists, persist the assignment and proceed. This removes the
             # dashboard footgun where a task created without an assignee
-            # parks in 'ready' forever even though the operator's intent
+            # parks in 'staged' forever even though the operator's intent
             # ("default") was perfectly clear (#27145). Mutating the row
             # (not just the in-memory view) keeps diagnostics and the
             # board state consistent: the task is now legitimately owned
@@ -6186,17 +6539,21 @@ def dispatch_once(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
+    # FLAG: the dedicated 'review' lane collapsed into 'in_progress', so
+    # this sub-dispatch now selects the same rows as the in_progress lane
+    # and is effectively broken. The status is remapped here; the redesign
+    # (removing this duplicate dispatch) is deferred as a card.
+    # Review tasks were tasks a worker moved to 'review' (now 'in_progress')
+    # after creating a PR.  The dispatcher spawns a review agent (loading
     # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # or rejects (→ back to in_progress for the worker to fix).
     #
     # Same concurrency model as ready dispatch: review spawns count
-    # against max_spawn alongside ready tasks, so the total number of
-    # running workers stays bounded.
+    # against max_spawn alongside staged tasks, so the total number of
+    # in_progress workers stays bounded.
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
+        "WHERE status = 'in_progress' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
@@ -6988,8 +7345,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts, plus the oldest ``ready`` age in
+    """Per-status + per-assignee counts, plus the oldest ``staged`` age in
     seconds (the clearest staleness signal for a router or HUD).
+
+    Note: the output key stays ``oldest_ready_age_seconds`` for now (rename
+    to ``oldest_staged_age_seconds`` is deferred as a card to avoid breaking
+    callers); only the underlying status comparison is remapped.
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
@@ -7007,7 +7368,7 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
     oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'staged'"
     ).fetchone()
     now = int(time.time())
     oldest_ready_age = (

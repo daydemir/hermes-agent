@@ -527,6 +527,30 @@ def test_voice_invite_rejects_ended_call(voice_client, monkeypatch):
     assert resp.status_code == 409
 
 
+def test_voice_invite_rejects_ended_call_with_sanitized_call_id(voice_client, monkeypatch):
+    client, _web_server = voice_client
+    monkeypatch.setenv("HERMES_VOICE_MEET_INVITES", "1")
+
+    end_resp = client.post(
+        "/api/voice/transcript",
+        json={
+            "call_id": "ended/invite-call",
+            "role": "system",
+            "text": "ended",
+            "event_type": "call_end",
+            "user": "deniz",
+        },
+    )
+    assert end_resp.status_code == 200
+
+    resp = client.post(
+        "/api/voice/meet/invite",
+        json={"call_id": "ended/invite-call", "user": "deniz"},
+    )
+
+    assert resp.status_code == 409
+
+
 def test_voice_call_end_preserves_detached_runner_result_state(voice_client, monkeypatch):
     client, web_server = voice_client
     sent = []

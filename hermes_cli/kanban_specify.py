@@ -143,10 +143,10 @@ def specify_task(
     author: Optional[str] = None,
     timeout: Optional[int] = None,
 ) -> SpecifyOutcome:
-    """Specify a single triage task and promote it to ``todo``.
+    """Specify a single triage card (stored status ``backlog``) and promote it.
 
     Returns an outcome describing what happened. Never raises for expected
-    failure modes (task not in triage, no aux client configured, API
+    failure modes (task not in backlog, no aux client configured, API
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
@@ -154,7 +154,7 @@ def specify_task(
         task = kb.get_task(conn, task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
+    if task.status != "backlog":
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
@@ -257,14 +257,14 @@ def specify_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column.
+    """Return task ids currently in the triage column (stored status ``backlog``).
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
     with kb.connect_closing() as conn:
         tasks = kb.list_tasks(
             conn,
-            status="triage",
+            status="backlog",
             tenant=tenant,
             include_archived=False,
         )

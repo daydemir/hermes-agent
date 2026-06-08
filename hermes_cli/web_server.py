@@ -461,8 +461,9 @@ def _voice_update_call_state(event: VoiceTranscriptEvent, user: str) -> None:
     now = event.timestamp or datetime.now(timezone.utc).isoformat()
     if event.event_type not in {"call_start", "call_end"}:
         return
+    call_id = re.sub(r"[^A-Za-z0-9_.-]", "_", event.call_id).strip("._") or event.call_id
     with _VOICE_CALLS_LOCK:
-        state = _VOICE_CALLS.setdefault(event.call_id, {"call_id": event.call_id, "participants": set()})
+        state = _VOICE_CALLS.setdefault(call_id, {"call_id": call_id, "participants": set()})
         participants = state.get("participants")
         if not isinstance(participants, set):
             participants = set(participants or [])
@@ -811,7 +812,7 @@ def _voice_brain_lookup_text(query: str | None = None, limit: int = 1800) -> str
 
 
 def _voice_kanban_digest(query: str | None = None, limit: int = 2200) -> str:
-    active = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
+    active = ("backlog", "staged", "in_progress")
     try:
         con = kanban_db.connect()
         con.row_factory = sqlite3.Row

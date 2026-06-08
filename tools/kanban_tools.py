@@ -620,7 +620,7 @@ def _handle_block(args: dict, **kw) -> str:
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"in_progress/staged)"
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -750,7 +750,12 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
-    initial_status = args.get("initial_status") or "running"
+    initial_status = args.get("initial_status") or "backlog"
+    # Back-compat: a model still emitting the legacy 'running' literal
+    # maps to the canonical in_progress so create_task's
+    # VALID_INITIAL_STATUSES gate accepts it.
+    if initial_status == "running":
+        initial_status = "in_progress"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -813,7 +818,7 @@ def _handle_create(args: dict, **kw) -> str:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task back to ready."""
+    """Transition a blocked task back to staged."""
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -830,7 +835,7 @@ def _handle_unblock(args: dict, **kw) -> str:
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
-            return _ok(task_id=str(tid), status="ready")
+            return _ok(task_id=str(tid), status="staged")
         finally:
             conn.close()
     except ValueError as e:
@@ -934,8 +939,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "backlog", "staged", "in_progress",
+                    "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1174,9 +1179,9 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Parent task ids. The new task stays in 'todo' "
+                    "Parent task ids. The new task stays in 'backlog' "
                     "until every parent reaches 'done'; then it "
-                    "auto-promotes to 'ready'. Typical fan-in: list "
+                    "auto-promotes to 'staged'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),
@@ -1214,7 +1219,7 @@ KANBAN_CREATE_SCHEMA = {
             "triage": {
                 "type": "boolean",
                 "description": (
-                    "If true, task lands in 'triage' instead of 'todo' "
+                    "If true, task parks in 'backlog' for triage "
                     "— a specifier profile is expected to flesh out "
                     "the body before work starts."
                 ),
@@ -1237,12 +1242,11 @@ KANBAN_CREATE_SCHEMA = {
             },
             "initial_status": {
                 "type": "string",
-                "enum": ["running", "blocked"],
+                "enum": ["in_progress", "backlog"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial card status. Use 'backlog' to park a task "
+                    "for later instead of eager-starting it. Defaults to "
+                    "'in_progress', which preserves the usual dispatch path."
                 ),
             },
             "skills": {
@@ -1290,7 +1294,7 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Move a blocked Kanban task back to ready. Orchestrator-only — only "
+        "Move a blocked Kanban task back to staged. Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),
@@ -1299,7 +1303,7 @@ KANBAN_UNBLOCK_SCHEMA = {
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "Blocked task id to return to ready.",
+                "description": "Blocked task id to return to staged.",
             },
             "board": _board_schema_prop(),
         },
@@ -1311,7 +1315,7 @@ KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
         "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
+        "exist. The child won't promote to 'staged' until all parents "
         "are 'done'. Cycles and self-links are rejected."
     ),
     "parameters": {

@@ -163,7 +163,15 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        # Post hard-cut, create defaults to backlog; claim only transitions
+        # staged -> in_progress. Create the worker's task directly in staged
+        # so the claim lands it in in_progress.
+        tid = kb.create_task(
+            conn,
+            title="worker-test",
+            assignee="test-worker",
+            initial_status="staged",
+        )
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -177,7 +185,7 @@ def test_show_defaults_to_env_task_id(worker_env):
     d = json.loads(out)
     assert "task" in d
     assert d["task"]["id"] == worker_env
-    assert d["task"]["status"] == "running"
+    assert d["task"]["status"] == "in_progress"
     assert "worker_context" in d
     assert "runs" in d
 
@@ -202,14 +210,24 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
-        b = kb.create_task(conn, title="beta", assignee="reviewer")
-        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        # No-parent creates default to backlog post hard-cut; this test
+        # exercises the staged-status filter, so create directly in staged.
+        a = kb.create_task(
+            conn, title="alpha", assignee="factory", priority=5,
+            initial_status="staged",
+        )
+        b = kb.create_task(
+            conn, title="beta", assignee="reviewer", initial_status="staged",
+        )
+        c = kb.create_task(
+            conn, title="gamma", assignee="factory", tenant="other",
+            initial_status="staged",
+        )
     finally:
         conn.close()
 
     from tools import kanban_tools as kt
-    out = kt._handle_list({"assignee": "factory", "status": "ready", "limit": 10})
+    out = kt._handle_list({"assignee": "factory", "status": "staged", "limit": 10})
     d = json.loads(out)
     ids = [t["id"] for t in d["tasks"]]
     assert ids == [a, c]
@@ -220,7 +238,7 @@ def test_list_filters_tasks(monkeypatch, worker_env):
 
     tenant_out = kt._handle_list({
         "assignee": "factory",
-        "status": "ready",
+        "status": "staged",
         "tenant": "other",
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
@@ -526,7 +544,7 @@ def test_complete_phantom_card_message_advertises_retry(worker_env):
     # rejection did not mutate state, so the worker's retry can land.
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.get_task(conn, worker_env).status == "in_progress"
     finally:
         conn.close()
 
@@ -604,7 +622,7 @@ def test_block_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "blocked"
+        assert kb.get_task(conn, worker_env).status == "backlog"
     finally:
         conn.close()
 
@@ -757,7 +775,7 @@ def test_create_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"]
-    assert d["status"] == "todo"  # parent isn't done yet
+    assert d["status"] == "backlog"  # parent isn't done yet
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -867,7 +885,11 @@ def test_create_parses_triage_string_false(worker_env):
     conn = kb.connect()
     try:
         task = kb.get_task(conn, d["task_id"])
-        assert task.status == "ready"
+        # Post hard-cut, EVERY create path defaults to backlog — a
+        # no-parent, non-triaged create is a deliberate jot, not auto-staged.
+        # triage="false" merely means "not force-parked by the triage flag";
+        # the default lane is still backlog.
+        assert task.status == "backlog"
     finally:
         conn.close()
 
@@ -885,7 +907,7 @@ def test_create_parses_triage_string_true(worker_env):
     conn = kb.connect()
     try:
         task = kb.get_task(conn, d["task_id"])
-        assert task.status == "triage"
+        assert task.status == "backlog"
     finally:
         conn.close()
 
@@ -1004,11 +1026,11 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     out = kt._handle_unblock({"task_id": tid})
     d = json.loads(out)
     assert d["ok"] is True
-    assert d["status"] == "ready"
+    assert d["status"] == "staged"
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.get_task(conn, tid).status == "staged"
     finally:
         conn.close()
 
@@ -1064,11 +1086,11 @@ def test_worker_lifecycle_through_tools(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child is todo (parent just finished, but recompute_ready may
+        # Child is backlog (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "ready", (
-            f"child should be ready after parent done, got {child.status}"
+        assert child.status == "staged", (
+            f"child should be staged after parent done, got {child.status}"
         )
         # Comment is visible
         assert len(kb.list_comments(conn, worker_env)) == 1
@@ -1185,7 +1207,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="sibling")
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.execute("UPDATE tasks SET status='staged' WHERE id=?", (other,))
         conn.commit()
     finally:
         conn.close()
@@ -1199,7 +1221,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     # Sibling task must be untouched.
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "ready"
+        assert kb.get_task(conn, other).status == "staged"
     finally:
         conn.close()
 
@@ -1210,7 +1232,7 @@ def test_worker_block_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="sibling")
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.execute("UPDATE tasks SET status='staged' WHERE id=?", (other,))
         conn.commit()
     finally:
         conn.close()
@@ -1222,7 +1244,7 @@ def test_worker_block_rejects_foreign_task_id(worker_env):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "ready"
+        assert kb.get_task(conn, other).status == "staged"
     finally:
         conn.close()
 
@@ -1233,8 +1255,8 @@ def test_worker_heartbeat_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="sibling")
-        # Put sibling in running state so heartbeat would otherwise succeed.
-        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (other,))
+        # Put sibling in in_progress state so heartbeat would otherwise succeed.
+        conn.execute("UPDATE tasks SET status='in_progress' WHERE id=?", (other,))
         conn.commit()
     finally:
         conn.close()
@@ -1307,7 +1329,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
 
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, other).status == "blocked"
+        assert kb.get_task(conn, other).status == "backlog"
     finally:
         conn.close()
 
@@ -1357,7 +1379,7 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     conn = kb.connect()
     try:
         task = kb.get_task(conn, worker_env)
-        assert task.status == "running"
+        assert task.status == "in_progress"
         assert task.current_run_id == run2.id
     finally:
         conn.close()
@@ -1384,7 +1406,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="child to close out")
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.execute("UPDATE tasks SET status='staged' WHERE id=?", (tid,))
         conn.commit()
     finally:
         conn.close()
@@ -1578,10 +1600,12 @@ def test_board_param_routes_complete_to_alt_board(multi_board_env):
 
     with kb.connect(board="alt") as conn:
         assert kb.get_task(conn, alt_seed).status == "done"
-    # Default seed is unchanged.
+    # Default seed is unchanged — it was created as a no-parent jot, which
+    # post hard-cut lands in backlog, and operating on the alt board must
+    # not touch it.
     with kb.connect() as conn:
         default_seed = multi_board_env["default_seed"]
-        assert kb.get_task(conn, default_seed).status == "ready"
+        assert kb.get_task(conn, default_seed).status == "backlog"
 
 
 def test_board_param_routes_block_to_alt_board(multi_board_env):
@@ -1602,7 +1626,7 @@ def test_board_param_routes_block_to_alt_board(multi_board_env):
     assert d["ok"] is True
 
     with kb.connect(board="alt") as conn:
-        assert kb.get_task(conn, alt_seed).status == "blocked"
+        assert kb.get_task(conn, alt_seed).status == "backlog"
 
 
 def test_board_param_routes_unblock_to_alt_board(multi_board_env):
@@ -1613,15 +1637,15 @@ def test_board_param_routes_unblock_to_alt_board(multi_board_env):
     alt_seed = multi_board_env["alt_seed"]
     with kb.connect(board="alt") as conn:
         kb.block_task(conn, alt_seed, reason="waiting")
-        assert kb.get_task(conn, alt_seed).status == "blocked"
+        assert kb.get_task(conn, alt_seed).status == "backlog"
 
     out = kt._handle_unblock({"task_id": alt_seed, "board": "alt"})
     d = json.loads(out)
     assert d["ok"] is True
-    assert d["status"] == "ready"
+    assert d["status"] == "staged"
 
     with kb.connect(board="alt") as conn:
-        assert kb.get_task(conn, alt_seed).status == "ready"
+        assert kb.get_task(conn, alt_seed).status == "staged"
 
 
 def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
@@ -1639,9 +1663,14 @@ def test_board_param_routes_heartbeat_to_alt_board(monkeypatch, tmp_path):
 
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
-    # Seed the alt board with a claimed task.
+    # Seed the alt board with a claimed task. Create defaults to backlog
+    # post hard-cut; claim only transitions staged -> in_progress, so seed
+    # directly in staged for the claim (and thus the heartbeat) to land.
     with kb.connect(board="alt") as conn:
-        tid = kb.create_task(conn, title="alt hb", assignee="alt-worker")
+        tid = kb.create_task(
+            conn, title="alt hb", assignee="alt-worker",
+            initial_status="staged",
+        )
         kb.claim_task(conn, tid)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
 

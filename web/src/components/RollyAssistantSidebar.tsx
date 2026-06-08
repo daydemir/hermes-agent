@@ -171,6 +171,7 @@ export function RollyAssistantSidebar() {
 
   const sidRef = useRef<string | null>(null);
   const currentTurnRef = useRef<string | null>(null);
+  const sendLockRef = useRef(false);
   const lastCtxKeyRef = useRef<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -188,6 +189,7 @@ export function RollyAssistantSidebar() {
     watchdogRef.current = setTimeout(() => {
       watchdogRef.current = null;
       currentTurnRef.current = null;
+      sendLockRef.current = false;
       setBusy(false);
       setError("Rolly has gone quiet — it may still be working. Send again or reconnect.");
     }, STREAM_IDLE_TIMEOUT_MS);
@@ -274,6 +276,7 @@ export function RollyAssistantSidebar() {
         streaming: false,
       }));
       currentTurnRef.current = null;
+      sendLockRef.current = false;
       setBusy(false);
     });
 
@@ -341,6 +344,7 @@ export function RollyAssistantSidebar() {
       disarmWatchdog();
       if (ev.payload?.message) setError(ev.payload.message);
       setBusy(false);
+      sendLockRef.current = false;
       currentTurnRef.current = null;
     });
 
@@ -424,6 +428,7 @@ export function RollyAssistantSidebar() {
     setError(null);
     setMessages([]);
     currentTurnRef.current = null;
+    sendLockRef.current = false;
     setBusy(false);
     setPending(null);
     setVersion((v) => v + 1);
@@ -470,7 +475,9 @@ export function RollyAssistantSidebar() {
   const send = useCallback(() => {
     const sid = sidRef.current;
     const text = draft.trim();
-    if (!sid || !text || busy || state !== "open") return;
+    if (!sid || !text || busy || state !== "open" || sendLockRef.current) return;
+
+    sendLockRef.current = true;
 
     // Inject the compact page context only when the visible entity changed,
     // so Rolly stays oriented without spamming every turn.
@@ -488,6 +495,7 @@ export function RollyAssistantSidebar() {
     setError(null);
     armWatchdog();
     gw.request("prompt.submit", { session_id: sid, text: sent }).catch((e: Error) => {
+      sendLockRef.current = false;
       disarmWatchdog();
       setError(e.message);
       setBusy(false);
@@ -698,6 +706,7 @@ export function RollyAssistantSidebar() {
             )}
           />
           <Button
+            type="button"
             size="icon"
             onClick={send}
             disabled={state !== "open" || busy || !draft.trim()}

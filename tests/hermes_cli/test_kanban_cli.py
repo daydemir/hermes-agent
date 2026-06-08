@@ -114,18 +114,18 @@ def test_run_slash_rejects_branch_without_worktree(kanban_home):
 def test_run_slash_create_with_parent_and_cascade(kanban_home):
     # Parent then child via --parent
     out1 = kc.run_slash("create 'parent' --assignee alice")
-    # Extract the "t_xxxx" id from "Created t_xxxx (ready, ...)"
+    # Extract the "t_xxxx" id from "Created t_xxxx (staged, ...)"
     import re
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     p = m.group(1)
     out2 = kc.run_slash(f"create 'child' --assignee bob --parent {p}")
-    assert "todo" in out2  # child starts as todo
+    assert "backlog" in out2  # child starts as backlog
 
-    # Complete parent; list should promote child to ready
+    # Complete parent; list should promote child to staged
     kc.run_slash(f"complete {p}")
-    # Explicit filter: child should now be ready (was todo before complete).
-    ready_list = kc.run_slash("list --status ready")
+    # Explicit filter: child should now be staged (was backlog before complete).
+    ready_list = kc.run_slash("list --status staged")
     assert "child" in ready_list
 
 
@@ -163,7 +163,9 @@ def test_run_slash_json_output(kanban_home):
     payload = json.loads(out)
     assert payload["title"] == "jsontask"
     assert payload["assignee"] == "alice"
-    assert payload["status"] == "ready"
+    # Post hard-cut, a no-parent CLI create lands in backlog (deliberate
+    # jot); staging is a separate, deliberate step.
+    assert payload["status"] == "backlog"
 
 
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
@@ -257,9 +259,9 @@ def test_run_slash_link_unlink(kanban_home):
     ta = re.search(r"(t_[a-f0-9]+)", a).group(1)
     tb = re.search(r"(t_[a-f0-9]+)", b).group(1)
     assert "Linked" in kc.run_slash(f"link {ta} {tb}")
-    # After link, b is todo
+    # After link, b is backlog
     show = kc.run_slash(f"show {tb}")
-    assert "todo" in show
+    assert "backlog" in show
     assert "Unlinked" in kc.run_slash(f"unlink {ta} {tb}")
 
 
@@ -337,7 +339,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     try:
         lock = secrets.token_hex(4)
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, int(time.time()) + 3600, 4242, tid),
         )
@@ -354,9 +356,9 @@ def test_run_slash_reclaim_running_task(kanban_home):
 
     out = kc.run_slash(f"reclaim {tid} --reason 'test'")
     assert "Reclaimed" in out, out
-    # Status back to ready.
+    # Status back to staged.
     out2 = kc.run_slash(f"show {tid}")
-    assert "ready" in out2.lower()
+    assert "staged" in out2.lower()
 
 
 def test_run_slash_reassign_with_reclaim_flag(kanban_home):
@@ -374,7 +376,7 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     try:
         lock = secrets.token_hex(4)
         conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "UPDATE tasks SET status='in_progress', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
             (lock, int(time.time()) + 3600, 4242, tid),
         )
@@ -405,7 +407,7 @@ def test_run_slash_specify_end_to_end(kanban_home, monkeypatch):
     covers both surfaces."""
     from unittest.mock import MagicMock
 
-    # Create a triage task via the same slash surface.
+    # Create a backlog-parked task via the same slash surface.
     create_out = kc.run_slash("create 'rough idea' --triage")
     import re
     m = re.search(r"(t_[a-f0-9]+)", create_out)
@@ -433,7 +435,7 @@ def test_run_slash_specify_end_to_end(kanban_home, monkeypatch):
     # Task is promoted and retitled.
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
-    assert task.status in {"todo", "ready"}
+    assert task.status in {"backlog", "staged"}
     assert task.title == "Spec: rough idea"
 
 

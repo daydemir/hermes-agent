@@ -32,15 +32,16 @@ from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_p
 # Small formatting helpers
 # ---------------------------------------------------------------------------
 
-_STATUS_ICONS = {
-    "todo":     "◻",
-    "ready":    "▶",
-    "running":  "●",
-    "scheduled":"⏱",
-    "triage":   "⊘",
-    "done":     "✓",
-    "archived": "—",
+# One glyph per canonical board status. Keyed off kb.BOARD_STATUSES so a
+# leaked legacy status falls through to the '?' sentinel in _fmt_task_line.
+_STATUS_GLYPHS = {
+    "backlog":     "◻",
+    "staged":      "▶",
+    "in_progress": "●",
+    "done":        "✓",
+    "archived":    "—",
 }
+_STATUS_ICONS = {s: _STATUS_GLYPHS[s] for s in kb.BOARD_STATUSES}
 
 
 def _fmt_ts(ts: Optional[int]) -> str:
@@ -141,7 +142,7 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
       explaining the next step.
 
     Used by ``hermes kanban create`` (and callers) to warn when a task
-    will sit in ``ready`` because nothing is there to pick it up.
+    will sit in ``staged`` because nothing is there to pick it up.
     Defensive against import failures and config-read errors — if the
     probe itself errors, we return ``(True, "")`` so we don't spam
     false warnings (better to miss a warning than to cry wolf).
@@ -169,13 +170,13 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
         return (
             False,
             "Gateway is running but kanban.dispatch_in_gateway=false in "
-            "config.yaml — the task will sit in 'ready' until you flip it "
+            "config.yaml — the task will sit in 'staged' until you flip it "
             "back on and restart the gateway, OR run the legacy "
             "standalone daemon (`hermes kanban daemon --force`)."
         )
     return (
         False,
-        "No gateway is running — the task will sit in 'ready' until you "
+        "No gateway is running — the task will sit in 'staged' until you "
         "start it. Run:\n"
         "    hermes gateway start\n"
         "The gateway hosts an embedded dispatcher (tick interval 60s by "
@@ -316,7 +317,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
-                          help="Park in triage — a specifier will flesh out the spec and promote to todo")
+                          help="Park in backlog — a specifier will flesh out the spec and promote it onward")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
@@ -356,10 +357,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Ignored without --goal.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
-                          default="running",
-                          help="Initial card status. Use 'triage' for cards "
+                          default=kb.DEFAULT_CLI_INITIAL_STATUS,
+                          help="Initial card status. Use 'backlog' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-triage transition.")
+                               "to skip the brief in_progress-to-backlog transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -501,7 +502,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- claim ---
     p_claim = sub.add_parser(
         "claim",
-        help="Atomically claim a ready task (prints resolved workspace path)",
+        help="Atomically claim a staged task (prints resolved workspace path)",
     )
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
@@ -548,19 +549,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
-    p_block = sub.add_parser("block", help="Mark one or more tasks triage")
+    p_block = sub.add_parser("block", help="Mark one or more tasks blocked (move to Backlog)")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
 
-    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
+    p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Staged (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
-    p_unblock = sub.add_parser("unblock", help="Return one or more triage/scheduled tasks to ready")
+    p_unblock = sub.add_parser("unblock", help="Return one or more backlog/staged tasks to staged")
     p_unblock.add_argument(
         "--reason",
         default=None,
@@ -570,7 +571,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/triage tasks to ready (recovery path)",
+        help="Manually move one or more backlog tasks to staged (recovery path)",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
@@ -761,11 +762,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_ctx.add_argument("task_id")
 
-    # --- specify --- (triage → todo via auxiliary LLM)
+    # --- specify --- (backlog → onward via auxiliary LLM)
     p_specify = sub.add_parser(
         "specify",
-        help="Flesh out a triage-column task into a concrete spec "
-             "(title + body) and promote it to todo. Uses the auxiliary "
+        help="Flesh out a backlog-column task into a concrete spec "
+             "(title + body) and promote it onward. Uses the auxiliary "
              "LLM configured under auxiliary.triage_specifier.",
     )
     p_specify.add_argument(
@@ -778,7 +779,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--all",
         dest="all_triage",
         action="store_true",
-        help="Specify every task currently in the triage column",
+        help="Specify every task currently in the backlog column",
     )
     p_specify.add_argument(
         "--tenant",
@@ -797,10 +798,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
-    # --- decompose --- (triage → fan-out via auxiliary LLM + orchestrator)
+    # --- decompose --- (backlog → fan-out via auxiliary LLM + orchestrator)
     p_decompose = sub.add_parser(
         "decompose",
-        help="Decompose a triage-column task into a graph of child tasks "
+        help="Decompose a backlog-column task into a graph of child tasks "
              "routed to specialist profiles by description. Falls back to "
              "specify-style single-task promotion when the task doesn't "
              "benefit from fan-out. Uses auxiliary.kanban_decomposer.",
@@ -815,7 +816,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--all",
         dest="all_triage",
         action="store_true",
-        help="Decompose every task currently in the triage column",
+        help="Decompose every task currently in the backlog column",
     )
     p_decompose.add_argument(
         "--tenant",
@@ -1270,13 +1271,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print("No profiles found under ~/.hermes/profiles/.")
         print("Create one with `hermes -p <name> setup` before assigning tasks.")
     print()
-    print("Next step: start the gateway so ready tasks actually get picked up.")
+    print("Next step: start the gateway so staged tasks actually get picked up.")
     print("  hermes gateway start")
     print()
     print(
         "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
         "by default (config: kanban.dispatch_interval_seconds). Without a\n"
-        "running gateway, tasks stay in 'ready' forever."
+        "running gateway, tasks stay in 'staged' forever."
     )
     return 0
 
@@ -1358,7 +1359,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=getattr(args, "initial_status", kb.DEFAULT_CLI_INITIAL_STATUS),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1366,14 +1367,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
 
-        # Warn when the task would sit in `ready` because no dispatcher is
-        # present. Only warn on ready+assigned tasks — triage/todo are
+        # Warn when the task would sit in `staged` because no dispatcher is
+        # present. Only warn on staged+assigned tasks — backlog cards are
         # expected to sit idle until promoted, and unassigned tasks
         # can't be dispatched. Skipped in --json mode so the stdout
         # stream stays strictly machine-parseable for callers (the JSON
         # response itself carries enough info for them to decide if
         # they want to check dispatcher presence separately).
-        if task.status == "ready" and task.assignee:
+        if task.status == kb.DISPATCH_ELIGIBLE_STATUS and task.assignee:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
@@ -2009,9 +2010,9 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not triage/scheduled?)", file=sys.stderr)
+                print(f"cannot unblock {tid} (not backlog/staged?)", file=sys.stderr)
             else:
-                print(f"Released {tid}" + (f": {reason}" if reason else ""))
+                print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2060,7 +2061,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     for r in results:
         if r["promoted"]:
             suffix = f": {reason}" if reason else ""
-            print(f"{label} {r['task_id']} -> ready{tag}{suffix}")
+            print(f"{label} {r['task_id']} -> staged{tag}{suffix}")
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
@@ -2302,11 +2303,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             if now - health_state["last_warn_at"] >= 300:
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
+                    f"staged queue non-empty for {health_state['bad_ticks']} "
                     f"consecutive ticks but 0 workers spawned successfully. "
                     f"Check profile health (venv, PATH, credentials) and "
-                    f"`hermes kanban list --status ready` / "
-                    f"`hermes kanban list --status triage` for recent "
+                    f"`hermes kanban list --status staged` / "
+                    f"`hermes kanban list --status backlog` for recent "
                     f"spawn_failed tasks.",
                     file=sys.stderr, flush=True,
                 )
@@ -2416,8 +2417,8 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "done"):
-        print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
+    for k in kb.VISIBLE_COLUMNS:
+        print(f"  {k:11s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")
         for who, counts in sorted(stats["by_assignee"].items()):
@@ -2544,8 +2545,8 @@ def _cmd_context(args: argparse.Namespace) -> int:
 
 
 def _cmd_specify(args: argparse.Namespace) -> int:
-    """Flesh out a triage task (or all of them) via auxiliary LLM,
-    then promote to todo. Thin wrapper over ``kanban_specify``."""
+    """Flesh out a backlog task (or all of them) via auxiliary LLM,
+    then promote it onward. Thin wrapper over ``kanban_specify``."""
     from hermes_cli import kanban_specify as spec
 
     all_flag = bool(getattr(args, "all_triage", False))
@@ -2564,7 +2565,7 @@ def _cmd_specify(args: argparse.Namespace) -> int:
         ids = spec.list_triage_ids(tenant=tenant)
         if not ids:
             msg = (
-                "No triage tasks"
+                "No backlog tasks"
                 + (f" for tenant {tenant!r}" if tenant else "")
                 + "."
             )
@@ -2603,7 +2604,7 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                 if outcome.new_title
                 else ""
             )
-            print(f"Specified {outcome.task_id} → todo{title_suffix}")
+            print(f"Specified {outcome.task_id} → backlog{title_suffix}")
         else:
             print(
                 f"kanban: specify {outcome.task_id}: {outcome.reason}",
@@ -2617,7 +2618,7 @@ def _cmd_specify(args: argparse.Namespace) -> int:
 
 
 def _cmd_decompose(args: argparse.Namespace) -> int:
-    """Fan a triage task (or all of them) out into a graph of child
+    """Fan a backlog task (or all of them) out into a graph of child
     tasks via the auxiliary LLM, routed to specialist profiles by
     description. Thin wrapper over ``kanban_decompose``."""
     from hermes_cli import kanban_decompose as decomp
@@ -2638,7 +2639,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
         ids = decomp.list_triage_ids(tenant=tenant)
         if not ids:
             msg = (
-                "No triage tasks"
+                "No backlog tasks"
                 + (f" for tenant {tenant!r}" if tenant else "")
                 + "."
             )
@@ -2675,7 +2676,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 child_summary = ", ".join(outcome.child_ids)
                 print(
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
-                    f"children ({child_summary}); root promoted to todo"
+                    f"children ({child_summary}); root promoted to backlog"
                 )
             else:
                 title_suffix = (
@@ -2684,7 +2685,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                     else ""
                 )
                 print(
-                    f"Specified {outcome.task_id} → todo "
+                    f"Specified {outcome.task_id} → backlog "
                     f"(no fanout){title_suffix}"
                 )
         else:
@@ -2752,7 +2753,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
-  `block <id> [reason]` Mark triage; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Move to Backlog; `schedule <id> [reason]` parks time-delay work in Staged; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

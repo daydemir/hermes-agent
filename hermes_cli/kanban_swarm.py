@@ -164,6 +164,11 @@ def create_swarm(
             assignee=spec.profile,
             created_by=created_by,
             parents=[root],
+            # Workers are parallel and start immediately — the root is already
+            # completed above, so they are dispatch-ready. Stage them directly
+            # (create_task keeps the verifier/synthesizer in backlog because
+            # their parents aren't done yet).
+            initial_status="staged",
             tenant=tenant,
             priority=spec.priority or priority,
             workspace_kind=workspace_kind,

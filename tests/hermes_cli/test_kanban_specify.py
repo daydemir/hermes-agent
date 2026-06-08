@@ -106,8 +106,10 @@ def test_specify_task_happy_path(kanban_home):
 
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
-    # Parent-free → recompute_ready promotes to ready.
-    assert task.status == "ready"
+    # Parent-free → specify re-stamps in backlog and STAYS there. A no-parent
+    # backlog card is a deliberate human jot and is never auto-promoted by
+    # recompute_ready; only a card with ≥1 parent (all done) gets promoted.
+    assert task.status == "backlog"
     assert task.title == "Refined rough"
     assert "**Goal**" in (task.body or "")
 
@@ -133,7 +135,8 @@ def test_specify_task_falls_back_to_body_only_on_bad_json(kanban_home):
 
 def test_specify_task_rejects_non_triage_task(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="ready task")
+        # Not in the backlog column — specify only operates on backlog.
+        tid = kb.create_task(conn, title="ready task", initial_status="staged")
 
     p, client = _patch_aux_client("unused")
     with p:
@@ -166,9 +169,9 @@ def test_specify_task_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "auxiliary client" in outcome.reason
-    # Task must stay in triage — we never touched it.
+    # Task must stay in backlog — we never touched it.
     with kb.connect() as conn:
-        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).status == "backlog"
 
 
 def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
@@ -186,7 +189,7 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     assert outcome.ok is False
     assert "LLM error" in outcome.reason
     with kb.connect() as conn:
-        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).status == "backlog"
 
 
 def test_specify_task_empty_llm_response(kanban_home):
@@ -199,14 +202,15 @@ def test_specify_task_empty_llm_response(kanban_home):
 
     assert outcome.ok is False
     with kb.connect() as conn:
-        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.get_task(conn, tid).status == "backlog"
 
 
 def test_list_triage_ids(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a", triage=True)
         b = kb.create_task(conn, title="b", triage=True, tenant="proj-1")
-        kb.create_task(conn, title="c")  # not triage — excluded
+        # Not in the backlog column → excluded from the triage/backlog sweep.
+        kb.create_task(conn, title="c", initial_status="staged")
 
     ids_all = spec.list_triage_ids()
     assert set(ids_all) == {a, b}
@@ -254,13 +258,19 @@ def test_cli_specify_single_id_success(kanban_home, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert tid in out
-    assert "→ todo" in out or "-> todo" in out or "→" in out
+    assert "→ backlog" in out or "-> backlog" in out
 
 
 def test_cli_specify_all_success_and_json(kanban_home, capsys):
     with kb.connect() as conn:
-        a = kb.create_task(conn, title="a", triage=True)
-        b = kb.create_task(conn, title="b", triage=True)
+        # Each triage card has an open (not-done) parent so the recompute_ready
+        # that specify_triage_task runs does not cross-promote the other triage
+        # card out of 'backlog' mid-sweep — both cards must specify cleanly.
+        # The parents are staged (not in the triage/backlog sweep) and not done.
+        pa = kb.create_task(conn, title="pa", initial_status="staged")
+        pb = kb.create_task(conn, title="pb", initial_status="staged")
+        a = kb.create_task(conn, title="a", triage=True, parents=[pa])
+        b = kb.create_task(conn, title="b", triage=True, parents=[pb])
 
     content = jsonlib.dumps({"title": "spec", "body": "body"})
     p, _ = _patch_aux_client(content)
@@ -279,7 +289,7 @@ def test_cli_specify_all_success_and_json(kanban_home, capsys):
 def test_cli_specify_all_empty_triage_column(kanban_home, capsys):
     rc = _run_cli("specify", "--all")
     assert rc == 0
-    assert "No triage tasks" in capsys.readouterr().out
+    assert "No backlog tasks" in capsys.readouterr().out
 
 
 def test_cli_specify_all_returns_1_when_every_task_fails(kanban_home, capsys):
@@ -316,11 +326,14 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
     ids = {row["task_id"] for row in lines}
     assert ids == {inside}
 
-    # The outside task stays in triage.
+    # The outside task is never specified (filtered out by --tenant). The
+    # recompute_ready that fires while specifying the inside task does NOT
+    # touch it: a parent-free backlog card is a deliberate human jot and is
+    # never auto-promoted. It stays in 'backlog'.
     with kb.connect() as conn:
-        assert kb.get_task(conn, outside).status == "triage"
-        # The inside task was promoted.
-        assert kb.get_task(conn, inside).status in {"todo", "ready"}
+        assert kb.get_task(conn, outside).status == "backlog"
+        # The inside task is also parent-free, so it likewise stays in backlog.
+        assert kb.get_task(conn, inside).status == "backlog"
 
 
 def test_cli_specify_author_passed_through(kanban_home, capsys):

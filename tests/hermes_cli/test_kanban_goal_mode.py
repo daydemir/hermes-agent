@@ -208,7 +208,7 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
 
 def test_loop_continues_then_worker_completes(monkeypatch):
     _patch_judge(monkeypatch, ["continue", "continue"])
-    statuses = iter(["running", "running", "done"])
+    statuses = iter(["in_progress", "in_progress", "done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -237,7 +237,7 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
         task_id="t3",
         goal_text="endless task",
         run_turn=lambda p: "still going",
-        task_status_fn=lambda: "running",
+        task_status_fn=lambda: "in_progress",
         block_fn=_block,
         max_turns=3,
         first_response="turn1",
@@ -251,7 +251,7 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.
     _patch_judge(monkeypatch, ["done", "done"])
-    statuses = iter(["running", "done"])
+    statuses = iter(["in_progress", "done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -278,7 +278,7 @@ def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
         task_id="t5",
         goal_text="task",
         run_turn=lambda p: "still not finalizing",
-        task_status_fn=lambda: "running",
+        task_status_fn=lambda: "in_progress",
         block_fn=lambda r: blocked.update(reason=r),
         max_turns=10,
         first_response="looks done",

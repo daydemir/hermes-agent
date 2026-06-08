@@ -31,10 +31,10 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
 
         assert root.status == "done"
         assert root.assignee == "orchestrator"
-        assert [task.status for task in workers] == ["ready", "ready"]
+        assert [task.status for task in workers] == ["staged", "staged"]
         assert [task.assignee for task in workers] == ["researcher-a", "researcher-b"]
-        assert verifier.status == "todo"
-        assert synthesizer.status == "todo"
+        assert verifier.status == "backlog"
+        assert synthesizer.status == "backlog"
         assert set(kb.parent_ids(conn, created.verifier_id)) == set(created.worker_ids)
         assert kb.parent_ids(conn, created.synthesizer_id) == [created.verifier_id]
         assert all(created.root_id in (task.body or "") for task in workers)
@@ -97,13 +97,13 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             metadata={"confidence": 0.8},
         )
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, created.verifier_id).status == "todo"
-        assert kb.get_task(conn, created.synthesizer_id).status == "todo"
+        assert kb.get_task(conn, created.verifier_id).status == "backlog"
+        assert kb.get_task(conn, created.synthesizer_id).status == "backlog"
 
         kb.complete_task(conn, created.worker_ids[1], summary="B done")
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, created.verifier_id).status == "ready"
-        assert kb.get_task(conn, created.synthesizer_id).status == "todo"
+        assert kb.get_task(conn, created.verifier_id).status == "staged"
+        assert kb.get_task(conn, created.synthesizer_id).status == "backlog"
 
         kb.complete_task(
             conn,
@@ -112,6 +112,6 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
             metadata={"gate": "pass"},
         )
         kb.recompute_ready(conn)
-        assert kb.get_task(conn, created.synthesizer_id).status == "ready"
+        assert kb.get_task(conn, created.synthesizer_id).status == "staged"
     finally:
         conn.close()

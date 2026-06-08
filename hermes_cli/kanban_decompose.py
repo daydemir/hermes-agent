@@ -285,7 +285,7 @@ def decompose_task(
         task = kb.get_task(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
+    if task.status != "backlog":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
@@ -466,11 +466,11 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column (stored status ``backlog``)."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
-            status="triage",
+            status="backlog",
             tenant=tenant,
             limit=1000,
         )
