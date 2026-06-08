@@ -1510,6 +1510,42 @@ export default function VoiceCallPage() {
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, [requestWakeLock, status]);
+  useEffect(() => {
+    const shouldWarnOnLeave = status === "requesting" || status === "connecting" || status === "live";
+    if (!shouldWarnOnLeave) return;
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+
+    const handleDocumentClick = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest("a[href]");
+      if (!(anchor instanceof HTMLAnchorElement)) return;
+      const href = anchor.getAttribute("href");
+      if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
+      const nextUrl = new URL(anchor.href, window.location.href);
+      const currentUrl = new URL(window.location.href);
+      if (nextUrl.pathname === currentUrl.pathname && nextUrl.search === currentUrl.search && nextUrl.hash === currentUrl.hash) {
+        return;
+      }
+      if (window.confirm("A voice call is still open. Leave this page and end the call?")) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    document.addEventListener("click", handleDocumentClick, true);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      document.removeEventListener("click", handleDocumentClick, true);
+    };
+  }, [status]);
 
   const live = status === "live";
   const busy = invitePending || status === "requesting" || status === "connecting" || status === "ending";
