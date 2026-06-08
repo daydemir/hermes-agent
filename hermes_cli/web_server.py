@@ -509,6 +509,13 @@ def _voice_read_room_state(call_id: str, since: int = 0, limit: int = 200) -> Di
     if not path.exists():
         return {"ok": True, "call_id": call_id, "cursor": 0, "participants": [], "events": []}
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    def participant_state(user: str, timestamp: str | None) -> Dict[str, Any]:
+        state = participants.setdefault(user, {"user": user, "status": "unknown", "joined_at": None, "left_at": None})
+        if timestamp and not state.get("joined_at"):
+            state["joined_at"] = timestamp
+        return state
+
     for index, line in enumerate(lines, start=1):
         try:
             record = json.loads(line)
@@ -520,9 +527,24 @@ def _voice_read_room_state(call_id: str, since: int = 0, limit: int = 200) -> Di
         if event_type == "call_start":
             participants[user] = {"user": user, "status": "live", "joined_at": timestamp, "left_at": None}
         elif event_type == "call_end":
-            state = participants.setdefault(user, {"user": user, "status": "unknown", "joined_at": None, "left_at": None})
+            state = participant_state(user, timestamp)
             state["status"] = "left"
             state["left_at"] = timestamp
+        elif event_type == "connection_state":
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            state_name = str(metadata.get("state") or "")
+            if state_name in {"closed", "disconnected", "failed"}:
+                state = participant_state(user, timestamp)
+                if state.get("status") != "left":
+                    state["status"] = "disconnected"
+        elif event_type == "realtime_error":
+            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            error_code = str(metadata.get("code") or "")
+            error_text = str(record.get("text") or "")
+            if error_code == "session_expired" or "session_expired" in error_text:
+                state = participant_state(user, timestamp)
+                if state.get("status") != "left":
+                    state["status"] = "disconnected"
         if index > safe_since and len(events) < safe_limit:
             record = dict(record)
             record["index"] = index

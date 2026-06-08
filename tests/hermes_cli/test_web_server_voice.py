@@ -254,6 +254,30 @@ def test_voice_room_returns_participants_and_incremental_events(voice_client):
     assert {row["user"]: row["status"] for row in body["participants"]} == {"deniz": "live", "arman": "left"}
 
 
+def test_voice_room_marks_failed_connection_disconnected(voice_client):
+    client, _web_server = voice_client
+    for event in [
+        {"call_id": "room/2", "role": "system", "text": "Call started.", "event_type": "call_start", "user": "deniz", "timestamp": "2026-06-02T00:00:01Z", "sequence": 1},
+        {
+            "call_id": "room/2",
+            "role": "system",
+            "text": "Connection failed.",
+            "event_type": "connection_state",
+            "user": "deniz",
+            "timestamp": "2026-06-02T00:00:02Z",
+            "sequence": 2,
+            "metadata": {"state": "failed"},
+        },
+    ]:
+        assert client.post("/api/voice/transcript", json=event).status_code == 200
+
+    resp = client.get("/api/voice/room?call_id=room/2")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {row["user"]: row["status"] for row in body["participants"]} == {"deniz": "disconnected"}
+
+
 def test_voice_meet_signaling_routes_to_room_participants(voice_client):
     client, web_server = voice_client
     with web_server._VOICE_ROOM_SIGNAL_LOCK:
