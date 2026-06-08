@@ -53,10 +53,10 @@ dispatcher used to claim their task — even under unusual symlink or
 Docker layouts.
 
 Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
-worktrees so that research / ops / digital-twin workloads work alongside
-coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
-design specification.
+task_events.  Workers run in a single fixed working directory per board
+(the board's ``default_workdir`` or a per-task scratch dir) — there is no
+per-card workspace selection.  See ``docs/hermes-kanban-v1-spec.pdf`` for the
+full design specification.
 
 Concurrency strategy: WAL mode + ``BEGIN IMMEDIATE`` for write
 transactions + compare-and-swap (CAS) updates on ``tasks.status`` and
@@ -162,7 +162,6 @@ STATUS_MIGRATION: dict[str, str] = {
 # states are excluded: ``done`` (already closed) and ``archived`` (off the
 # board), so completing a parked card is never a silent no-op.
 COMPLETABLE_FROM_STATUSES = tuple(sorted(VALID_STATUSES - {"done", "archived"}))
-VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -750,8 +749,6 @@ class Task:
     created_at: int
     started_at: Optional[int]
     completed_at: Optional[int]
-    workspace_kind: str
-    workspace_path: Optional[str]
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
@@ -832,8 +829,6 @@ class Task:
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
-            workspace_kind=row["workspace_kind"],
-            workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -989,8 +984,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
-    workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
-    workspace_path       TEXT,
     branch_name          TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
@@ -2187,8 +2180,6 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
-    workspace_kind: str = "scratch",
-    workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
@@ -2235,15 +2226,8 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
-    if workspace_kind not in VALID_WORKSPACE_KINDS:
-        raise ValueError(
-            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
-            f"got {workspace_kind!r}"
-        )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
-    if branch_name and workspace_kind != "worktree":
-        raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2308,22 +2292,6 @@ def create_task(
 
     now = int(time.time())
 
-    # Resolve workspace_path from board-level default_workdir when the
-    # caller did not specify one explicitly. Board defaults represent
-    # persistent project checkouts, so only persistent workspace kinds may
-    # inherit them. Scratch workspaces are auto-deleted on completion and
-    # must stay under the per-board scratch root created by
-    # ``resolve_workspace``; inheriting ``default_workdir`` for a scratch
-    # task would point cleanup at the user's source tree (#28818). The
-    # containment guard in ``_cleanup_workspace`` is the safety rail, but
-    # we also stop the bad state from being created in the first place.
-    if workspace_path is None and workspace_kind in {"dir", "worktree"}:
-        board_slug = board if board else get_current_board()
-        board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
-        if board_default:
-            workspace_path = str(board_default)
-
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -2354,10 +2322,10 @@ def create_task(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
+                        created_by, created_at,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2368,8 +2336,6 @@ def create_task(
                         priority,
                         created_by,
                         now,
-                        workspace_kind,
-                        workspace_path,
                         branch_name,
                         tenant,
                         idempotency_key,
@@ -3915,14 +3881,31 @@ def _is_managed_scratch_path(p: Path) -> bool:
     subtrees hold Hermes' own DB, metadata, and logs, not task workspaces.
 
     Used by :func:`_cleanup_workspace` to refuse to ``shutil.rmtree`` paths
-    outside Hermes-managed storage. A board ``default_workdir`` pointing at a
-    real source tree can otherwise pair with ``workspace_kind='scratch'`` and
-    cause task completion to delete user data (#28818).
+    outside Hermes-managed storage. A board ``default_workdir`` is a persistent
+    checkout that never lives under a managed workspaces root, so cleanup never
+    deletes it (#28818).
     """
     try:
         p_abs = p.resolve(strict=False)
     except OSError:
         return False
+    for root in _managed_scratch_roots():
+        if p_abs == root:
+            continue
+        try:
+            if p_abs.is_relative_to(root):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _managed_scratch_roots() -> list[Path]:
+    """Resolved kanban-managed scratch roots: the worker-side override
+    (``HERMES_KANBAN_WORKSPACES_ROOT``), the legacy default-board root
+    (``<kanban_home>/kanban/workspaces``), and every existing board's
+    ``workspaces/`` dir. A per-task scratch dir lives directly under one of
+    these as ``<root>/<task_id>``."""
     roots: list[Path] = []
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
@@ -3958,54 +3941,31 @@ def _is_managed_scratch_path(p: Path) -> bool:
                     roots.append((entry / "workspaces").resolve(strict=False))
                 except OSError:
                     continue
-    for root in roots:
-        if p_abs == root:
-            continue
-        try:
-            if p_abs.is_relative_to(root):
-                return True
-        except ValueError:
-            continue
-    return False
+    return roots
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Remove a task's per-task scratch workspace dir + kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+
+    Only the kanban-managed per-task scratch dir (``<root>/<task_id>`` under a
+    managed workspaces root) is removed — safe by construction. A board
+    ``default_workdir`` is a persistent checkout that never lives under a managed
+    root, so it is never touched (#28818). The task id, not a stored path, drives
+    cleanup now that there is no per-card ``workspace_path``.
     """
     try:
-        row = conn.execute(
-            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
-            return
-        kind: Optional[str] = row["workspace_kind"]
-        path: Optional[str] = row["workspace_path"]
-        if kind != "scratch" or not path:
-            return
         import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            # Containment guard (#28818): a board's ``default_workdir`` can
-            # pair ``workspace_kind='scratch'`` with a user-supplied path
-            # pointing at a real source tree. Without this check, task
-            # completion would unconditionally ``shutil.rmtree`` that path
-            # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
-            else:
-                _log.warning(
-                    "Refusing to remove out-of-scratch workspace for task %s: %s "
-                    "(workspace_kind='scratch' but path is outside any "
-                    "kanban-managed workspaces root)",
-                    task_id, wp,
-                )
+        for root in _managed_scratch_roots():
+            wp = root / task_id
+            try:
+                if wp.is_dir():
+                    shutil.rmtree(wp, ignore_errors=True)
+                    _log.debug("Removed scratch workspace: %s", wp)
+            except OSError:
+                continue
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)
@@ -4037,93 +3997,6 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
             _log.debug("Killed stale tmux session: %s", session)
     except Exception:
         pass  # best-effort — never block completion
-
-
-# ---------------------------------------------------------------------------
-# First-use tip for scratch workspaces
-# ---------------------------------------------------------------------------
-#
-# Scratch workspaces are intentionally ephemeral — ``_cleanup_workspace``
-# removes them as soon as ``complete_task`` runs.  New users often don't
-# realize that and lose worker output (community report, May 2026).  The
-# behavior is right; the lack of warning is the bug.
-#
-# On the FIRST scratch workspace materialization across the whole install
-# we:
-#   1. Log a warning line on the dispatcher logger.
-#   2. Append a ``tip_scratch_workspace`` event on the task so it's visible
-#      via ``hermes kanban show <id>`` and the dashboard.
-#   3. Touch a sentinel file under ``kanban_home() / '.scratch_tip_shown'``
-#      so we don't repeat the tip — once you know, you know.
-#
-# Scope is per-install, not per-board: a user creating a second board
-# already learned the lesson on board #1.
-
-_SCRATCH_TIP_SENTINEL_NAME = ".scratch_tip_shown"
-
-_SCRATCH_TIP_MESSAGE = (
-    "scratch workspaces are ephemeral — they're deleted when the task "
-    "completes. Use --workspace worktree: (git worktree) or "
-    "--workspace dir:/abs/path (existing dir) to preserve worker output."
-)
-
-
-def _scratch_tip_sentinel_path() -> Path:
-    """Path to the per-install scratch-workspace-tip sentinel file."""
-    return kanban_home() / _SCRATCH_TIP_SENTINEL_NAME
-
-
-def _scratch_tip_shown() -> bool:
-    """True iff the scratch-workspace tip has already been emitted on this
-    install. Best-effort — any error means we re-emit, which is the safer
-    failure mode for a help message."""
-    try:
-        return _scratch_tip_sentinel_path().exists()
-    except OSError:
-        return False
-
-
-def _mark_scratch_tip_shown() -> None:
-    """Touch the sentinel so future scratch workspaces stay silent.
-
-    Best-effort: a failure here just means the tip might appear once more,
-    which is preferable to crashing dispatch over a help message.
-    """
-    try:
-        path = _scratch_tip_sentinel_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch(exist_ok=True)
-    except OSError:
-        pass
-
-
-def _maybe_emit_scratch_tip(
-    conn: sqlite3.Connection,
-    task_id: str,
-    workspace_kind: Optional[str],
-) -> None:
-    """Emit the first-use scratch-workspace tip exactly once per install.
-
-    Called from the dispatcher right after a scratch workspace is
-    materialized. No-op for ``worktree`` / ``dir`` workspaces (they're
-    preserved by design) and no-op after the sentinel exists.
-    """
-    if (workspace_kind or "scratch") != "scratch":
-        return
-    if _scratch_tip_shown():
-        return
-    try:
-        _log.warning("kanban: %s (task %s)", _SCRATCH_TIP_MESSAGE, task_id)
-        with write_txn(conn):
-            _append_event(
-                conn, task_id, "tip_scratch_workspace",
-                {"message": _SCRATCH_TIP_MESSAGE},
-            )
-    except Exception:
-        # Best-effort — never block the spawn loop over a help message.
-        pass
-    finally:
-        _mark_scratch_tip_shown()
 
 
 def edit_completed_task_result(
@@ -4597,9 +4470,9 @@ def decompose_triage_task(
             assignee = _canonical_assignee(child.get("assignee"))
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
+                "(id, title, body, assignee, status, "
                 " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'backlog', 'scratch', ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, 'backlog', ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5011,77 +4884,31 @@ def move_task_to_board(
 # ---------------------------------------------------------------------------
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
-    """Resolve (and create if needed) the workspace for a task.
+    """Resolve (and create) the working directory for a task's worker.
 
-    - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
-      where ``<board-root>`` is the active board's root. The path is the
-      same for the dispatcher and every profile worker, so handoff is
-      path-stable.
-    - ``dir:<path>``: the path stored in ``workspace_path``.  Created
-      if missing.  MUST be absolute — relative paths are rejected to
-      prevent confused-deputy traversal where ``../../../tmp/attacker``
-      resolves against the dispatcher's CWD instead of a meaningful
-      root.  Users who want a kanban-root-relative workspace should
-      compute the absolute path themselves.
-    - ``worktree``: a git worktree at ``workspace_path``.  Not created
-      automatically in v1 -- the kanban-worker skill documents
-      ``git worktree add`` as a worker-side step.  Returns the intended path.
+    There is no per-card workspace selection anymore — every card runs in a
+    single fixed working directory per board:
 
-    Persist the resolved path back to the task row via ``set_workspace_path``
-    so subsequent runs reuse the same directory.
+    - the board's ``default_workdir`` (a persistent checkout) when one is set, or
+    - a per-task scratch dir under ``<board-root>/workspaces/<id>/`` otherwise.
+
+    The path is deterministic from the task id + board, so it does not need to
+    be persisted on the row; the dispatcher and every profile worker resolve the
+    same directory. A board ``default_workdir`` must be an absolute path.
     """
-    kind = task.workspace_kind or "scratch"
-    if kind == "scratch":
-        if task.workspace_path:
-            # Legacy scratch tasks that were set to an explicit path get the
-            # same absolute-path guard as dir: — consistent with the
-            # threat model.
-            p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
-                raise ValueError(
-                    f"task {task.id} has non-absolute workspace_path "
-                    f"{task.workspace_path!r}; workspace paths must be absolute"
-                )
-        else:
-            p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    if kind == "dir":
-        if not task.workspace_path:
-            raise ValueError(
-                f"task {task.id} has workspace_kind=dir but no workspace_path"
-            )
-        p = Path(task.workspace_path).expanduser()
+    board_slug = board if board else get_current_board()
+    default_workdir = read_board_metadata(board_slug).get("default_workdir")
+    if default_workdir:
+        p = Path(default_workdir).expanduser()
         if not p.is_absolute():
             raise ValueError(
-                f"task {task.id} has non-absolute workspace_path "
-                f"{task.workspace_path!r}; use an absolute path "
-                f"(relative paths are ambiguous against the dispatcher's CWD)"
+                f"board {board_slug!r} default_workdir {default_workdir!r} "
+                f"must be an absolute path"
             )
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-    if kind == "worktree":
-        if not task.workspace_path:
-            # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
-            )
-        return p
-    raise ValueError(f"unknown workspace_kind: {kind}")
-
-
-def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
-) -> None:
-    with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-            (str(path), task_id),
-        )
+    else:
+        p = workspaces_root(board=board) / task.id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -5186,7 +5013,7 @@ class DispatchResult:
     reclaimed: int = 0
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
-    """List of ``(task_id, assignee, workspace_path)`` triples."""
+    """List of ``(task_id, assignee, workdir)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -6255,7 +6082,7 @@ def dispatch_once(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
-         ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
+         ``spawn_fn(task, workdir, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
 
@@ -6495,9 +6322,6 @@ def dispatch_once(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -6585,9 +6409,6 @@ def dispatch_once(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load sdlc-review skill for review agents.  The
         # _default_spawn function already auto-loads kanban-worker, and
         # appends task.skills via --skills.  Setting task.skills here
@@ -7162,7 +6983,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Status:   {task.status}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,

@@ -86,8 +86,6 @@ def create_swarm(
     synthesizer_title: str = "Synthesize swarm outputs",
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
-    workspace_kind: str = "scratch",
-    workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
@@ -122,8 +120,6 @@ def create_swarm(
         tenant=tenant,
         priority=priority,
         idempotency_key=idempotency_key,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
         skills=["kanban-orchestrator"],
     )
 
@@ -171,8 +167,6 @@ def create_swarm(
             initial_status="staged",
             tenant=tenant,
             priority=spec.priority or priority,
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
         )
@@ -193,8 +187,6 @@ def create_swarm(
         parents=worker_ids,
         tenant=tenant,
         priority=priority,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
         skills=["requesting-code-review"],
     )
 
@@ -212,8 +204,6 @@ def create_swarm(
         parents=[verifier],
         tenant=tenant,
         priority=priority,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
         skills=["humanizer"],
     )
 

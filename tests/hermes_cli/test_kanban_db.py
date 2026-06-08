@@ -201,7 +201,6 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t is not None
     assert t.status == "backlog"
     assert t.assignee == "alice"
-    assert t.workspace_kind == "scratch"
 
 
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
@@ -254,19 +253,12 @@ def test_create_task_unknown_parent_errors(kanban_home):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])
 
 
-def test_workspace_kind_validation(kanban_home):
-    with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
-        kb.create_task(conn, title="bad ws", workspace_kind="cloud")
-
-
 def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     with kb.connect() as conn:
         tid = kb.create_task(
             conn,
             title="ship worktree",
-            workspace_kind="worktree",
-            workspace_path=str(target),
             branch_name=" wt/t6-wire ",
         )
         task = kb.get_task(conn, tid)
@@ -276,16 +268,6 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert task.branch_name == "wt/t6-wire"
     assert events[0].payload["branch_name"] == "wt/t6-wire"
     assert "Branch:   wt/t6-wire" in context
-
-
-def test_branch_name_requires_worktree_workspace(kanban_home):
-    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
-        kb.create_task(
-            conn,
-            title="bad branch",
-            workspace_kind="scratch",
-            branch_name="wt/bad",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1786,30 +1768,6 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     assert "kanban" in str(ws)
 
 
-def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
-    target = tmp_path / "my-vault"
-    with kb.connect() as conn:
-        t = kb.create_task(
-            conn, title="biz", workspace_kind="dir", workspace_path=str(target)
-        )
-        task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-    assert ws == target
-    assert ws.exists()
-
-
-def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
-    target = str(tmp_path / ".worktrees" / "my-task")
-    with kb.connect() as conn:
-        t = kb.create_task(
-            conn, title="ship", workspace_kind="worktree", workspace_path=target
-        )
-        task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
-
-
 # ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
@@ -1818,38 +1776,32 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     """A scratch workspace under the kanban workspaces root is removed."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="scratchy")
-        task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, t, ws)
-        assert ws.is_dir()
+        scratch_dir = kb.workspaces_root() / t
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        assert scratch_dir.is_dir()
         kb.complete_task(conn, t, result="ok")
-    assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
+    assert not scratch_dir.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
 def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
-    """A scratch task with a user path outside the workspaces root must NOT be deleted (#28818).
+    """A board ``default_workdir`` (a real checkout outside any managed root)
+    must NOT be deleted when its task completes (#28818).
 
-    Reproduces the data-loss vector where a board's ``default_workdir`` is set
-    to a real source directory; tasks created without an explicit
-    ``workspace_kind`` inherit ``scratch`` semantics, and the old cleanup path
-    would ``shutil.rmtree`` the user's source tree on task completion.
+    Cleanup is now board-agnostic: it only ever removes ``<managed_root>/<id>``.
+    A board ``default_workdir`` never lives under a managed workspaces root, so
+    it is structurally safe — verified here end to end.
     """
     real_source = tmp_path / "real-source"
     real_source.mkdir()
     (real_source / ".git").mkdir()
     (real_source / "README.md").write_text("important", encoding="utf-8")
 
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship")
-        # Simulate the bad state directly: workspace_kind='scratch' (default)
-        # but workspace_path pointing at the user's real source tree, which is
-        # exactly what board.default_workdir produces when the task is created
-        # without an explicit workspace_kind.
-        conn.execute(
-            "UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=?",
-            ("scratch", str(real_source), t),
-        )
-        conn.commit()
+    kb.create_board("ws-board", default_workdir=str(real_source))
+    with kb.connect(board="ws-board") as conn:
+        t = kb.create_task(conn, title="ship", board="ws-board")
+        # The resolved workspace for this task is the board default_workdir.
+        task = kb.get_task(conn, t)
+        assert kb.resolve_workspace(task, board="ws-board") == real_source
         kb.complete_task(conn, t, result="ok")
 
     assert real_source.exists(), "User source tree must not be deleted by scratch cleanup"
@@ -1873,15 +1825,13 @@ def test_cleanup_workspace_honors_workspaces_root_env_override(tmp_path, monkeyp
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspaces_override))
     kb.init_db()
 
+    # The override root is part of the managed-scratch set.
+    assert workspaces_override.resolve() in kb._managed_scratch_roots()
+
     with kb.connect() as conn:
         t = kb.create_task(conn, title="ext")
         scratch_dir = workspaces_override / t
         scratch_dir.mkdir()
-        conn.execute(
-            "UPDATE tasks SET workspace_kind=?, workspace_path=? WHERE id=?",
-            ("scratch", str(scratch_dir), t),
-        )
-        conn.commit()
         kb.complete_task(conn, t, result="ok")
 
     assert not scratch_dir.exists(), "Override-root scratch dir should be cleaned up"
@@ -2337,8 +2287,6 @@ class TestSharedBoardPaths:
             created_at=0,
             started_at=None,
             completed_at=None,
-            workspace_kind="worktree",
-            workspace_path=str(tmp_path / "ws"),
             claim_lock=None,
             claim_expires=None,
             tenant=None,
@@ -2841,8 +2789,6 @@ def _make_task(**overrides) -> "kb.Task":
         created_at=0,
         started_at=None,
         completed_at=None,
-        workspace_kind="scratch",
-        workspace_path=None,
         claim_lock=None,
         claim_expires=None,
         tenant=None,
@@ -2947,66 +2893,6 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
         conn.close()
     age = kb.task_age(task)
     assert age["created_age_seconds"] is None
-
-
-# ---------------------------------------------------------------------------
-# Board-level default_workdir
-# ---------------------------------------------------------------------------
-
-
-def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kanban_home, monkeypatch):
-    """Scratch tasks must NOT inherit board.default_workdir — would point auto-cleanup
-    at the user's source tree on completion (#28818)."""
-    default_wd = "/home/user/project"
-    kb.create_board("work-proj", default_workdir=default_wd)
-
-    with kb.connect(board="work-proj") as conn:
-        tid = kb.create_task(conn, title="scratch-task", board="work-proj")
-        t = kb.get_task(conn, tid)
-    assert t is not None
-    assert t.workspace_kind == "scratch"
-    assert t.workspace_path is None
-
-
-def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban_home, monkeypatch):
-    """Board default_workdir is for persistent dir/worktree workspaces, not scratch."""
-    default_wd = "/home/user/project"
-    kb.create_board("work-proj-dir", default_workdir=default_wd)
-
-    with kb.connect(board="work-proj-dir") as conn:
-        tid = kb.create_task(
-            conn,
-            title="inherited",
-            workspace_kind="dir",
-            board="work-proj-dir",
-        )
-        t = kb.get_task(conn, tid)
-    assert t is not None
-    assert t.workspace_path == default_wd
-
-
-def test_create_task_without_workspace_no_default_stays_none(kanban_home):
-    """Board without default_workdir → create_task without workspace_path → stays None."""
-    kb.create_board("empty-board")
-
-    with kb.connect(board="empty-board") as conn:
-        tid = kb.create_task(conn, title="none", board="empty-board")
-        t = kb.get_task(conn, tid)
-    assert t is not None
-    assert t.workspace_path is None
-
-
-def test_create_task_with_explicit_workspace_ignores_board_default(kanban_home):
-    """create_task with explicit workspace_path → ignores board default."""
-    kb.create_board("custom-ws-board", default_workdir="/board/default")
-
-    explicit = "/my/explicit/path"
-    with kb.connect(board="custom-ws-board") as conn:
-        tid = kb.create_task(conn, title="explicit", workspace_path=explicit, board="custom-ws-board")
-        t = kb.get_task(conn, tid)
-    assert t is not None
-    assert t.workspace_path == explicit
-    assert t.workspace_path != "/board/default"
 
 
 # ---------------------------------------------------------------------------
@@ -3638,111 +3524,6 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
     with kb.connect(db_path=db_path) as conn:
         tasks = kb.list_tasks(conn)
     assert [t.title for t in tasks] == ["keeps"]
-
-
-# ---------------------------------------------------------------------------
-# First-use tip for scratch workspaces
-# ---------------------------------------------------------------------------
-
-def test_maybe_emit_scratch_tip_fires_once_per_install(kanban_home, caplog):
-    """First scratch workspace materialization warns + emits an event.
-
-    Subsequent scratch workspaces on the SAME install stay silent — the
-    sentinel file under kanban_home() flips after the first emit.
-    """
-    import logging
-
-    with kb.connect() as conn:
-        t1 = kb.create_task(conn, title="first scratch")
-        t2 = kb.create_task(conn, title="second scratch")
-
-    # Sentinel must not exist yet on a fresh install.
-    assert not kb._scratch_tip_shown()
-
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        with kb.connect() as conn:
-            kb._maybe_emit_scratch_tip(conn, t1, "scratch")
-
-    # Sentinel is now set.
-    assert kb._scratch_tip_shown()
-    assert kb._scratch_tip_sentinel_path().exists()
-
-    # Warning was logged exactly once.
-    tip_records = [
-        r for r in caplog.records
-        if "scratch workspaces are ephemeral" in r.getMessage()
-    ]
-    assert len(tip_records) == 1, (
-        f"Expected exactly one tip warning, got {len(tip_records)}: "
-        f"{[r.getMessage() for r in tip_records]!r}"
-    )
-
-    # An event row was appended on the first task.
-    with kb.connect() as conn:
-        events = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
-            (t1,),
-        ).fetchall()
-    kinds = [e["kind"] for e in events]
-    assert "tip_scratch_workspace" in kinds, (
-        f"Expected tip_scratch_workspace event on first scratch task; "
-        f"got {kinds!r}"
-    )
-
-    # Second scratch materialization on the same install stays silent.
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        with kb.connect() as conn:
-            kb._maybe_emit_scratch_tip(conn, t2, "scratch")
-    tip_records2 = [
-        r for r in caplog.records
-        if "scratch workspaces are ephemeral" in r.getMessage()
-    ]
-    assert tip_records2 == [], (
-        f"Tip should not re-fire after sentinel is set; got "
-        f"{[r.getMessage() for r in tip_records2]!r}"
-    )
-    with kb.connect() as conn:
-        events2 = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
-            (t2,),
-        ).fetchall()
-    assert "tip_scratch_workspace" not in [e["kind"] for e in events2], (
-        "Tip event should not be appended for subsequent scratch tasks."
-    )
-
-
-def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog):
-    """worktree/dir workspaces are preserved on completion and must not
-    trigger the scratch-cleanup tip."""
-    import logging
-
-    with kb.connect() as conn:
-        t_wt = kb.create_task(conn, title="worktree task")
-        t_dir = kb.create_task(conn, title="dir task")
-
-    assert not kb._scratch_tip_shown()
-
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        with kb.connect() as conn:
-            kb._maybe_emit_scratch_tip(conn, t_wt, "worktree")
-            kb._maybe_emit_scratch_tip(conn, t_dir, "dir")
-
-    # Sentinel stays unset — these workspaces are preserved by design,
-    # so the warning is irrelevant for them and we save the one-shot
-    # for a real scratch user.
-    assert not kb._scratch_tip_shown()
-    tip_records = [
-        r for r in caplog.records
-        if "scratch workspaces are ephemeral" in r.getMessage()
-    ]
-    assert tip_records == []
-    with kb.connect() as conn:
-        for tid in (t_wt, t_dir):
-            events = conn.execute(
-                "SELECT kind FROM task_events WHERE task_id = ?", (tid,),
-            ).fetchall()
-            assert "tip_scratch_workspace" not in [e["kind"] for e in events]
 
 
 # ---------------------------------------------------------------------------

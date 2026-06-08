@@ -228,15 +228,11 @@ def test_archived_children_count_as_completed_progress(client):
 
 
 def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
-    workspace = tmp_path / "work dir"
-    workspace.mkdir()
     r = client.post(
         "/api/plugins/kanban/tasks",
         json={
             "title": "Implement card workspace",
             "body": "Keep launch manual.",
-            "workspace_kind": "dir",
-            "workspace_path": str(workspace),
         },
     )
     assert r.status_code == 200, r.text
@@ -247,12 +243,13 @@ def test_claude_context_endpoint_returns_manual_copy_launch(client, tmp_path):
     data = r.json()
     assert data["mode"] == "card-tmux-single-window"
     assert data["task_id"] == task_id
-    assert data["workspace_path"] == str(workspace.resolve())
+    # There is no per-card workspace anymore: the launch dir falls back to home.
+    home = str(Path.home().resolve())
+    assert data["workspace_path"] == home
     expected_session = "card-" + task_id.replace("_", "-")
-    assert data["command"] == f"tmux new-session -A -s {expected_session} -c '{workspace.resolve()}'"
+    assert data["command"] == f"tmux new-session -A -s {expected_session} -c {home}"
     assert data["session_name"] == expected_session
     assert "Implement card workspace" in data["prompt"]
-    assert "manual Claude Code" in data["prompt"]
     assert f"Card id: {task_id}" in data["rolly_prompt"]
     assert "Title: Implement card workspace" in data["rolly_prompt"]
     assert "First, look up the card by id" in data["rolly_prompt"]
@@ -277,11 +274,11 @@ def test_claude_context_endpoint_defaults_scratch_workspace_to_home(client):
 
 
 def test_tmux_session_endpoint_starts_single_card_window(client, tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    # No per-card workspace: the launch dir falls back to home.
+    workspace = Path.home().resolve()
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "Run terminal", "workspace_kind": "dir", "workspace_path": str(workspace)},
+        json={"title": "Run terminal"},
     )
     assert r.status_code == 200, r.text
     task_id = r.json()["task"]["id"]
@@ -318,7 +315,7 @@ def test_tmux_session_endpoint_starts_single_card_window(client, tmp_path, monke
     assert calls[1][0] == ["tmux", "has-session", "-t", expected_session]
     # Exactly ONE window is created, rooted at the card workspace.
     assert calls[2][0] == [
-        "tmux", "new-session", "-d", "-s", expected_session, "-n", "terminal", "-c", str(workspace.resolve()),
+        "tmux", "new-session", "-d", "-s", expected_session, "-n", "terminal", "-c", str(workspace),
     ]
     assert len(calls) == 3
     assert not any(c[0][1] == "new-window" for c in calls)
@@ -365,11 +362,11 @@ def test_tmux_session_endpoint_reconnect_is_idempotent_when_window_present(clien
 
 
 def test_tmux_session_endpoint_recreates_missing_terminal_window(client, tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    # No per-card workspace: the launch dir falls back to home.
+    workspace = Path.home().resolve()
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "Repair", "workspace_kind": "dir", "workspace_path": str(workspace)},
+        json={"title": "Repair"},
     )
     assert r.status_code == 200, r.text
     task_id = r.json()["task"]["id"]
@@ -397,7 +394,7 @@ def test_tmux_session_endpoint_recreates_missing_terminal_window(client, tmp_pat
     data = r.json()
     assert data["started"] is False
     # Exactly one window is (re)created, still named 'terminal' at the workspace.
-    assert ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace.resolve())] in [
+    assert ["tmux", "new-window", "-t", expected_session, "-n", "terminal", "-c", str(workspace)] in [
         c[0] for c in calls
     ]
     assert not any(c[0][1] == "new-session" for c in calls)

@@ -317,8 +317,6 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "status": task.status,
         "priority": task.priority,
         "tenant": task.tenant,
-        "workspace_kind": task.workspace_kind,
-        "workspace_path": task.workspace_path,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -362,8 +360,6 @@ def _handle_show(args: dict, **kw) -> str:
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
-                    "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -743,8 +739,6 @@ def _handle_create(args: dict, **kw) -> str:
     # CLI / dashboard paths and on legacy hosts that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
-    workspace_kind = args.get("workspace_kind") or "scratch"
-    workspace_path = args.get("workspace_path")
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -786,8 +780,6 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1198,22 +1190,6 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Dispatcher tiebreaker. Higher = picked sooner "
                     "when multiple ready tasks share an assignee."
-                ),
-            },
-            "workspace_kind": {
-                "type": "string",
-                "enum": ["scratch", "dir", "worktree"],
-                "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
-                ),
-            },
-            "workspace_path": {
-                "type": "string",
-                "description": (
-                    "Absolute path for 'dir' or 'worktree' workspace. "
-                    "Relative paths are rejected at dispatch."
                 ),
             },
             "triage": {

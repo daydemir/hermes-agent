@@ -25,26 +25,28 @@ def _trim(text: Optional[str], limit: int) -> str:
     return text[: limit - 20].rstrip() + "\n…[truncated]"
 
 
-def _workspace_path(task: kanban_db.Task) -> Path:
-    if not task.workspace_path:
-        if task.workspace_kind == "scratch":
-            return Path.home().resolve()
-        raise CardContextError(
-            f"task {task.id} has no workspace_path; set a concrete repo/workspace before launching Claude Code"
-        )
-    path = Path(task.workspace_path).expanduser()
-    if not path.exists():
-        raise CardContextError(f"task {task.id} workspace_path does not exist: {path}")
-    if not path.is_dir():
-        raise CardContextError(f"task {task.id} workspace_path is not a directory: {path}")
-    return path.resolve()
+def _workspace_path(task: kanban_db.Task, *, board: Optional[str] = None) -> Path:
+    """Directory a Claude Code session for this card launches in: the board's
+    ``default_workdir`` (a real checkout) when set, else the user's home. There
+    is no per-card workspace anymore — every card launches in one place."""
+    default_workdir = kanban_db.read_board_metadata(
+        board if board else kanban_db.get_current_board()
+    ).get("default_workdir")
+    if default_workdir:
+        path = Path(default_workdir).expanduser()
+        if not path.is_dir():
+            raise CardContextError(
+                f"board default_workdir does not exist or is not a directory: {path}"
+            )
+        return path.resolve()
+    return Path.home().resolve()
 
 
 def build_card_context(task_id: str, *, board: Optional[str] = None) -> dict[str, Any]:
     """Return canonical card data plus a launchable workspace path.
 
-    This intentionally fails when the card lacks a real workspace. Claude Code
-    sessions should not silently fall back to an unrelated repo.
+    The launch dir is the board's ``default_workdir`` when set, else the user's
+    home — there is no per-card workspace, so every card is launchable.
     """
 
     kanban_db.init_db(board=board)
@@ -53,7 +55,7 @@ def build_card_context(task_id: str, *, board: Optional[str] = None) -> dict[str
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise CardContextError(f"task {task_id} not found")
-        workspace = _workspace_path(task)
+        workspace = _workspace_path(task, board=board)
         list_criteria = getattr(kanban_db, "list_acceptance_criteria", None)
         criteria = list_criteria(conn, task_id) if callable(list_criteria) else []
         task_dict = asdict(task)

@@ -66,8 +66,6 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "status": t.status,
         "priority": t.priority,
         "tenant": t.tenant,
-        "workspace_kind": t.workspace_kind,
-        "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -90,31 +88,6 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     if st is None:
         return {}
     return {"state_type": st, "state_name": sn}
-
-
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
-    """Parse ``--workspace`` into ``(kind, path|None)``.
-
-    Accepts: ``scratch``, ``worktree``, ``worktree:<path>``, ``dir:<path>``.
-    """
-    if not value:
-        return ("scratch", None)
-    v = value.strip()
-    if v in {"scratch", "worktree"}:
-        return (v, None)
-    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
-        if not v.startswith(prefix):
-            continue
-        path = v[len(prefix):].strip()
-        if not path:
-            raise argparse.ArgumentTypeError(
-                f"--workspace {prefix} requires a path after the colon"
-            )
-        return (kind, os.path.expanduser(path))
-    raise argparse.ArgumentTypeError(
-        f"unknown --workspace value {value!r}: use scratch, worktree, "
-        "worktree:<path>, or dir:<path>"
-    )
 
 
 def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
@@ -309,11 +282,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
-                          help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
     p_create.add_argument("--branch", default=None,
-                          help="Branch name for worktree tasks, e.g. wt/t6-wire")
+                          help="Git branch name for the card's worker (optional)")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1318,13 +1288,9 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
-        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
-        return 2
-    if branch_name and ws_kind != "worktree":
-        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
@@ -1346,8 +1312,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
             branch_name=branch_name,
             tenant=args.tenant,
             priority=args.priority,
@@ -1525,8 +1489,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
-    print(f"  workspace: {task.workspace_kind}" +
-          (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
@@ -1843,7 +1805,6 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
@@ -2706,12 +2667,12 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_ws = 0
     with kb.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
+            "SELECT id FROM tasks WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+        # Every card runs in the per-task scratch dir under the board's
+        # workspaces root (there is no per-card workspace path anymore).
+        path = scratch_root / row["id"]
         try:
             path = path.resolve()
         except OSError:

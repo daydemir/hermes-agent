@@ -24,42 +24,8 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Workspace flag parsing
+# Branch flag parsing
 # ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "value,expected",
-    [
-        ("scratch",              ("scratch", None)),
-        ("worktree",              ("worktree", None)),
-        ("worktree:/tmp/wt",       ("worktree", "/tmp/wt")),
-        ("dir:/tmp/work",         ("dir", "/tmp/work")),
-    ],
-)
-def test_parse_workspace_flag_valid(value, expected):
-    assert kc._parse_workspace_flag(value) == expected
-
-
-def test_parse_workspace_flag_expands_user():
-    kind, path = kc._parse_workspace_flag("dir:~/vault")
-    assert kind == "dir"
-    assert path.endswith("/vault")
-    assert not path.startswith("~")
-
-    kind, path = kc._parse_workspace_flag("worktree:~/trees/t6-wire")
-    assert kind == "worktree"
-    assert path.endswith("/trees/t6-wire")
-    assert not path.startswith("~")
-
-@pytest.mark.parametrize("bad", ["cloud", "dir:", "worktree:", ""])
-def test_parse_workspace_flag_rejects(bad):
-    if not bad:
-        # Empty -> defaults; not an error.
-        assert kc._parse_workspace_flag(bad) == ("scratch", None)
-        return
-    with pytest.raises(argparse.ArgumentTypeError):
-        kc._parse_workspace_flag(bad)
-
 
 def test_parse_branch_flag_rejects_empty_and_option_like():
     assert kc._parse_branch_flag(None) is None
@@ -88,27 +54,6 @@ def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("list")
     assert "ship feature" in out
     assert "alice" in out
-
-
-def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
-    target = tmp_path / ".worktrees" / "t6-wire"
-    target_arg = target.as_posix()
-    out = kc.run_slash(
-        f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"
-    )
-    assert "Created" in out
-
-    with kb.connect() as conn:
-        tasks = kb.list_tasks(conn)
-    task = tasks[0]
-    assert task.workspace_kind == "worktree"
-    assert task.workspace_path == target_arg
-    assert task.branch_name == "wt/t6-wire"
-
-
-def test_run_slash_rejects_branch_without_worktree(kanban_home):
-    out = kc.run_slash("create 'bad branch' --workspace scratch --branch wt/bad")
-    assert "--branch is only valid with --workspace worktree" in out
 
 
 def test_run_slash_create_with_parent_and_cascade(kanban_home):

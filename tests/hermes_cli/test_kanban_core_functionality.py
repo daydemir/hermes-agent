@@ -339,38 +339,6 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         conn.close()
 
 
-def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
-    """`dir:` workspace with no path should fail workspace resolution AND
-    count against the failure budget — not just crash the tick."""
-    conn = kb.connect()
-    try:
-        # Manually insert a broken task: dir workspace but workspace_path is NULL
-        # after initial create. We achieve this by creating via kanban_db then
-        # UPDATE-ing workspace_path to NULL.
-        tid = kb.create_task(
-            conn, title="x", assignee="worker",
-            workspace_kind="dir", workspace_path="/tmp/kanban_e2e_dir",
-            initial_status="staged",
-        )
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET workspace_path = NULL WHERE id = ?", (tid,),
-            )
-        res = kb.dispatch_once(conn, failure_limit=3)
-        task = kb.get_task(conn, tid)
-        assert task.consecutive_failures == 1
-        assert task.status == "staged"
-        assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
-        res = kb.dispatch_once(conn, failure_limit=3)
-        assert tid in res.auto_blocked
-        task = kb.get_task(conn, tid)
-        assert task.status == "backlog"
-    finally:
-        conn.close()
-
-
 # ---------------------------------------------------------------------------
 # Worker aliveness / crash detection
 # ---------------------------------------------------------------------------
@@ -2599,60 +2567,6 @@ def test_cli_show_clamps_negative_elapsed(kanban_home):
     )
     # Should show "0s" for the clamped elapsed
     assert "0s" in out_show or "0s" in out_runs
-
-
-def test_resolve_workspace_rejects_relative_dir_path(kanban_home):
-    """dir: workspace_path must be absolute. A relative path like
-    '../../../tmp/attacker' would be resolved against the dispatcher's
-    CWD — a confused-deputy escape vector."""
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn, title="path-trav", assignee="worker",
-            workspace_kind="dir",
-            workspace_path="../../../tmp/attacker",
-        )
-        task = kb.get_task(conn, tid)
-        # Storage is verbatim — that's fine.
-        assert task.workspace_path == "../../../tmp/attacker"
-        # But resolution must refuse.
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(task)
-    finally:
-        conn.close()
-
-
-def test_resolve_workspace_accepts_absolute_dir_path(kanban_home, tmp_path):
-    """Legitimate absolute paths are accepted and created."""
-    conn = kb.connect()
-    try:
-        abs_path = str(tmp_path / "my-workspace")
-        tid = kb.create_task(
-            conn, title="legit", assignee="worker",
-            workspace_kind="dir",
-            workspace_path=abs_path,
-        )
-        task = kb.get_task(conn, tid)
-        resolved = kb.resolve_workspace(task)
-        assert str(resolved) == abs_path
-        assert resolved.exists()
-    finally:
-        conn.close()
-
-
-def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
-    """Worktree paths also must be absolute when explicitly set."""
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn, title="wt", assignee="worker",
-            workspace_kind="worktree",
-            workspace_path="../escape",
-        )
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(kb.get_task(conn, tid))
-    finally:
-        conn.close()
 
 
 def test_build_worker_context_caps_prior_attempts(kanban_home):

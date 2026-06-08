@@ -916,7 +916,6 @@ In Progress cards:
           assignee: task ? task.assignee : undefined,
           priority: task ? task.priority : undefined,
           tenant: task ? task.tenant : undefined,
-          workspace_path: task ? task.workspace_path : undefined,
           selected_filters: filters,
           actions_available: ["add_comment", "update_body", "update_acceptance", "update_status", "open_card", "copy_cc_prompt"],
         };
@@ -3051,12 +3050,6 @@ In Progress cards:
     const [priority, setPriority] = useState(0);
     const [parent, setParent] = useState("");
     const [skills, setSkills] = useState("");
-    // Workspace controls. `scratch` (default) ignores path; `worktree` optionally
-    // takes a path (dispatcher derives one from the assignee profile otherwise);
-    // `dir` requires a path. Backend enforces the rule — we only hide/show the
-    // input here to save vertical space in the common `scratch` case.
-    const [workspaceKind, setWorkspaceKind] = useState("scratch");
-    const [workspacePath, setWorkspacePath] = useState("");
     // Goal-mode: when on, the dispatched worker runs the Ralph-style /goal
     // loop — a judge re-checks the card after each turn and the worker keeps
     // going in the same session until done, or the turn budget runs out
@@ -3083,13 +3076,6 @@ In Progress cards:
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
       if (skillList.length > 0) body.skills = skillList;
-      // Only send workspace_kind when it's non-default. Keeps the request
-      // shape small and interoperable with older dispatcher versions.
-      if (workspaceKind && workspaceKind !== "scratch") {
-        body.workspace_kind = workspaceKind;
-      }
-      const wpTrim = workspacePath.trim();
-      if (wpTrim) body.workspace_path = wpTrim;
       // Goal-mode toggle. Only send the keys when enabled so the request
       // shape stays small and old dispatchers ignore it cleanly.
       if (goalMode) {
@@ -3099,15 +3085,8 @@ In Progress cards:
       }
       props.onSubmit(body);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
-      setWorkspaceKind("scratch"); setWorkspacePath("");
       setGoalMode(false); setGoalMaxTurns("");
     };
-
-    const showPathInput = workspaceKind !== "scratch";
-    const pathPlaceholder = workspaceKind === "dir"
-      ? tx(t, "workspacePathDir", "workspace path (required, e.g. ~/projects/my-app)")
-      : tx(t, "workspacePathOptional",
-          "workspace path (optional, derived from assignee if blank)");
 
     return h("div", { className: "hermes-kanban-inline-create" },
       h("textarea", {
@@ -3177,23 +3156,6 @@ In Progress cards:
           className: "h-7 text-xs w-40",
           title: "Turn budget for the goal loop. Blank = backend default (20).",
           min: 1,
-        }) : null,
-      ),
-      h("div", { className: "flex gap-2" },
-        h(Select, Object.assign({
-          value: workspaceKind,
-          title: "scratch: isolated temp dir (default). worktree: git worktree on the assignee profile. dir: exact path (required below).",
-          className: "h-7 text-xs w-28",
-        }, selectChangeHandler(setWorkspaceKind)),
-          h(SelectOption, { value: "scratch" }, "scratch"),
-          h(SelectOption, { value: "worktree" }, "worktree"),
-          h(SelectOption, { value: "dir" }, "dir"),
-        ),
-        showPathInput ? h(Input, {
-          value: workspacePath,
-          onChange: function (e) { setWorkspacePath(e.target.value); },
-          placeholder: pathPlaceholder,
-          className: "h-7 text-xs flex-1",
         }) : null,
       ),
       h(Select, Object.assign({
@@ -3640,7 +3602,7 @@ In Progress cards:
     const [busy, setBusy] = useState(false);
     const [err, setErr] = useState(null);
     const [copied, setCopied] = useState(false);
-    const hasLaunchWorkspace = !!(task && (task.workspace_path || task.workspace_kind === "scratch"));
+    const hasLaunchWorkspace = !!task;  // every card launches (board workdir or home)
     const loadPrompt = function () {
       if (!task || busy || !hasLaunchWorkspace) return;
       setBusy(true);
@@ -3687,7 +3649,7 @@ In Progress cards:
     const [copied, setCopied] = useState(null);
     const [terminalReady, setTerminalReady] = useState(false);
     const [terminalNonce, setTerminalNonce] = useState(0);
-    const hasLaunchWorkspace = !!(task && (task.workspace_path || task.workspace_kind === "scratch"));
+    const hasLaunchWorkspace = !!task;  // every card launches (board workdir or home)
 
     const loadContext = function () {
       if (!task || busy) return;
@@ -3766,12 +3728,6 @@ In Progress cards:
     }, [task && task.id, props.boardSlug]);
 
     return h("div", { className: "hermes-kanban-section hermes-kanban-terminal-workspace" },
-      !hasLaunchWorkspace ? h("div", { className: "hermes-kanban-compact-warning text-xs text-destructive" },
-        tx(i18n, "cardWorkspaceNoWorkspace",
-          "Set workspace_path to launch.")) : null,
-      task && !task.workspace_path && task.workspace_kind === "scratch" ? h("div", { className: "hermes-kanban-compact-warning text-xs text-muted-foreground" },
-        tx(i18n, "cardWorkspaceScratchHome",
-          "Scratch: starts in /Users/rolly.")) : null,
       h("div", { className: "hermes-kanban-terminal-actions" },
         h("div", { className: "hermes-kanban-terminal-actions-main" },
           h(Button, {
@@ -3884,7 +3840,6 @@ In Progress cards:
             chip("@", t.assignee || tx(i18n, "unassigned", "unassigned"), tx(i18n, "assignee", "Assignee") + ": " + (t.assignee || tx(i18n, "unassigned", "unassigned"))),
             chip("P", t.priority, tx(i18n, "priority", "Priority") + ": " + t.priority),
             t.tenant ? chip(null, t.tenant, tx(i18n, "tenant", "Tenant") + ": " + t.tenant) : null,
-            chip(null, t.workspace_path || t.workspace_kind, tx(i18n, "workspace", "Workspace") + ": " + `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`),
           ),
         ),
         h("div", { className: "hermes-kanban-card-lifecycle" },
@@ -3912,10 +3867,6 @@ In Progress cards:
         h(AssigneeEditor, { task: t, assignees: props.assignees || [], onPatch: props.onPatch }),
         h(PriorityEditor, { task: t, onPatch: props.onPatch }),
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
-        h(MetaRow, {
-          label: tx(i18n, "workspace", "Workspace"),
-          value: `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`,
-        }),
         (t.skills && t.skills.length > 0) ? h(MetaRow, {
           label: tx(i18n, "skills", "Skills"),
           value: t.skills.join(", "),

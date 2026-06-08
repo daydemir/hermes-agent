@@ -856,8 +856,6 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: str = "scratch"
-    workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     # NOTE: ``triage`` predates ``initial_status`` and forwards to
     # create_task(triage=...) (parks in backlog). It now conflicts with the
@@ -906,8 +904,6 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
-            workspace_path=payload.workspace_path,
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
