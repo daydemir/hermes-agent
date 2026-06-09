@@ -1,6 +1,8 @@
 """Tests for dashboard voice-call prototype endpoints."""
 
 import json
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +71,7 @@ def test_voice_session_config_uses_phone_call_turn_detection(voice_client):
     assert "brain_lookup" in tool_names
     assert "session_lookup" in tool_names
     assert "rolly_background" in tool_names
+    assert "rolly" not in tool_names
     turn_detection = config["audio"]["input"]["turn_detection"]
     assert turn_detection == {
         "type": "semantic_vad",
@@ -179,6 +182,29 @@ def test_voice_lookup_tools_return_explicit_no_match_text(voice_client, monkeypa
     assert kanban.json()["result"] == "Kanban: no matching results found for query: blocked mix card."
     assert sessions.status_code == 200
     assert sessions.json()["result"] == "Sessions: no matching results found for query: recent mix message."
+
+
+def test_voice_recent_sessions_falls_back_to_recent_messages_for_broad_queries(voice_client):
+    _client, web_server = voice_client
+    db_path = Path(web_server.get_hermes_home()) / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as con:
+        con.execute(
+            "CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, timestamp TEXT)"
+        )
+        con.executemany(
+            "INSERT INTO messages VALUES (?, ?, ?, ?)",
+            [
+                ("sess-old", "assistant", "Older reply", "2026-06-01T10:00:00Z"),
+                ("sess-new", "user", "Most recent actual message", "2026-06-01T11:00:00Z"),
+            ],
+        )
+        con.commit()
+
+    result = web_server._voice_recent_sessions("yesterday conversation")
+
+    assert "2026-06-01T11:00:00Z sess-new user: Most recent actual message" in result
+    assert "2026-06-01T10:00:00Z sess-old assistant: Older reply" in result
 
 
 def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):

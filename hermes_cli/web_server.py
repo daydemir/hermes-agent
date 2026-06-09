@@ -884,6 +884,16 @@ def _voice_recent_sessions(query: str | None = None, limit: int = 1600) -> str:
                 """,
                 (f"%{query}%",),
             ).fetchall()
+            if not rows:
+                rows = con.execute(
+                    """
+                    SELECT session_id, role, content, timestamp
+                    FROM messages
+                    WHERE role IN ('user','assistant')
+                    ORDER BY timestamp DESC
+                    LIMIT 8
+                    """
+                ).fetchall()
         else:
             rows = con.execute(
                 """
@@ -897,7 +907,7 @@ def _voice_recent_sessions(query: str | None = None, limit: int = 1600) -> str:
         con.close()
     except sqlite3.Error:
         return ""
-    lines = [f"{r['session_id']} {r['role']}: {_voice_bound_text(r['content'], 260)}" for r in rows]
+    lines = [f"{r['timestamp']} {r['session_id']} {r['role']}: {_voice_bound_text(r['content'], 260)}" for r in rows]
     return _voice_bound_text("\n".join(lines), limit)
 
 
@@ -1106,12 +1116,6 @@ def _voice_session_config(user: str | None = None, mode: str = "solo") -> Dict[s
                 "type": "function",
                 "name": "rolly_background",
                 "description": "Use only for long-running or action-oriented work. Returns pending status immediately; do not claim completion.",
-                "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"], "additionalProperties": False},
-            },
-            {
-                "type": "function",
-                "name": "rolly",
-                "description": "Slow full Rolly bridge for exceptional foreground questions only. Prefer fast lookup tools or rolly_background.",
                 "parameters": {"type": "object", "properties": {"request": {"type": "string"}}, "required": ["request"], "additionalProperties": False},
             },
         ],
