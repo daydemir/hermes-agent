@@ -1179,7 +1179,12 @@ export default function VoiceCallPage() {
           }
           const meetMetadata =
             currentMode === "meet"
-              ? { mode: currentMode, invoked_rolly: meetInvokedRef.current, dashboard_user: speaker, speaker_attribution: "unknown_room_speaker" }
+              ? {
+                  mode: currentMode,
+                  invoked_rolly: meetInvokedRef.current,
+                  dashboard_user: speaker,
+                  speaker_attribution: speaker || "unknown_room_speaker",
+                }
               : { mode: currentMode, invoked_rolly: meetInvokedRef.current };
           addLog("user", currentMode === "meet" ? `[room mic / dashboard: ${speaker || "unknown"}] ${text}` : text);
           persistTranscript("user", text, "transcript", meetMetadata);
