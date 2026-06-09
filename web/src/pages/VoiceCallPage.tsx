@@ -156,6 +156,7 @@ export default function VoiceCallPage() {
   const voiceRoomCursorRef = useRef(0);
   const seenVoiceRoomEventsRef = useRef<Set<string>>(new Set());
   const voiceSignalCursorRef = useRef(0);
+  const suppressLeaveWarningRef = useRef(false);
   const meetPeerConnectionsRef = useRef<Map<string, MeshPeer>>(new Map());
   const meetRemoteAudioRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const meetSignalCancelRef = useRef<(() => void) | null>(null);
@@ -1519,6 +1520,10 @@ export default function VoiceCallPage() {
     if (!shouldWarnOnLeave) return;
 
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (suppressLeaveWarningRef.current) {
+        suppressLeaveWarningRef.current = false;
+        return;
+      }
       event.preventDefault();
       event.returnValue = "";
     };
@@ -1538,9 +1543,13 @@ export default function VoiceCallPage() {
       if (nextUrl.pathname === currentUrl.pathname && nextUrl.search === currentUrl.search && nextUrl.hash === currentUrl.hash) {
         return;
       }
-      if (window.confirm("A voice call is still open. Leave this page and end the call?")) return;
       event.preventDefault();
       event.stopPropagation();
+      if (window.confirm("A voice call is still open. Leave this page and end the call?")) {
+        suppressLeaveWarningRef.current = true;
+        stopCall("navigation");
+        window.location.assign(anchor.href);
+      }
     };
 
     window.addEventListener("beforeunload", handleBeforeUnload);
@@ -1549,7 +1558,7 @@ export default function VoiceCallPage() {
       window.removeEventListener("beforeunload", handleBeforeUnload);
       document.removeEventListener("click", handleDocumentClick, true);
     };
-  }, [status]);
+  }, [status, stopCall]);
 
   const live = status === "live";
   const busy = invitePending || status === "requesting" || status === "connecting" || status === "ending";
