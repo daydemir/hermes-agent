@@ -794,6 +794,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                actor_slug=args.get("actor_slug"),
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -1259,6 +1260,15 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "actor_slug": {
+                "type": "string",
+                "description": (
+                    "Human whose git identity the worker commits as: "
+                    "deniz/arman. Resolved into GIT_AUTHOR_*/GIT_COMMITTER_* "
+                    "at spawn so commits land under the right person. Omit "
+                    "to use the box's default actor."
                 ),
             },
             "board": _board_schema_prop(),

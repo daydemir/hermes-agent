@@ -66,6 +66,10 @@ hermes-agent/
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
+## Conversation privacy
+
+Keep each user's conversation content private as much as possible: avoid cross-user leakage, minimize reuse of prior user content unless it is needed for the current task, and persist only the smallest durable note required.
+
 ## Runtime restart discipline
 
 This box is Rolly — a dedicated, single-purpose machine where the `rolly` account
@@ -871,6 +875,21 @@ Isolation model:
 - After `kanban.failure_limit` consecutive non-success attempts on the
   same task (default: 2), the dispatcher auto-blocks it to prevent spin
   loops.
+
+Per-card git identity:
+- A card carries an optional `actor_slug` (the human whose git identity
+  its worker commits as). Set via `hermes kanban create --actor <slug>`,
+  the `kanban_create` tool's `actor_slug`, or the dashboard (defaults to
+  the logged-in `X-Rolly-User`).
+- At spawn the dispatcher resolves `actor_slug` (or the per-box default —
+  `HERMES_KANBAN_DEFAULT_ACTOR`, falling back to `deniz`) against the
+  `git` block of `rolly-users.json` and injects
+  `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (author == committer) into the worker
+  env, so each person gets their own commit history.
+- **Fail-closed:** an actor with no configured git identity raises in
+  `hermes_cli/kanban_git_identity.py`; the spawn loop records it as a
+  spawn failure (auto-blocking the card) — a worker NEVER commits as the
+  wrong human or falls back to ambient git config.
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 

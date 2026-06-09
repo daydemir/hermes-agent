@@ -46,6 +46,14 @@ def fresh_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Per-card git identity fail-closes worker spawn unless the default
+    # actor (deniz) resolves, so seed a rolly-users.json with deniz's git
+    # block. The spawn-env tests in TestWorkerSpawnEnv depend on this.
+    (home / "rolly-users.json").write_text(
+        '{"users": [{"slug": "deniz", "git": '
+        '{"name": "Deniz Aydemir", "email": "deniz@aydemir.us", "github": "daydemir"}}]}',
+        encoding="utf-8",
+    )
     for var in (
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_WORKSPACES_ROOT",

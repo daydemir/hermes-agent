@@ -89,6 +89,8 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
+from hermes_cli import kanban_git_identity as _kgi
+
 _log = logging.getLogger(__name__)
 
 
@@ -805,6 +807,10 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Human actor whose git identity the dispatched worker commits as.
+    # Resolved through rolly-users.json into GIT_AUTHOR_*/GIT_COMMITTER_* at
+    # spawn (see kanban_git_identity). NULL = the per-box default actor.
+    actor_slug: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -877,6 +883,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            actor_slug=(
+                row["actor_slug"] if "actor_slug" in keys else None
             ),
         )
 
@@ -1037,7 +1046,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Human actor whose git identity the dispatched worker commits as.
+    -- Resolved via rolly-users.json's per-user ``git`` block into
+    -- GIT_AUTHOR_*/GIT_COMMITTER_* at spawn (see kanban_git_identity).
+    -- NULL = use the per-box default actor. Fail-closed: an actor with no
+    -- configured git identity blocks the card rather than committing as
+    -- the wrong human.
+    actor_slug           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1706,6 +1722,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "actor_slug" not in cols:
+        # Human actor whose git identity the worker commits as. NULL on
+        # legacy rows and on creation paths that don't name an actor; the
+        # dispatcher then falls back to the per-box default actor. Resolved
+        # into GIT_AUTHOR_*/GIT_COMMITTER_* at spawn (kanban_git_identity).
+        _add_column_if_missing(
+            conn, "tasks", "actor_slug", "actor_slug TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2193,6 +2218,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = DEFAULT_CREATE_INITIAL_STATUS,
     session_id: Optional[str] = None,
+    actor_slug: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2324,8 +2350,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        actor_slug
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2345,6 +2372,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (str(actor_slug).strip() or None) if actor_slug else None,
                     ),
                 )
                 if task_status == "staged":
@@ -6767,6 +6795,16 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Per-card git identity. Resolve the card's human actor (or the per-box
+    # default when none is named) to a concrete GitIdentity and pin the
+    # worker's GIT_AUTHOR_*/GIT_COMMITTER_* env so every commit lands under
+    # the right human. Fail-closed: an unresolved actor raises
+    # GitIdentityError, which the dispatcher's spawn loop catches and records
+    # as a spawn failure (auto-blocking the card after the failure limit) —
+    # we never spawn a worker that would commit as the wrong human or fall
+    # back to the ambient git config.
+    identity = _kgi.resolve_git_identity(task.actor_slug)
+    env.update(_kgi.git_identity_env(identity))
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),

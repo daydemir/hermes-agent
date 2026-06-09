@@ -75,6 +75,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
+        "actor_slug": t.actor_slug,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -298,6 +299,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument("--actor", default=None, dest="actor_slug",
+                          help="Human whose git identity the worker commits as "
+                               "(slug from rolly-users.json, e.g. deniz/arman). "
+                               "Resolved into GIT_AUTHOR_*/GIT_COMMITTER_* at "
+                               "spawn. Omit to use the box's default actor.")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). Appended to the built-in "
@@ -1324,6 +1330,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", kb.DEFAULT_CLI_INITIAL_STATUS),
+            actor_slug=getattr(args, "actor_slug", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

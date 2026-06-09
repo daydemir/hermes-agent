@@ -29,11 +29,21 @@ from hermes_cli.kanban import run_slash
 # Fixtures
 # ---------------------------------------------------------------------------
 
+# Per-card git identity (kanban_git_identity) fail-closes the worker spawn
+# when the default actor can't be resolved, so spawn tests need a
+# rolly-users.json that defines the box's default actor (deniz).
+_DENIZ_USERS_JSON = (
+    '{"users": [{"slug": "deniz", "git": '
+    '{"name": "Deniz Aydemir", "email": "deniz@aydemir.us", "github": "daydemir"}}]}'
+)
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "rolly-users.json").write_text(_DENIZ_USERS_JSON, encoding="utf-8")
     # Existing crash-detection tests pre-date the grace window; pin to 0
     # so they keep their immediate-reclaim semantics.
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")

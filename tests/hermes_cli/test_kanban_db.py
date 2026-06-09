@@ -2045,6 +2045,14 @@ class TestSharedBoardPaths:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+        # Per-card git identity fail-closes worker spawn unless the default
+        # actor (deniz) resolves, so seed deniz's git block at the kanban
+        # home root (== HERMES_HOME here). The spawn-env test below needs it.
+        (Path(hermes_home) / "rolly-users.json").write_text(
+            '{"users": [{"slug": "deniz", "git": '
+            '{"name": "Deniz Aydemir", "email": "deniz@aydemir.us", "github": "daydemir"}}]}',
+            encoding="utf-8",
+        )
 
     def test_default_install_anchors_at_home_dot_hermes(
         self, tmp_path, monkeypatch

@@ -871,6 +871,10 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    # Human whose git identity the worker commits as (rolly-users.json slug).
+    # When omitted, the create handler falls back to the logged-in user from
+    # the ``X-Rolly-User`` header so a card a human creates is owned by them.
+    actor_slug: Optional[str] = None
 
     @field_validator("initial_status")
     @classmethod
@@ -884,7 +888,11 @@ class CreateTaskBody(BaseModel):
 
 
 @router.post("/tasks")
-def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
+def create_task(
+    payload: CreateTaskBody,
+    board: Optional[str] = Query(None),
+    x_rolly_user: Optional[str] = Header(None),
+):
     board = _resolve_board(board)
     # Fail-fast: only the visible board columns are valid landing lanes.
     # (The model validator also enforces this; this backstops direct callers.)
@@ -914,6 +922,13 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            # A card a logged-in human creates is owned by them: an explicit
+            # body actor_slug wins, else the X-Rolly-User header identity.
+            actor_slug=payload.actor_slug or (
+                x_rolly_user.strip()
+                if x_rolly_user and x_rolly_user.strip()
+                else None
+            ),
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
