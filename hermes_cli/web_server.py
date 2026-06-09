@@ -944,16 +944,25 @@ def _voice_lookup_no_match(source: str, query: str | None) -> str:
     return f"{source}: no matching results found{suffix}."
 
 
-def _voice_tool_cache_key(payload: VoiceToolRequest, user: str | None = None) -> str | None:
-    explicit = payload.idempotency_key or str(payload.arguments.get("_realtime_call_id") or "")
-    if explicit or payload.call_id:
-        normalized = json.dumps(
-            {"user": _voice_speaker_label(user), "explicit": explicit, "name": payload.name, "arguments": payload.arguments, "call_id": payload.call_id},
-            sort_keys=True,
-            default=str,
-        )
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return None
+def _voice_tool_cache_keys(payload: VoiceToolRequest, user: str | None = None) -> list[str]:
+    base = {"user": _voice_speaker_label(user), "name": payload.name, "arguments": payload.arguments}
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(marker: str | None) -> None:
+        if not marker:
+            return
+        normalized = json.dumps({**base, "marker": marker}, sort_keys=True, default=str)
+        key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    add(payload.idempotency_key)
+    add(payload.realtime_call_id)
+    add(str(payload.arguments.get("_realtime_call_id") or ""))
+    add(payload.call_id)
+    return keys
 
 
 def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> Dict[str, Any]:
@@ -1347,18 +1356,19 @@ async def get_voice_context(request: Request, debug: bool = False):
 @app.post("/api/voice/tool")
 async def run_voice_tool(payload: VoiceToolRequest, request: Request):
     user = _voice_auth_context(request)
-    key = _voice_tool_cache_key(payload, user=user)
+    keys = _voice_tool_cache_keys(payload, user=user)
     now = time.time()
-    if key:
+    if keys:
         with _VOICE_TOOL_CACHE_LOCK:
             stale = [cache_key for cache_key, (created, _value) in _VOICE_TOOL_CACHE.items() if now - created > _VOICE_TOOL_CACHE_TTL_SECONDS]
             for cache_key in stale:
                 _VOICE_TOOL_CACHE.pop(cache_key, None)
-            cached = _VOICE_TOOL_CACHE.get(key)
-            if cached and now - cached[0] <= _VOICE_TOOL_CACHE_TTL_SECONDS:
-                result = dict(cached[1])
-                result["cached"] = True
-                return result
+            for key in keys:
+                cached = _VOICE_TOOL_CACHE.get(key)
+                if cached and now - cached[0] <= _VOICE_TOOL_CACHE_TTL_SECONDS:
+                    result = dict(cached[1])
+                    result["cached"] = True
+                    return result
     try:
         result = _voice_tool_dispatch(payload, user=user)
     except HTTPException:
@@ -1372,9 +1382,10 @@ async def run_voice_tool(payload: VoiceToolRequest, request: Request):
             "tool_name": payload.name,
             "cached": False,
         }
-    if key and payload.name != "rolly_background":
+    if keys and payload.name != "rolly_background":
         with _VOICE_TOOL_CACHE_LOCK:
-            _VOICE_TOOL_CACHE[key] = (time.time(), dict(result))
+            for key in keys:
+                _VOICE_TOOL_CACHE[key] = (time.time(), dict(result))
     return result
 
 
