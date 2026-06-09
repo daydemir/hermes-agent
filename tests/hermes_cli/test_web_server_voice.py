@@ -205,6 +205,33 @@ def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     assert second.json()["cached"] is True
 
 
+def test_voice_tool_caches_failures_for_same_realtime_call_id(voice_client, monkeypatch):
+    client, web_server = voice_client
+    calls = []
+
+    def fake_run(question, user=None, **_kwargs):
+        calls.append((question, user))
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+    payload = {
+        "name": "rolly",
+        "arguments": {"request": "status"},
+        "realtime_call_id": "call_fail",
+    }
+
+    first = client.post("/api/voice/tool", json=payload, headers={"X-Rolly-User": "deniz"})
+    second = client.post("/api/voice/tool", json=payload, headers={"X-Rolly-User": "deniz"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["ok"] is False
+    assert "boom" in first.json()["error"]
+    assert first.json()["cached"] is False
+    assert second.json()["cached"] is True
+    assert len(calls) == 1
+
+
 def test_voice_transcript_persists_jsonl(voice_client):
     client, _web_server = voice_client
 

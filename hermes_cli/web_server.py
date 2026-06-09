@@ -1360,7 +1360,14 @@ async def run_voice_tool(payload: VoiceToolRequest, request: Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)[:700]) from exc
+        result = {
+            "ok": False,
+            "result": "",
+            "data": {},
+            "error": str(exc)[:700],
+            "tool_name": payload.name,
+            "cached": False,
+        }
     if key and payload.name != "rolly_background":
         with _VOICE_TOOL_CACHE_LOCK:
             _VOICE_TOOL_CACHE[key] = (time.time(), dict(result))
