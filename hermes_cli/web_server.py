@@ -935,7 +935,7 @@ def _voice_lookup_no_match(source: str, query: str | None) -> str:
 
 
 def _voice_tool_cache_key(payload: VoiceToolRequest, user: str | None = None) -> str | None:
-    explicit = payload.idempotency_key or payload.realtime_call_id or str(payload.arguments.get("_realtime_call_id") or "")
+    explicit = payload.idempotency_key or str(payload.arguments.get("_realtime_call_id") or "")
     if explicit or payload.call_id:
         normalized = json.dumps(
             {"user": _voice_speaker_label(user), "explicit": explicit, "name": payload.name, "arguments": payload.arguments, "call_id": payload.call_id},

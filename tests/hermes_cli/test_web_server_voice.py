@@ -184,6 +184,8 @@ def test_voice_lookup_tools_return_explicit_no_match_text(voice_client, monkeypa
 def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
+    with web_server._VOICE_TOOL_CACHE_LOCK:
+        web_server._VOICE_TOOL_CACHE.clear()
 
     def fake_run(question, user=None, **_kwargs):
         calls.append((question, user))
@@ -193,6 +195,7 @@ def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     payload = {
         "name": "rolly",
         "arguments": {"request": "status"},
+        "call_id": "voice-call",
         "realtime_call_id": "call_same",
     }
 
@@ -205,9 +208,40 @@ def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     assert second.json()["cached"] is True
 
 
+def test_voice_tool_dedupes_same_request_even_with_distinct_realtime_call_ids(voice_client, monkeypatch):
+    client, web_server = voice_client
+    calls = []
+    with web_server._VOICE_TOOL_CACHE_LOCK:
+        web_server._VOICE_TOOL_CACHE.clear()
+
+    def fake_run(question, user=None, **_kwargs):
+        calls.append((question, user))
+        return "answer once"
+
+    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+
+    first = client.post(
+        "/api/voice/tool",
+        json={"name": "rolly", "arguments": {"request": "status"}, "call_id": "voice-call", "realtime_call_id": "call_a"},
+        headers={"X-Rolly-User": "deniz"},
+    )
+    second = client.post(
+        "/api/voice/tool",
+        json={"name": "rolly", "arguments": {"request": "status"}, "call_id": "voice-call", "realtime_call_id": "call_b"},
+        headers={"X-Rolly-User": "deniz"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(calls) == 1
+    assert second.json()["cached"] is True
+
+
 def test_voice_tool_caches_failures_for_same_realtime_call_id(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
+    with web_server._VOICE_TOOL_CACHE_LOCK:
+        web_server._VOICE_TOOL_CACHE.clear()
 
     def fake_run(question, user=None, **_kwargs):
         calls.append((question, user))
@@ -217,6 +251,7 @@ def test_voice_tool_caches_failures_for_same_realtime_call_id(voice_client, monk
     payload = {
         "name": "rolly",
         "arguments": {"request": "status"},
+        "call_id": "voice-call",
         "realtime_call_id": "call_fail",
     }
 

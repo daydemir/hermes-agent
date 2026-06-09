@@ -1090,8 +1090,7 @@ export default function VoiceCallPage() {
         started_at: new Date(startedAt).toISOString(),
       });
       try {
-        const idempotencyKey = `${callIdRef.current}:${callId}`;
-        const result = await api.runVoiceTool({ name, arguments: args, call_id: callIdRef.current, realtime_call_id: callId, idempotency_key: idempotencyKey } satisfies VoiceToolRequest, speaker);
+        const result = await api.runVoiceTool({ name, arguments: args, call_id: callIdRef.current, realtime_call_id: callId } satisfies VoiceToolRequest, speaker);
         const durationMs = Date.now() - startedAt;
         const output = result.ok ? result.result : `Tool failed: ${result.error ?? "unknown error"}`;
         markWorkFinished(`tool:${toolKey}`, false);
