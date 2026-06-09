@@ -211,10 +211,16 @@ export default function VoiceCallPage() {
   );
 
   const playVoiceCue = useCallback(
-    (kind: "live" | "working" | "done" | "error") => {
+    (kind: "live" | "working" | "done" | "error" | "speech_start" | "speech_stop") => {
       if (kind === "live") {
         playTone(523, 0, 80);
         playTone(784, 95, 110);
+      } else if (kind === "speech_start") {
+        playTone(440, 0, 45, 0.018);
+        playTone(660, 55, 55, 0.016);
+      } else if (kind === "speech_stop") {
+        playTone(660, 0, 45, 0.016);
+        playTone(440, 55, 55, 0.014);
       } else if (kind === "working") {
         playTone(659, 0, 65, 0.025);
         playTone(880, 95, 65, 0.022);
@@ -291,7 +297,9 @@ export default function VoiceCallPage() {
   const startWorkingCue = useCallback(() => {
     if (workingCueIntervalRef.current !== null) return;
     playVoiceCue("working");
-    workingCueIntervalRef.current = window.setInterval(() => playVoiceCue("working"), 6500);
+    workingCueIntervalRef.current = window.setTimeout(() => {
+      workingCueIntervalRef.current = null;
+    }, 1200);
   }, [playVoiceCue]);
 
   const stopWorkingCue = useCallback(
@@ -342,11 +350,11 @@ export default function VoiceCallPage() {
 
   const markWorkFinished = useCallback(
     (id: string, finish: "done" | "error" | false = false) => {
-      activeWorkRef.current.delete(id);
+      const hadWork = activeWorkRef.current.delete(id);
       const remaining = Array.from(activeWorkRef.current.values());
       setActiveTool(remaining[remaining.length - 1] ?? null);
       setActiveWorkCount(activeWorkRef.current.size);
-      if (activeWorkRef.current.size === 0) stopWorkingCue(finish);
+      if (hadWork && activeWorkRef.current.size === 0) stopWorkingCue(finish);
     },
     [stopWorkingCue],
   );
@@ -1113,7 +1121,6 @@ export default function VoiceCallPage() {
         const taskId = typeof result.data?.task_id === "string" ? result.data.task_id : "";
         if (name === "rolly_background" && taskId) {
           rememberVoiceTask(result.data as unknown as VoiceTaskResponse);
-          markWorkStarted(`task:${taskId}`, `${taskId} running in background`);
           void pollVoiceTask(taskId, callId, callSeqRef.current);
         }
       } catch (exc) {
@@ -1195,12 +1202,14 @@ export default function VoiceCallPage() {
         userSpeakingRef.current = true;
         addLog("system", "Realtime API heard speech start.");
         persistTranscript("system", "Realtime API heard speech start.", "speech_started");
+        playVoiceCue("speech_start");
         return;
       }
       if (type === "input_audio_buffer.speech_stopped") {
         userSpeakingRef.current = false;
         addLog("system", "Realtime API heard speech stop.");
         persistTranscript("system", "Realtime API heard speech stop.", "speech_stopped");
+        playVoiceCue("speech_stop");
         window.setTimeout(flushPendingHandoffs, 250);
         return;
       }

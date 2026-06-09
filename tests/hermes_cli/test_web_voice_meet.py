@@ -210,6 +210,18 @@ def test_voice_page_filters_realtime_noise_until_verbose_and_uses_compact_rows()
     assert "bg-background-base/50 p-3" not in source
 
 
+def test_voice_page_uses_distinct_speech_cues_and_no_background_ping_loop():
+    source = (WEB_DIR / "src/pages/VoiceCallPage.tsx").read_text(encoding="utf-8")
+
+    assert '"speech_start" | "speech_stop"' in source
+    assert 'playVoiceCue("speech_start");' in source
+    assert 'playVoiceCue("speech_stop");' in source
+    assert 'window.setInterval(() => playVoiceCue("working"), 6500)' not in source
+    assert 'markWorkStarted(`task:${taskId}`, `${taskId} running in background`);' not in source
+    assert 'const hadWork = activeWorkRef.current.delete(id);' in source
+    assert 'if (hadWork && activeWorkRef.current.size === 0) stopWorkingCue(finish);' in source
+
+
 def test_voice_page_transcript_and_events_stick_to_latest_without_forcing_manual_scroll():
     source = (WEB_DIR / "src/pages/VoiceCallPage.tsx").read_text(encoding="utf-8")
 
