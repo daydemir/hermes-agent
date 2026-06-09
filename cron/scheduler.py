@@ -149,6 +149,22 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
+
+def _mirror_cron_run(job: dict, success: bool, error: Optional[str]) -> None:
+    """Best-effort mirror of a finished cron run to the Rolly activity channel
+    (``#rolly-activity`` via ``ROLLY_ACTIVITY_CHANNEL``) — so the team sees what
+    Rolly does in the background. No-op when unconfigured; never raises."""
+    try:
+        from hermes_cli.rolly_activity import notify_activity
+        name = job.get("name") or job.get("id")
+        if success:
+            notify_activity(f"🕐 cron `{name}` ran ✓")
+        else:
+            notify_activity(f"🕐 cron `{name}` failed: {(error or '').strip()[:200]}")
+    except Exception:
+        pass
+
+
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
@@ -2056,11 +2072,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+                _mirror_cron_run(job, success, error)
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
+                _mirror_cron_run(job, False, str(e))
                 mark_job_run(job["id"], False, str(e))
                 return False
 
