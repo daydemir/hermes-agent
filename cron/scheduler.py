@@ -151,16 +151,25 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 
 
 def _mirror_cron_run(job: dict, success: bool, error: Optional[str]) -> None:
-    """Best-effort mirror of a finished cron run to the Rolly activity channel
-    (``#rolly-activity`` via ``ROLLY_ACTIVITY_CHANNEL``) — so the team sees what
-    Rolly does in the background. No-op when unconfigured; never raises."""
+    """Record a finished cron run for the 15-minute Rolly activity digest.
+
+    The digest job batches these records into one activity message every 15
+    minutes instead of mirroring each cron run immediately. This function is a
+    best-effort append-only write and must never break the cron run itself.
+    """
     try:
-        from hermes_cli.rolly_activity import notify_activity
-        name = job.get("name") or job.get("id")
-        if success:
-            notify_activity(f"🕐 cron `{name}` ran ✓")
-        else:
-            notify_activity(f"🕐 cron `{name}` failed: {(error or '').strip()[:200]}")
+        hermes_home = _get_hermes_home()
+        activity_log = hermes_home / "cron" / "activity-events.jsonl"
+        activity_log.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": _hermes_now().isoformat(),
+            "job_id": job.get("id"),
+            "name": job.get("name") or job.get("id"),
+            "success": bool(success),
+            "error": (error or "").strip()[:500] or None,
+        }
+        with activity_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
