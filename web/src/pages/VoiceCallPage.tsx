@@ -1561,11 +1561,27 @@ export default function VoiceCallPage() {
       }
     };
 
+    const handlePopState = () => {
+      if (suppressLeaveWarningRef.current) {
+        suppressLeaveWarningRef.current = false;
+        return;
+      }
+      if (window.confirm("A voice call is still open. Leave this page and end the call?")) {
+        suppressLeaveWarningRef.current = true;
+        stopCall("navigation");
+        return;
+      }
+      suppressLeaveWarningRef.current = true;
+      window.history.go(1);
+    };
+
     window.addEventListener("beforeunload", handleBeforeUnload);
     document.addEventListener("click", handleDocumentClick, true);
+    window.addEventListener("popstate", handlePopState);
     return () => {
       window.removeEventListener("beforeunload", handleBeforeUnload);
       document.removeEventListener("click", handleDocumentClick, true);
+      window.removeEventListener("popstate", handlePopState);
     };
   }, [status, stopCall]);
 
