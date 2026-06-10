@@ -13,6 +13,11 @@ Code. Delivery uses ``hermes send`` (bot-token Slack, no gateway needed).
 
 Usage (from the hook config): ``cc_slack_notify.py {stop|notification}``.
 Channel override: ``CC_SLACK_NOTIFY_CHANNEL`` env (default = #mix-builder).
+
+Mention policy (SUE-81, Deniz): routine Stop pings stay untagged, but a
+Notification — Claude genuinely needs input / is waiting on a human — tags
+@deniz, rate-limited to once per session handle per 30 minutes so an idle
+overnight session does not ping him repeatedly.
 """
 from __future__ import annotations
 
@@ -44,6 +49,32 @@ def _tmux_session() -> str | None:
     name = out.stdout.strip()
     return name or None
 
+# Deniz's Slack member id (SLACK_ALLOWED_USERS order: deniz, arman).
+DENIZ_MENTION = "<@U04JU6XTF1U>"
+# A genuinely-waiting session tags Deniz at most once per this window.
+MENTION_COOLDOWN_SECONDS = 1800
+
+
+def _should_mention(handle: str) -> bool:
+    """Rate-limit @deniz tags per session handle (idle sessions re-notify)."""
+    import time
+
+    state_dir = os.path.expanduser("~/.hermes/state")
+    stamp = os.path.join(state_dir, f"cc-slack-mention-{handle}.stamp")
+    now = time.time()
+    try:
+        if now - os.path.getmtime(stamp) < MENTION_COOLDOWN_SECONDS:
+            return False
+    except OSError:
+        pass
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        with open(stamp, "w", encoding="utf-8") as fh:
+            fh.write(str(int(now)))
+    except OSError:
+        pass
+    return True
+
 
 def main() -> None:
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -58,9 +89,10 @@ def main() -> None:
 
     if "notification" in kind:
         message = (event.get("message") or "needs input").strip()
-        text = f"❓ `{handle}` needs input: {message}"
+        mention = f" {DENIZ_MENTION}" if _should_mention(handle) else ""
+        text = f"\u2753 `{handle}` needs input: {message}{mention}"
     else:  # stop / finished generating
-        text = f"✅ `{handle}` finished"
+        text = f"\u2705 `{handle}` finished"
 
     channel = os.environ.get("CC_SLACK_NOTIFY_CHANNEL", DEFAULT_CHANNEL)
     try:
