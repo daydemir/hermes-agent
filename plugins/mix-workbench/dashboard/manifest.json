@@ -1,0 +1,13 @@
+{
+  "name": "mix-workbench",
+  "label": "Mix Workbench",
+  "description": "Read-only browser for mix-mono builder artifacts: UI screen captures, walk-eval runs, simulator transcripts",
+  "icon": "Image",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/mix-workbench",
+    "position": "after:loops"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
