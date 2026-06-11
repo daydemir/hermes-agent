@@ -322,6 +322,9 @@ export const api = {
       method: "POST",
       headers: user ? { "Content-Type": "application/json", "X-Rolly-User": user } : { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      // Call-end saves often happen immediately before navigation/unload.
+      // keepalive lets the browser finish this small POST after the page starts leaving.
+      keepalive: body.event_type === "call_end",
     }),
   getVoiceRoom: (callId: string, since = 0, limit = 200, user?: string, waitMs = 0) => {
     const qs = new URLSearchParams({ call_id: callId, since: String(since), limit: String(limit) });
