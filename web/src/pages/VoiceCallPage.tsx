@@ -1119,7 +1119,7 @@ export default function VoiceCallPage() {
         });
         requestResponseCreate("tool output", { queueIfActive: false });
         const taskId = typeof result.data?.task_id === "string" ? result.data.task_id : "";
-        if (name === "rolly_background" && taskId) {
+        if (taskId) {
           rememberVoiceTask(result.data as unknown as VoiceTaskResponse);
           void pollVoiceTask(taskId, callId, callSeqRef.current);
         }

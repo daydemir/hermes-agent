@@ -207,17 +207,17 @@ def test_voice_recent_sessions_falls_back_to_recent_messages_for_broad_queries(v
     assert "2026-06-01T10:00:00Z sess-old assistant: Older reply" in result
 
 
-def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
+def test_voice_tool_dedupes_same_realtime_call_id_for_legacy_rolly_background_route(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
     with web_server._VOICE_TOOL_CACHE_LOCK:
         web_server._VOICE_TOOL_CACHE.clear()
 
-    def fake_run(question, user=None, **_kwargs):
-        calls.append((question, user))
-        return "answer once"
+    def fake_start_background_task(call_id, request_text, user):
+        calls.append((call_id, request_text, user))
+        return SimpleNamespace(task_id="vt_test", to_dict=lambda: {"task_id": "vt_test"})
 
-    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+    monkeypatch.setattr(web_server, "_voice_start_background_task", fake_start_background_task)
     payload = {
         "name": "rolly",
         "arguments": {"request": "status"},
@@ -231,20 +231,21 @@ def test_voice_tool_dedupes_same_realtime_call_id(voice_client, monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(calls) == 1
+    assert first.json()["data"]["task_id"] == "vt_test"
     assert second.json()["cached"] is True
 
 
-def test_voice_tool_dedupes_same_realtime_call_id_even_with_distinct_call_ids(voice_client, monkeypatch):
+def test_voice_tool_dedupes_same_realtime_call_id_even_with_distinct_call_ids_for_legacy_rolly_background_route(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
     with web_server._VOICE_TOOL_CACHE_LOCK:
         web_server._VOICE_TOOL_CACHE.clear()
 
-    def fake_run(question, user=None, **_kwargs):
-        calls.append((question, user))
-        return "answer once"
+    def fake_start_background_task(call_id, request_text, user):
+        calls.append((call_id, request_text, user))
+        return SimpleNamespace(task_id="vt_test", to_dict=lambda: {"task_id": "vt_test"})
 
-    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+    monkeypatch.setattr(web_server, "_voice_start_background_task", fake_start_background_task)
 
     first = client.post(
         "/api/voice/tool",
@@ -260,20 +261,21 @@ def test_voice_tool_dedupes_same_realtime_call_id_even_with_distinct_call_ids(vo
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(calls) == 1
+    assert first.json()["data"]["task_id"] == "vt_test"
     assert second.json()["cached"] is True
 
 
-def test_voice_tool_dedupes_same_request_even_with_distinct_realtime_call_ids(voice_client, monkeypatch):
+def test_voice_tool_dedupes_same_request_even_with_distinct_realtime_call_ids_for_legacy_rolly_background_route(voice_client, monkeypatch):
     client, web_server = voice_client
     calls = []
     with web_server._VOICE_TOOL_CACHE_LOCK:
         web_server._VOICE_TOOL_CACHE.clear()
 
-    def fake_run(question, user=None, **_kwargs):
-        calls.append((question, user))
-        return "answer once"
+    def fake_start_background_task(call_id, request_text, user):
+        calls.append((call_id, request_text, user))
+        return SimpleNamespace(task_id="vt_test", to_dict=lambda: {"task_id": "vt_test"})
 
-    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+    monkeypatch.setattr(web_server, "_voice_start_background_task", fake_start_background_task)
 
     first = client.post(
         "/api/voice/tool",
@@ -289,6 +291,7 @@ def test_voice_tool_dedupes_same_request_even_with_distinct_realtime_call_ids(vo
     assert first.status_code == 200
     assert second.status_code == 200
     assert len(calls) == 1
+    assert first.json()["data"]["task_id"] == "vt_test"
     assert second.json()["cached"] is True
 
 
@@ -298,11 +301,11 @@ def test_voice_tool_caches_failures_for_same_realtime_call_id(voice_client, monk
     with web_server._VOICE_TOOL_CACHE_LOCK:
         web_server._VOICE_TOOL_CACHE.clear()
 
-    def fake_run(question, user=None, **_kwargs):
-        calls.append((question, user))
+    def fake_start_background_task(call_id, request_text, user):
+        calls.append((call_id, request_text, user))
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(web_server, "_run_voice_research", fake_run)
+    monkeypatch.setattr(web_server, "_voice_start_background_task", fake_start_background_task)
     payload = {
         "name": "rolly",
         "arguments": {"request": "status"},

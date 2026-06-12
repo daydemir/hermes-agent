@@ -968,6 +968,16 @@ def _voice_tool_cache_keys(payload: VoiceToolRequest, user: str | None = None) -
 def _voice_tool_dispatch(payload: VoiceToolRequest, user: str | None = None) -> Dict[str, Any]:
     args = payload.arguments or {}
     name = payload.name
+    if name == "rolly" and payload.call_id:
+        request_text = str(args.get("request") or args.get("question") or "").strip()
+        if not request_text:
+            raise HTTPException(status_code=400, detail="Missing question")
+        task = _voice_start_background_task(payload.call_id, request_text, _voice_speaker_label(user))
+        return _voice_tool_result(
+            f"Queued background Rolly task {task.task_id}. The voice UI will inject the result back into this live call when it is ready.",
+            tool_name=name,
+            data=task.to_dict(),
+        )
     if name in {"research", "rolly"}:
         question = str(args.get("request") or args.get("question") or "").strip()
         if not question:
