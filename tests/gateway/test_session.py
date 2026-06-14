@@ -575,6 +575,39 @@ class TestLoadTranscriptDBOnly:
         assert result[1]["content"] == "db-a"
 
 
+class TestSessionStoreRollyAttribution:
+    def test_db_session_user_id_uses_rolly_registry_slug(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        registry = tmp_path / "rolly-users.json"
+        registry.write_text(
+            json.dumps({
+                "users": [{
+                    "slug": "deniz",
+                    "display_name": "Deniz",
+                    "accounts": [{"platform": "slack", "user_id": "U_DENIZ"}],
+                }]
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ROLLY_USERS_PATH", str(registry))
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="group",
+            user_id="U_DENIZ",
+            user_name="Deniz",
+        )
+
+        entry = store.get_or_create_session(source)
+
+        assert source.user_id == "U_DENIZ"  # routing/source identity stays raw
+        assert store._db.get_session(entry.session_id)["user_id"] == "deniz"
+
+
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
 

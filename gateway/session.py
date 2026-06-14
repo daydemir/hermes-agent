@@ -27,6 +27,44 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _canonical_rolly_user_id(platform: str, user_id: Optional[str]) -> Optional[str]:
+    """Map a platform user id to a Rolly user slug for DB attribution.
+
+    Keep gateway routing/session-source semantics on raw platform ids, but store
+    the canonical human slug in SQLite sessions when Rolly's local registry has
+    a matching account. Unknown users remain unchanged.
+    """
+    raw_user_id = str(user_id or "").strip()
+    platform_key = str(platform or "").strip().lower()
+    if not raw_user_id or not platform_key:
+        return user_id
+
+    # Already canonicalized.
+    registry_path = Path(
+        os.environ.get("ROLLY_USERS_PATH")
+        or Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / "rolly-users.json"
+    ).expanduser()
+    try:
+        data = json.loads(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return user_id
+
+    users = data.get("users", []) if isinstance(data, dict) else []
+    if not isinstance(users, list):
+        return user_id
+    for user in users:
+        slug = str(user.get("slug") or "").strip().lower()
+        if slug and raw_user_id.lower() == slug:
+            return slug
+        for account in user.get("accounts") or []:
+            if (
+                str(account.get("platform") or "").strip().lower() == platform_key
+                and str(account.get("user_id") or "").strip() == raw_user_id
+            ):
+                return slug or raw_user_id
+    return user_id
+
+
 # ---------------------------------------------------------------------------
 # PII redaction helpers
 # ---------------------------------------------------------------------------
@@ -947,7 +985,7 @@ class SessionStore:
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": source.platform.value,
-                "user_id": source.user_id,
+                "user_id": _canonical_rolly_user_id(source.platform.value, source.user_id),
             }
 
         # SQLite operations outside the lock
