@@ -1507,6 +1507,7 @@ class AIAgent:
                     session_id=self.session_id,
                     role=role,
                     content=content,
+                    platform_message_id=msg.get("platform_message_id") or msg.get("message_id"),
                     tool_name=msg.get("tool_name"),
                     tool_calls=tool_calls_data,
                     tool_call_id=msg.get("tool_call_id"),
@@ -4508,10 +4509,20 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        platform_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        return run_conversation(
+            self,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            platform_message_id,
+        )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

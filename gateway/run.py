@@ -9009,6 +9009,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                platform_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=event.channel_prompt,
             )
 
@@ -16244,6 +16245,7 @@ class GatewayRunner:
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        platform_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -17560,6 +17562,8 @@ class GatewayRunner:
                     "conversation_history": agent_history,
                     "task_id": session_id,
                 }
+                if platform_message_id:
+                    _conversation_kwargs["platform_message_id"] = platform_message_id
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
@@ -18351,6 +18355,7 @@ class GatewayRunner:
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_platform_message_id = None
                 next_channel_prompt = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
@@ -18368,6 +18373,7 @@ class GatewayRunner:
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_platform_message_id = str(pending_event.message_id) if pending_event.message_id else None
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
                 # Restart typing indicator so the user sees activity while
@@ -18393,6 +18399,7 @@ class GatewayRunner:
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    platform_message_id=next_platform_message_id,
                     channel_prompt=next_channel_prompt,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

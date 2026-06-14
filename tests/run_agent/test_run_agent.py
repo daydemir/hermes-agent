@@ -95,6 +95,29 @@ def agent_with_memory_tool():
         return a
 
 
+def test_flush_messages_to_session_db_persists_platform_message_id(agent):
+    """Gateway-provided platform ids must survive agent DB persistence."""
+    mock_db = MagicMock()
+    agent._session_db = mock_db
+    agent._session_db_created = True
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+
+    agent._flush_messages_to_session_db(
+        [
+            {
+                "role": "user",
+                "content": "hello from slack",
+                "platform_message_id": "1712345678.123456",
+            }
+        ],
+        conversation_history=[],
+    )
+
+    mock_db.append_message.assert_called_once()
+    assert mock_db.append_message.call_args.kwargs["platform_message_id"] == "1712345678.123456"
+
+
 def test_aiagent_reuses_existing_errors_log_handler():
     """Repeated AIAgent init should not accumulate duplicate errors.log handlers."""
     root_logger = logging.getLogger()
@@ -3029,6 +3052,21 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_run_conversation_attaches_platform_message_id_to_current_user_turn(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        with (
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("hello", platform_message_id="1712345678.123456")
+
+        persisted_messages = mock_persist.call_args.args[0]
+        current_user_turn = next(msg for msg in persisted_messages if msg.get("role") == "user")
+        assert current_user_turn["platform_message_id"] == "1712345678.123456"
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)

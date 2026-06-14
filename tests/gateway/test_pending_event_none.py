@@ -14,16 +14,27 @@ from types import SimpleNamespace
 from gateway.run import _is_control_interrupt_message
 
 
-def _extract_channel_prompt(pending_event):
-    """Reproduce the fixed logic from gateway/run.py.
+def _extract_pending_event_metadata(pending_event):
+    """Reproduce the fixed metadata capture from gateway/run.py.
 
     Mirrors the variable-capture pattern used before the recursive
     _run_agent call so we can test both paths without a full runner.
     """
     next_channel_prompt = None
+    next_platform_message_id = None
     if pending_event is not None:
         next_channel_prompt = getattr(pending_event, "channel_prompt", None)
-    return next_channel_prompt
+        message_id = getattr(pending_event, "message_id", None)
+        next_platform_message_id = str(message_id) if message_id else None
+    return next_channel_prompt, next_platform_message_id
+
+
+def _extract_channel_prompt(pending_event):
+    return _extract_pending_event_metadata(pending_event)[0]
+
+
+def _extract_platform_message_id(pending_event):
+    return _extract_pending_event_metadata(pending_event)[1]
 
 
 def _extract_pending_text(interrupted, pending_event, interrupt_message):
@@ -54,6 +65,19 @@ class TestPendingEventNoneChannelPrompt:
         event = SimpleNamespace()
         result = _extract_channel_prompt(event)
         assert result is None
+
+    def test_none_pending_event_returns_none_platform_message_id(self):
+        """Path B: no pending_event means no platform id to forward."""
+        assert _extract_platform_message_id(None) is None
+
+    def test_pending_event_message_id_passes_through_as_platform_message_id(self):
+        """Path A: queued gateway event id is forwarded for DB attribution."""
+        event = SimpleNamespace(message_id="1712345678.123456")
+        assert _extract_platform_message_id(event) == "1712345678.123456"
+
+    def test_pending_event_without_message_id_returns_none_platform_message_id(self):
+        """Path A: no event message id remains harmless."""
+        assert _extract_platform_message_id(SimpleNamespace()) is None
 
 
 class TestControlInterruptMessages:

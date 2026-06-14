@@ -356,6 +356,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    platform_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -423,6 +424,8 @@ def run_conversation(
         user_message = _sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = _sanitize_surrogates(persist_user_message)
+    if platform_message_id is not None:
+        platform_message_id = str(platform_message_id)
 
     # Store stream callback for _interruptible_api_call to pick up
     agent._stream_callback = stream_callback
@@ -560,6 +563,8 @@ def run_conversation(
 
     # Add user message
     user_msg = {"role": "user", "content": user_message}
+    if platform_message_id:
+        user_msg["platform_message_id"] = platform_message_id
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
