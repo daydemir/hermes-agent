@@ -62,6 +62,11 @@ hermes-agent/
 ```
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
+**Credentials:** `/Users/rolly/.credentials/` (private, non-git root)
+- `rolly-ops/` — Rolly/Hermes/admin/operator credentials
+- `mix/` — MIX product/backend/local credentials
+- `inbox/` — raw imported secret files kept verbatim
+- `bin/load-rolly-env.sh` / `bin/load-mix-env.sh` — shell loaders for the above
 **Logs:** `~/.hermes/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),
 `gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
 Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
