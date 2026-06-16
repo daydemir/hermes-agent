@@ -67,6 +67,33 @@ def test_audio_upload_saves_file_and_metadata(upload_client, monkeypatch):
     assert saved.parent == web_server.get_hermes_home() / "uploads" / "audio"
 
 
+def test_audio_upload_streams_request_without_buffering(upload_client, monkeypatch):
+    client, web_server = upload_client
+    monkeypatch.setattr(web_server, "_start_audio_diarization", lambda path: None)
+
+    from starlette.requests import Request
+
+    async def fail_body(self):
+        raise AssertionError("upload_audio should stream request body, not call request.body()")
+
+    monkeypatch.setattr(Request, "body", fail_body)
+
+    payload = b"chunked fake audio" * 1024
+    resp = client.post(
+        "/api/uploads/audio?filename=large.m4a",
+        content=payload,
+        headers={
+            "content-type": "audio/mp4",
+            web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["size_bytes"] == len(payload)
+    assert Path(body["path"]).read_bytes() == payload
+
+
 def test_audio_upload_rejects_non_audio_extension(upload_client):
     client, _web_server = upload_client
 

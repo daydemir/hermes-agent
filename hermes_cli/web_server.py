@@ -67,6 +67,7 @@ try:
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
+    from starlette.requests import ClientDisconnect
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -79,6 +80,7 @@ except ImportError:
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
         from pydantic import BaseModel
+        from starlette.requests import ClientDisconnect
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -4252,11 +4254,26 @@ class AudioSpeakersUpdate(BaseModel):
 @app.post("/api/uploads/audio")
 async def upload_audio(request: Request, filename: str = ""):
     stored_name = _safe_audio_filename(filename)
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Audio upload body is empty")
     audio_path = _audio_uploads_dir() / stored_name
-    audio_path.write_bytes(body)
+    tmp_path = audio_path.with_name(f".{audio_path.name}.uploading-{uuid.uuid4().hex}.tmp")
+    size_bytes = 0
+    try:
+        with tmp_path.open("wb") as handle:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                size_bytes += len(chunk)
+        if size_bytes == 0:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="Audio upload body is empty")
+        os.replace(tmp_path, audio_path)
+    except ClientDisconnect:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=499, detail="Client disconnected during audio upload")
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     try:
         audio_path.chmod(0o600)
     except OSError:
@@ -4267,7 +4284,7 @@ async def upload_audio(request: Request, filename: str = ""):
         "original_name": filename,
         "stored_name": stored_name,
         "path": str(audio_path),
-        "size_bytes": len(body),
+        "size_bytes": size_bytes,
         "rolly_user": rolly_user,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
     }
