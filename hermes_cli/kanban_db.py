@@ -744,6 +744,11 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Explicit per-card identity and credential selector. These are non-secret
+    # lookup keys only; credential material is resolved at dispatch time from
+    # config/env and is never stored on the card.
+    actor_slug: Optional[str] = None
+    git_account: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -818,6 +823,12 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            actor_slug=(
+                row["actor_slug"] if "actor_slug" in keys and row["actor_slug"] else None
+            ),
+            git_account=(
+                row["git_account"] if "git_account" in keys and row["git_account"] else None
             ),
         )
 
@@ -980,7 +991,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Non-secret per-card identity/account selectors. Credential material is
+    -- resolved by the dispatcher from local config/env at spawn time; never
+    -- persist tokens or passwords in task rows.
+    actor_slug           TEXT,
+    git_account          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1635,6 +1651,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
+    if "actor_slug" not in cols:
+        # Non-secret per-card identity selector. Credential material is never
+        # stored here; the dispatcher resolves it from local config/env.
+        _add_column_if_missing(conn, "tasks", "actor_slug", "actor_slug TEXT")
+    if "git_account" not in cols:
+        # Non-secret per-card credential account selector, owner-checked against
+        # actor_slug at dispatch time.
+        _add_column_if_missing(conn, "tasks", "git_account", "git_account TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2014,6 +2038,8 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    actor_slug: Optional[str] = None,
+    git_account: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2054,6 +2080,12 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if actor_slug is not None:
+        actor_slug = str(actor_slug).strip() or None
+    if git_account is not None:
+        git_account = str(git_account).strip() or None
+    if (actor_slug and not git_account) or (git_account and not actor_slug):
+        raise ValueError("actor_slug and git_account must be provided together")
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
@@ -2179,8 +2211,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        actor_slug, git_account
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2202,6 +2235,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        actor_slug,
+                        git_account,
                     ),
                 )
                 for pid in parents:
@@ -2221,6 +2256,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "actor_slug": actor_slug,
+                        "git_account": git_account,
                     },
                 )
             return task_id
@@ -6460,6 +6497,35 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    if task.actor_slug or task.git_account:
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_credentials import (
+            KanbanCredentialError,
+            apply_kanban_credentials_to_env,
+        )
+
+        try:
+            credential_summary = apply_kanban_credentials_to_env(
+                env,
+                actor_slug=task.actor_slug,
+                account_key=task.git_account,
+                config=load_config(),
+            )
+        except KanbanCredentialError as exc:
+            raise RuntimeError(
+                f"task {task.id} credential resolution failed closed: {exc}"
+            ) from exc
+        if credential_summary:
+            env["HERMES_KANBAN_ACTOR_SLUG"] = credential_summary["actor_slug"]
+            env["HERMES_KANBAN_GIT_ACCOUNT"] = credential_summary["account_key"]
+            _log.info(
+                "task %s: resolved per-card credentials for actor=%s account=%s provider=%s source=%s",
+                task.id,
+                credential_summary["actor_slug"],
+                credential_summary["account_key"],
+                credential_summary["provider"],
+                credential_summary["source"],
+            )
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.

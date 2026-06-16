@@ -76,6 +76,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "session_id": t.session_id,
+        "actor_slug": t.actor_slug,
+        "git_account": t.git_account,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
@@ -360,6 +362,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--actor-slug", default=None,
+                          help="Non-secret per-card actor selector. Must be used with --git-account.")
+    p_create.add_argument("--git-account", default=None,
+                          help="Non-secret per-card credential account selector. Must be used with --actor-slug.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1359,6 +1365,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            actor_slug=getattr(args, "actor_slug", None),
+            git_account=getattr(args, "git_account", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1528,6 +1536,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.actor_slug or task.git_account:
+        print(f"  identity:  actor={task.actor_slug or '-'} account={task.git_account or '-'}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:

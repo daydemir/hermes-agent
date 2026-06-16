@@ -763,6 +763,8 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    actor_slug = args.get("actor_slug")
+    git_account = args.get("git_account")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -797,6 +799,8 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                actor_slug=actor_slug,
+                git_account=git_account,
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -1279,6 +1283,22 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "actor_slug": {
+                "type": "string",
+                "description": (
+                    "Non-secret per-card actor selector. Must be provided "
+                    "together with git_account; credentials are resolved "
+                    "from local config/env at dispatch time."
+                ),
+            },
+            "git_account": {
+                "type": "string",
+                "description": (
+                    "Non-secret per-card credential account selector. Must "
+                    "be provided together with actor_slug; never include "
+                    "tokens or passwords here."
                 ),
             },
             "board": _board_schema_prop(),
