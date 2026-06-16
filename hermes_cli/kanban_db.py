@@ -1992,6 +1992,82 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_MIX_WORD_RE = re.compile(r"\bMIX\b", re.IGNORECASE)
+_READY_ACCEPTANCE_RE = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?acceptance(?:\s+criteria)?\s*:")
+_READY_VERIFICATION_RE = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?verification\s*:")
+_READY_SOURCE_RE = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?(?:context/)?(?:source|provenance)\b")
+_READY_APPROVAL_RE = re.compile(r"(?i)\bapproved\s+by\s+([A-Za-z][A-Za-z ._-]*)")
+_GENERIC_APPROVERS = {"human", "reviewer", "another human reviewer", "user", "operator"}
+
+
+def _is_mix_task_row(row: sqlite3.Row | None) -> bool:
+    if row is None:
+        return False
+    tenant = (row["tenant"] or "").strip().casefold() if "tenant" in row.keys() else ""
+    if tenant == "mix":
+        return True
+    return bool(_MIX_WORD_RE.search(row["title"] or "") or _MIX_WORD_RE.search(row["body"] or ""))
+
+
+def _has_human_approval(text: str) -> bool:
+    for match in _READY_APPROVAL_RE.finditer(text):
+        approver = match.group(1).strip(" ._-").casefold()
+        if approver and approver not in _GENERIC_APPROVERS:
+            return True
+    return False
+
+
+def _mix_ready_guard_error(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT title, body, tenant FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not _is_mix_task_row(row):
+        return None
+
+    body = row["body"] or ""
+    comments = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    comment_text = "\n".join(c["body"] or "" for c in comments)
+    combined_text = "\n".join(part for part in (body, comment_text) if part)
+
+    missing: list[str] = []
+    if not _READY_ACCEPTANCE_RE.search(body):
+        missing.append("missing acceptance criteria")
+    if not _READY_VERIFICATION_RE.search(body):
+        missing.append("missing verification")
+    if not _READY_SOURCE_RE.search(body):
+        missing.append("missing source/provenance")
+    if not _has_human_approval(combined_text):
+        missing.append("missing human approval")
+
+    if not missing:
+        return None
+    return "MIX ready guard: " + "; ".join(missing)
+
+
+def _append_mix_ready_guard_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    dedupe: bool = False,
+) -> None:
+    payload = {"reason": reason}
+    if dedupe:
+        previous = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'ready_guard_blocked' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if previous and json.loads(previous["payload"] or "null") == payload:
+            return
+    _append_event(conn, task_id, "ready_guard_blocked", payload)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2204,6 +2280,15 @@ def create_task(
                         session_id,
                     ),
                 )
+                if task_status == "ready":
+                    guard_error = _mix_ready_guard_error(conn, task_id)
+                    if guard_error:
+                        task_status = "todo"
+                        conn.execute(
+                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                            (task_id,),
+                        )
+                        _append_mix_ready_guard_event(conn, task_id, guard_error)
                 for pid in parents:
                     conn.execute(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -2876,6 +2961,15 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                guard_error = _mix_ready_guard_error(conn, task_id)
+                if guard_error:
+                    if cur_status == "blocked":
+                        conn.execute(
+                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'blocked'",
+                            (task_id,),
+                        )
+                    _append_mix_ready_guard_event(conn, task_id, guard_error, dedupe=True)
+                    continue
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -2951,6 +3045,18 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        guard_error = _mix_ready_guard_error(conn, task_id)
+        if guard_error:
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": guard_error},
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4092,6 +4198,13 @@ def promote_task(
                 f"{', '.join(unsatisfied)} (use --force to override)"
             )
 
+    guard_error = _mix_ready_guard_error(conn, task_id)
+    if guard_error:
+        if not dry_run:
+            with write_txn(conn):
+                _append_mix_ready_guard_event(conn, task_id, guard_error)
+        return False, guard_error
+
     if dry_run:
         return True, None
 
@@ -4154,6 +4267,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
+        guard_error = None
+        if new_status == "ready":
+            guard_error = _mix_ready_guard_error(conn, task_id)
+            if guard_error:
+                new_status = "todo"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
@@ -4166,6 +4284,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
         )
+        if guard_error:
+            _append_mix_ready_guard_event(conn, task_id, guard_error)
         return True
 
 
