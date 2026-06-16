@@ -763,6 +763,11 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    actor_slug = args.get("actor_slug")
+    git_author = args.get("git_author")
+    git_account = args.get("git_account")
+    committer_mode = args.get("committer_mode")
+    identity_source = args.get("identity_source")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -797,6 +802,11 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                actor_slug=actor_slug,
+                git_author=git_author,
+                git_account=git_account,
+                committer_mode=committer_mode,
+                identity_source=identity_source or ("tool" if actor_slug or git_author or git_account or committer_mode else None),
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -810,6 +820,25 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_resolve_git_identity(args: dict, **kw) -> str:
+    tid = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            identity = kb.resolve_task_git_identity(conn, str(tid))
+            return _ok(task_id=str(tid), identity=identity.as_dict())
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_resolve_git_identity: {e}")
+    except Exception as e:
+        logger.exception("kanban_resolve_git_identity failed")
+        return tool_error(f"kanban_resolve_git_identity: {e}")
 
 
 def _handle_unblock(args: dict, **kw) -> str:
@@ -1281,11 +1310,49 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "actor_slug": {
+                "type": "string",
+                "enum": ["deniz", "arman"],
+                "description": "Intended human git actor for this card.",
+            },
+            "git_author": {
+                "type": "object",
+                "description": "Optional explicit git author object: {name, email}.",
+            },
+            "git_account": {
+                "type": "string",
+                "description": "Owner-checked git account selector: <actor> or <actor>:<selector>.",
+            },
+            "committer_mode": {
+                "type": "string",
+                "enum": ["agent", "actor"],
+                "description": "Committer policy for workers performing git writes.",
+            },
+            "identity_source": {
+                "type": "string",
+                "description": "Optional provenance label for the identity metadata.",
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
     },
 }
+
+KANBAN_RESOLVE_GIT_IDENTITY_SCHEMA = {
+    "name": "kanban_resolve_git_identity",
+    "description": (
+        "Resolve the effective human git identity for a card. Workers should "
+        "call this before git writes and fail closed unless status is 'resolved'."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "board": _board_schema_prop(),
+        },
+    },
+}
+
 
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
@@ -1391,6 +1458,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_resolve_git_identity",
+    toolset="kanban",
+    schema=KANBAN_RESOLVE_GIT_IDENTITY_SCHEMA,
+    handler=_handle_resolve_git_identity,
+    check_fn=_check_kanban_mode,
+    emoji="👤",
 )
 
 registry.register(

@@ -672,6 +672,47 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+
+VALID_GIT_ACTOR_SLUGS = {"deniz", "arman"}
+VALID_COMMITTER_MODES = {"agent", "actor"}
+
+_DEFAULT_GIT_AUTHORS: dict[str, dict[str, str]] = {
+    "deniz": {"name": "Deniz", "email": "deniz@users.noreply.rolly.local"},
+    "arman": {"name": "Arman", "email": "arman@users.noreply.rolly.local"},
+}
+
+
+@dataclass
+class GitIdentityResolution:
+    """Effective git identity resolved for a Kanban task.
+
+    ``status`` is ``resolved`` when a task has a valid intended human actor,
+    ``legacy_default`` when a legacy task carries no identity metadata, and
+    ``error`` when present metadata is invalid or unsafe to use. Callers that
+    are about to perform git writes should fail closed unless ``status`` is
+    ``resolved``.
+    """
+
+    status: str
+    actor_slug: Optional[str]
+    git_author: Optional[dict[str, str]]
+    git_account: Optional[str]
+    committer_mode: str
+    identity_source: str
+    error: Optional[str] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "actor_slug": self.actor_slug,
+            "git_author": self.git_author,
+            "git_account": self.git_account,
+            "committer_mode": self.committer_mode,
+            "identity_source": self.identity_source,
+            "error": self.error,
+        }
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -744,6 +785,15 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Intended human git identity metadata for card-side execution.
+    # ``actor_slug`` is the human reference (currently deniz or arman).
+    # ``git_author`` is optional JSON author metadata; when absent the
+    # resolver supplies a safe local no-reply author for known actors.
+    actor_slug: Optional[str] = None
+    git_author: Optional[dict[str, str]] = None
+    git_account: Optional[str] = None
+    committer_mode: Optional[str] = None
+    identity_source: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -757,6 +807,10 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+
+        git_author_value: Optional[dict[str, str]] = None
+        if "git_author" in keys and row["git_author"]:
+            git_author_value = _parse_git_author(row["git_author"])
         return cls(
             id=row["id"],
             title=row["title"],
@@ -818,6 +872,19 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            actor_slug=(
+                row["actor_slug"] if "actor_slug" in keys and row["actor_slug"] else None
+            ),
+            git_author=git_author_value,
+            git_account=(
+                row["git_account"] if "git_account" in keys and row["git_account"] else None
+            ),
+            committer_mode=(
+                row["committer_mode"] if "committer_mode" in keys and row["committer_mode"] else None
+            ),
+            identity_source=(
+                row["identity_source"] if "identity_source" in keys and row["identity_source"] else None
             ),
         )
 
@@ -980,7 +1047,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Intended human git identity metadata for this card. actor_slug is a
+    -- known human reference (currently deniz or arman); git_author is JSON
+    -- {name,email}; git_account is an owner-checked credential/account
+    -- selector; committer_mode is agent|actor; identity_source records
+    -- provenance such as dashboard, cli, telegram, or inherited.
+    actor_slug           TEXT,
+    git_author           TEXT,
+    git_account          TEXT,
+    committer_mode       TEXT,
+    identity_source      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1635,6 +1712,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
+    if "actor_slug" not in cols:
+        _add_column_if_missing(conn, "tasks", "actor_slug", "actor_slug TEXT")
+    if "git_author" not in cols:
+        _add_column_if_missing(conn, "tasks", "git_author", "git_author TEXT")
+    if "git_account" not in cols:
+        _add_column_if_missing(conn, "tasks", "git_account", "git_account TEXT")
+    if "committer_mode" not in cols:
+        _add_column_if_missing(conn, "tasks", "committer_mode", "committer_mode TEXT")
+    if "identity_source" not in cols:
+        _add_column_if_missing(conn, "tasks", "identity_source", "identity_source TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -1992,6 +2079,160 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_actor_slug(actor_slug: Optional[str]) -> Optional[str]:
+    if actor_slug is None:
+        return None
+    slug = str(actor_slug).strip().lower()
+    return slug or None
+
+
+def _parse_git_author(value: Any) -> Optional[dict[str, str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            match = re.match(r"^(.+?)\s*<([^<>@\s]+@[^<>\s]+)>$", raw)
+            if not match:
+                return None
+            parsed = {"name": match.group(1).strip(), "email": match.group(2).strip()}
+    elif isinstance(value, dict):
+        parsed = value
+    else:
+        return None
+    name = str(parsed.get("name", "")).strip()
+    email = str(parsed.get("email", "")).strip()
+    if not name or not email or "@" not in email or "<" in email or ">" in email:
+        return None
+    return {"name": name, "email": email}
+
+
+def _serialize_git_author(value: Any) -> Optional[str]:
+    author = _parse_git_author(value)
+    if author is None:
+        return None
+    return json.dumps(author, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_git_identity_fields(
+    *,
+    actor_slug: Optional[str] = None,
+    git_author: Any = None,
+    git_account: Optional[str] = None,
+    committer_mode: Optional[str] = None,
+    identity_source: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    actor = _normalize_actor_slug(actor_slug)
+    if actor is not None and actor not in VALID_GIT_ACTOR_SLUGS:
+        raise ValueError(
+            f"actor_slug must be one of {sorted(VALID_GIT_ACTOR_SLUGS)}, got {actor_slug!r}"
+        )
+
+    author_json = None
+    if git_author is not None:
+        author_json = _serialize_git_author(git_author)
+        if author_json is None:
+            raise ValueError("git_author must be {name,email} or 'Name <email>'")
+
+    account = str(git_account).strip() if git_account is not None else None
+    account = account or None
+    if account and actor and account != actor and not account.startswith(f"{actor}:"):
+        raise ValueError("git_account must be owned by actor_slug (use '<actor>' or '<actor>:<selector>')")
+
+    mode = str(committer_mode).strip().lower() if committer_mode is not None else None
+    mode = mode or None
+    if mode is not None and mode not in VALID_COMMITTER_MODES:
+        raise ValueError(
+            f"committer_mode must be one of {sorted(VALID_COMMITTER_MODES)}, got {committer_mode!r}"
+        )
+
+    source = str(identity_source).strip() if identity_source is not None else None
+    return {
+        "actor_slug": actor,
+        "git_author": author_json,
+        "git_account": account,
+        "committer_mode": mode,
+        "identity_source": source or None,
+    }
+
+
+def resolve_task_git_identity(
+    conn: sqlite3.Connection,
+    task_or_id: Task | str,
+    *,
+    default_actor_slug: Optional[str] = None,
+) -> GitIdentityResolution:
+    """Resolve the effective human git identity for a Kanban card.
+
+    Legacy cards with no identity metadata resolve to ``legacy_default`` so
+    existing boards keep loading. Cards that name an unknown actor, malformed
+    author, unsafe account selector, or invalid committer mode resolve to
+    ``error``; git-writing callers should fail closed on that status.
+    """
+    task = get_task(conn, task_or_id) if isinstance(task_or_id, str) else task_or_id
+    if task is None:
+        raise ValueError(f"task {task_or_id!r} not found")
+
+    actor = _normalize_actor_slug(task.actor_slug)
+    source = task.identity_source or "task"
+    has_task_identity = any([task.actor_slug, task.git_author, task.git_account, task.committer_mode])
+    if actor is None and default_actor_slug:
+        actor = _normalize_actor_slug(default_actor_slug)
+        source = "default"
+
+    if actor is None:
+        if has_task_identity:
+            return GitIdentityResolution(
+                status="error", actor_slug=None, git_author=None, git_account=task.git_account,
+                committer_mode=task.committer_mode or "agent", identity_source=source,
+                error="identity metadata is present but actor_slug is missing",
+            )
+        return GitIdentityResolution(
+            status="legacy_default", actor_slug=None, git_author=None, git_account=None,
+            committer_mode="agent", identity_source="legacy", error=None,
+        )
+
+    if actor not in VALID_GIT_ACTOR_SLUGS:
+        return GitIdentityResolution(
+            status="error", actor_slug=actor, git_author=None, git_account=task.git_account,
+            committer_mode=task.committer_mode or "agent", identity_source=source,
+            error=f"unknown actor_slug {actor!r}",
+        )
+
+    author = task.git_author or dict(_DEFAULT_GIT_AUTHORS[actor])
+    if _parse_git_author(author) is None:
+        return GitIdentityResolution(
+            status="error", actor_slug=actor, git_author=None, git_account=task.git_account,
+            committer_mode=task.committer_mode or "agent", identity_source=source,
+            error="git_author is malformed",
+        )
+
+    account = task.git_account
+    if account and account != actor and not account.startswith(f"{actor}:"):
+        return GitIdentityResolution(
+            status="error", actor_slug=actor, git_author=author, git_account=account,
+            committer_mode=task.committer_mode or "agent", identity_source=source,
+            error="git_account is not owned by actor_slug",
+        )
+
+    mode = (task.committer_mode or "agent").strip().lower()
+    if mode not in VALID_COMMITTER_MODES:
+        return GitIdentityResolution(
+            status="error", actor_slug=actor, git_author=author, git_account=account,
+            committer_mode=mode, identity_source=source,
+            error=f"invalid committer_mode {mode!r}",
+        )
+
+    return GitIdentityResolution(
+        status="resolved", actor_slug=actor, git_author=author, git_account=account,
+        committer_mode=mode, identity_source=source, error=None,
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2014,6 +2255,11 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    actor_slug: Optional[str] = None,
+    git_author: Any = None,
+    git_account: Optional[str] = None,
+    committer_mode: Optional[str] = None,
+    identity_source: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2057,6 +2303,13 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+    identity = _normalize_git_identity_fields(
+        actor_slug=actor_slug,
+        git_author=git_author,
+        git_account=git_account,
+        committer_mode=committer_mode,
+        identity_source=identity_source,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2179,8 +2432,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        actor_slug, git_author, git_account, committer_mode, identity_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2202,6 +2456,11 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        identity["actor_slug"],
+                        identity["git_author"],
+                        identity["git_account"],
+                        identity["committer_mode"],
+                        identity["identity_source"],
                     ),
                 )
                 for pid in parents:

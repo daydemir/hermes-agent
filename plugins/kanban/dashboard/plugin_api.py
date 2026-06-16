@@ -583,6 +583,11 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    actor_slug: Optional[str] = None
+    git_author: Optional[dict[str, str]] = None
+    git_account: Optional[str] = None
+    committer_mode: Optional[str] = None
+    identity_source: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -607,6 +612,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            actor_slug=payload.actor_slug,
+            git_author=payload.git_author,
+            git_account=payload.git_account,
+            committer_mode=payload.committer_mode,
+            identity_source=payload.identity_source or (
+                "dashboard" if any([
+                    payload.actor_slug,
+                    payload.git_author,
+                    payload.git_account,
+                    payload.committer_mode,
+                ]) else None
+            ),
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -627,6 +644,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         return body
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}/git-identity")
+def resolve_task_git_identity(task_id: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return {"identity": kanban_db.resolve_task_git_identity(conn, task_id).as_dict()}
     finally:
         conn.close()
 

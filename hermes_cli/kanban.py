@@ -78,6 +78,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "actor_slug": t.actor_slug,
+        "git_author": t.git_author,
+        "git_account": t.git_account,
+        "committer_mode": t.committer_mode,
+        "identity_source": t.identity_source,
     }
 
 
@@ -354,6 +359,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--actor", dest="actor_slug", choices=sorted(kb.VALID_GIT_ACTOR_SLUGS),
+                          default=None, help="Intended human git actor for this card (deniz or arman).")
+    p_create.add_argument("--git-author", default=None,
+                          help="Explicit git author, either JSON {name,email} or 'Name <email>'.")
+    p_create.add_argument("--git-account", default=None,
+                          help="Owner-checked git account selector: <actor> or <actor>:<selector>.")
+    p_create.add_argument("--committer-mode", choices=sorted(kb.VALID_COMMITTER_MODES),
+                          default=None, help="Committer policy for workers: agent or actor.")
+    p_create.add_argument("--identity-source", default=None,
+                          help="Optional provenance label for the identity metadata.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1358,6 +1373,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            actor_slug=getattr(args, "actor_slug", None),
+            git_author=getattr(args, "git_author", None),
+            git_account=getattr(args, "git_account", None),
+            committer_mode=getattr(args, "committer_mode", None),
+            identity_source=getattr(args, "identity_source", None) or (
+                "cli" if any([
+                    getattr(args, "actor_slug", None),
+                    getattr(args, "git_author", None),
+                    getattr(args, "git_account", None),
+                    getattr(args, "committer_mode", None),
+                ]) else None
+            ),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
