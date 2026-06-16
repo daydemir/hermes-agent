@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    routing_metadata TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -238,7 +239,8 @@ CREATE TABLE IF NOT EXISTS messages (
     codex_reasoning_items TEXT,
     codex_message_items TEXT,
     platform_message_id TEXT,
-    observed INTEGER DEFAULT 0
+    observed INTEGER DEFAULT 0,
+    event_metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -705,13 +707,15 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        routing_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
+        routing_metadata_json = json.dumps(routing_metadata) if routing_metadata else None
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, started_at, routing_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -721,6 +725,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    routing_metadata_json,
                 ),
             )
         self._execute_write(_do)
@@ -951,7 +956,16 @@ class SessionDB:
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        session = dict(row)
+        if session.get("routing_metadata"):
+            try:
+                session["routing_metadata"] = json.loads(session["routing_metadata"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Failed to deserialize routing_metadata in get_session, falling back to None")
+                session["routing_metadata"] = None
+        return session
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -1460,8 +1474,9 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
-        platform_message_id: str = None,
+        platform_message_id: Optional[str] = None,
         observed: bool = False,
+        event_metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1489,6 +1504,7 @@ class SessionDB:
             if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        event_metadata_json = json.dumps(event_metadata) if event_metadata else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -1503,8 +1519,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, event_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -1522,6 +1538,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_message_id,
                     1 if observed else 0,
+                    event_metadata_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -1588,13 +1605,17 @@ class SessionDB:
                 platform_msg_id = (
                     msg.get("platform_message_id") or msg.get("message_id")
                 )
+                event_metadata_json = (
+                    json.dumps(msg.get("event_metadata"))
+                    if msg.get("event_metadata") else None
+                )
 
                 conn.execute(
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items, platform_message_id, observed)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       codex_message_items, platform_message_id, observed, event_metadata)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         role,
@@ -1612,6 +1633,7 @@ class SessionDB:
                         codex_message_items_json,
                         platform_msg_id,
                         1 if msg.get("observed") else 0,
+                        event_metadata_json,
                     ),
                 )
                 total_messages += 1
@@ -1647,6 +1669,12 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            if msg.get("event_metadata"):
+                try:
+                    msg["event_metadata"] = json.loads(msg["event_metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize event_metadata in get_messages, falling back to None")
+                    msg["event_metadata"] = None
             result.append(msg)
         return result
 
@@ -1716,6 +1744,14 @@ class SessionDB:
                         "Failed to deserialize tool_calls in get_messages_around, falling back to []"
                     )
                     msg["tool_calls"] = []
+            if msg.get("event_metadata"):
+                try:
+                    msg["event_metadata"] = json.loads(msg["event_metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize event_metadata in get_messages_around, falling back to None"
+                    )
+                    msg["event_metadata"] = None
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of

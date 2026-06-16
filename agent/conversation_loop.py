@@ -268,6 +268,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    event_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -283,6 +284,9 @@ def run_conversation(
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
             synthetic prefixes.
+        event_metadata: Optional event/source metadata for the triggering
+            message. Stored beside the persisted user row; not replayed as
+            conversation content.
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -471,6 +475,11 @@ def run_conversation(
 
     # Add user message
     user_msg = {"role": "user", "content": user_message}
+    if event_metadata:
+        user_msg["event_metadata"] = dict(event_metadata)
+        platform_message_id = event_metadata.get("platform_message_id") or event_metadata.get("message_id")
+        if platform_message_id:
+            user_msg["platform_message_id"] = str(platform_message_id)
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

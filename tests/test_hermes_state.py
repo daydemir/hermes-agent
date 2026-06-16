@@ -35,6 +35,26 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_create_session_persists_routing_metadata(self, db):
+        db.create_session(
+            session_id="s_route",
+            source="telegram",
+            routing_metadata={
+                "platform": "telegram",
+                "chat_id": "chat-1",
+                "thread_id": "topic-2",
+                "gateway_session_key": "agent:main:telegram:chat-1:topic-2",
+            },
+        )
+
+        session = db.get_session("s_route")
+        assert session["routing_metadata"] == {
+            "platform": "telegram",
+            "chat_id": "chat-1",
+            "thread_id": "topic-2",
+            "gateway_session_key": "agent:main:telegram:chat-1:topic-2",
+        }
+
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None

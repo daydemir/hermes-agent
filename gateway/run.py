@@ -8710,6 +8710,19 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            _inbound_event_metadata = {
+                "platform_message_id": str(event.message_id) if event.message_id else None,
+                "message_id": str(event.message_id) if event.message_id else None,
+                "platform_update_id": event.platform_update_id,
+                "reply_to_message_id": str(event.reply_to_message_id) if event.reply_to_message_id else None,
+                "message_type": event.message_type.value if hasattr(event.message_type, "value") else str(event.message_type),
+                "media_types": list(event.media_types or []),
+                "media_count": len(event.media_urls or []),
+                "source": source.to_dict() if hasattr(source, "to_dict") else None,
+                "gateway_session_key": session_key,
+            }
+            _inbound_event_metadata = {k: v for k, v in _inbound_event_metadata.items() if v not in (None, [], {})}
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -8720,6 +8733,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                event_metadata=_inbound_event_metadata or None,
                 channel_prompt=event.channel_prompt,
             )
 
@@ -8987,7 +9001,9 @@ class GatewayRunner:
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
                 # it's a gateway-generated hint, not model output. (#7100)
-                _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                _user_entry: Dict[str, Any] = {"role": "user", "content": message_text, "timestamp": ts}
+                if _inbound_event_metadata:
+                    _user_entry["event_metadata"] = _inbound_event_metadata
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 self.session_store.append_to_transcript(
@@ -9000,7 +9016,9 @@ class GatewayRunner:
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
-                    _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
+                    _user_entry: Dict[str, Any] = {"role": "user", "content": message_text, "timestamp": ts}
+                    if _inbound_event_metadata:
+                        _user_entry["event_metadata"] = _inbound_event_metadata
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     self.session_store.append_to_transcript(
@@ -9037,6 +9055,12 @@ class GatewayRunner:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
+                        if (
+                            msg.get("role") == "user"
+                            and _inbound_event_metadata
+                            and "event_metadata" not in entry
+                        ):
+                            entry["event_metadata"] = _inbound_event_metadata
                         self.session_store.append_to_transcript(
                             session_entry.session_id, entry,
                             skip_db=agent_persisted,
@@ -15795,6 +15819,7 @@ class GatewayRunner:
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
         channel_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -17141,9 +17166,17 @@ class GatewayRunner:
                     _run_message,
                     observed_group_context,
                 )
+                _event_metadata = event_metadata or {
+                    "platform_message_id": str(event_message_id) if event_message_id else None,
+                    "message_id": str(event_message_id) if event_message_id else None,
+                    "source": source.to_dict() if hasattr(source, "to_dict") else None,
+                    "gateway_session_key": session_key,
+                }
+                _event_metadata = {k: v for k, v in _event_metadata.items() if v not in (None, [], {})}
                 _conversation_kwargs = {
                     "conversation_history": agent_history,
                     "task_id": session_id,
+                    "event_metadata": _event_metadata or None,
                 }
                 if observed_group_context:
                     _conversation_kwargs["persist_user_message"] = message

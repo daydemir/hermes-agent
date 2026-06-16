@@ -508,6 +508,18 @@ class AIAgent:
         if self._session_db_created or not self._session_db:
             return
         try:
+            routing_metadata = {
+                key: value for key, value in {
+                    "platform": getattr(self, "platform", None),
+                    "user_id": getattr(self, "_user_id", None),
+                    "user_name": getattr(self, "_user_name", None),
+                    "chat_id": getattr(self, "_chat_id", None),
+                    "chat_name": getattr(self, "_chat_name", None),
+                    "chat_type": getattr(self, "_chat_type", None),
+                    "thread_id": getattr(self, "_thread_id", None),
+                    "gateway_session_key": getattr(self, "_gateway_session_key", None),
+                }.items() if value is not None
+            }
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE") or self.platform or "cli",
@@ -516,6 +528,7 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=os.environ.get("HERMES_SESSION_USER_ID") or None,
                 parent_session_id=self._parent_session_id,
+                routing_metadata=routing_metadata or None,
             )
             self._session_db_created = True
         except Exception as e:
@@ -1354,6 +1367,8 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    platform_message_id=msg.get("platform_message_id") or msg.get("message_id"),
+                    event_metadata=msg.get("event_metadata"),
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -4159,10 +4174,20 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        return run_conversation(
+            self,
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+            event_metadata=event_metadata,
+        )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
