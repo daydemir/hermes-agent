@@ -2145,6 +2145,9 @@ def terminal_tool(
                         proc_session.watcher_user_name = _gw_user_name
                         proc_session.watcher_thread_id = _gw_thread_id
                         proc_session.watcher_message_id = _gw_message_id
+                        proc_session.planner_generation = int(
+                            _gse("HERMES_PLANNER_GENERATION", "0") or 0
+                        )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -2183,6 +2186,7 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
+                            "planner_generation": proc_session.planner_generation,
                         })
 
                 # Set watch patterns for output monitoring

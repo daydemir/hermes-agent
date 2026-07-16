@@ -1706,6 +1706,7 @@ class GatewayRunner:
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
+        from gateway.planner_activity import PLANNER_SKILL
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
@@ -8987,6 +8988,20 @@ class GatewayRunner:
             session_key,
             run_generation,
         )
+        from gateway.session_context import _PLANNER_GENERATION
+        from gateway.planner_activity import planner_activity
+
+        _planner_owner = planner_activity.current(
+            session_key, str(source.chat_id or ""), str(source.thread_id or "")
+        )
+        _session_env_tokens.append(
+            (
+                _PLANNER_GENERATION,
+                _PLANNER_GENERATION.set(
+                    str(_planner_owner.generation if _planner_owner else 0)
+                ),
+            )
+        )
 
         try:
             # Emit agent:start hook
@@ -15209,12 +15224,23 @@ class GatewayRunner:
         if not adapter:
             return
         try:
+            metadata = {}
+            from gateway.planner_activity import PLANNER_SKILL
+
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            if parent_session_id:
+                metadata["gateway_session_id"] = parent_session_id
+            planner_generation = int(evt.get("planner_generation", 0) or 0)
+            if planner_generation:
+                metadata["planner_generation"] = planner_generation
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
+                metadata=metadata,
+                auto_skill=PLANNER_SKILL if planner_generation > 0 else None,
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -15333,6 +15359,12 @@ class GatewayRunner:
                                 source=source,
                                 internal=True,
                                 message_id=message_id,
+                                metadata={"planner_generation": int(
+                                    watcher.get("planner_generation", 0) or 0
+                                )},
+                                auto_skill=(PLANNER_SKILL if int(
+                                    watcher.get("planner_generation", 0) or 0
+                                ) > 0 else None),
                             )
                             logger.info(
                                 "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
@@ -15392,6 +15424,13 @@ class GatewayRunner:
                         logger.error("Watcher delivery error: %s", e)
 
         logger.debug("Process watcher ended: %s", session_id)
+        planner_generation = int(watcher.get("planner_generation", 0) or 0)
+        if platform_name == "slack" and planner_generation and session_key and chat_id and thread_id:
+            from gateway.planner_activity import PlannerOwner, planner_activity
+
+            owner = PlannerOwner(session_key, chat_id, thread_id, planner_generation)
+            if not process_registry.has_planner_owner(owner):
+                await planner_activity.release(owner)
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
 

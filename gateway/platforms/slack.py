@@ -341,8 +341,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
-        # clear them (chat_id → thread_ts).
-        self._active_status_threads: Dict[str, str] = {}
+        # clear them. Exact routes prevent same-channel cross-clears.
+        self._active_status_threads: Dict[Any, str] = {}
+        self._sent_message_threads: Dict[str, Tuple[str, str]] = {}
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
@@ -805,9 +806,10 @@ class SlackAdapter(BasePlatformAdapter):
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
-            # Clear Slack Assistant status as soon as the final message is posted.
+            # Slack clears Assistant status on a bot post. Re-arm an active
+            # planner lease immediately; wait/terminal ownership stays clear.
             if thread_ts:
-                await self.stop_typing(chat_id)
+                await self._rearm_planner_status(chat_id, thread_ts)
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
@@ -817,6 +819,7 @@ class SlackAdapter(BasePlatformAdapter):
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
                     self._bot_message_ts.add(thread_ts)
+                    self._sent_message_threads[sent_ts] = (chat_id, thread_ts)
                 if len(self._bot_message_ts) > self._BOT_TS_MAX:
                     excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
                     for old_ts in list(self._bot_message_ts)[:excess]:
@@ -887,7 +890,11 @@ class SlackAdapter(BasePlatformAdapter):
                 text=formatted,
             )
             if finalize:
-                await self.stop_typing(chat_id)
+                route = self._sent_message_threads.pop(message_id, None)
+                if route and route[0] == chat_id:
+                    await self._rearm_planner_status(*route)
+                else:
+                    await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -898,6 +905,17 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def _rearm_planner_status(self, chat_id: str, thread_ts: str) -> None:
+        from gateway.planner_activity import planner_activity
+
+        metadata = {"thread_id": thread_ts, "planner_activity": True}
+        if planner_activity.route_known(chat_id, thread_ts):
+            await self.stop_typing(chat_id, metadata=metadata)
+            if planner_activity.route_active(chat_id, thread_ts):
+                await self.send_typing(chat_id, metadata=metadata)
+            return
+        await self.stop_typing(chat_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
@@ -916,13 +934,18 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return  # Can only set status in a thread context
 
-        self._active_status_threads[chat_id] = thread_ts
+        status_key = (chat_id, thread_ts) if metadata and metadata.get("planner_activity") else chat_id
+        self._active_status_threads[status_key] = thread_ts
         try:
-            await self._get_client(chat_id).assistant_threads_setStatus(
+            kwargs = dict(
                 channel_id=chat_id,
                 thread_ts=thread_ts,
                 status="is thinking...",
             )
+            if metadata and metadata.get("planner_activity"):
+                from gateway.planner_activity import LOADING_MESSAGES
+                kwargs["loading_messages"] = list(LOADING_MESSAGES)
+            await self._get_client(chat_id).assistant_threads_setStatus(**kwargs)
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
@@ -932,7 +955,15 @@ class SlackAdapter(BasePlatformAdapter):
         """Clear the assistant thread status indicator."""
         if not self._app:
             return
-        thread_ts = self._active_status_threads.pop(chat_id, None)
+        thread_ts = None
+        if metadata:
+            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
+        if thread_ts:
+            self._active_status_threads.pop((chat_id, thread_ts), None)
+            if self._active_status_threads.get(chat_id) == thread_ts:
+                self._active_status_threads.pop(chat_id, None)
+        else:
+            thread_ts = self._active_status_threads.pop(chat_id, None)
         if not thread_ts:
             return
         try:

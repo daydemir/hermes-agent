@@ -1386,6 +1386,86 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
         assert adapter._active_status_threads["C123"] == "parent_ts"
 
+    @pytest.mark.asyncio
+    async def test_planner_post_rearms_exact_active_thread(self, adapter):
+        from gateway.planner_activity import LOADING_MESSAGES, planner_activity
+
+        planner_activity.__init__()
+        owner = planner_activity.acquire(
+            MessageEvent(
+                text="go",
+                source=MagicMock(
+                    platform=Platform.SLACK,
+                    chat_type="group",
+                    chat_id="C123",
+                    thread_id="123.456",
+                    user_id="U123",
+                    is_bot=False,
+                ),
+                auto_skill="rolly-bootstrap:rolly-planner",
+            ),
+            "S",
+        )
+        assert owner
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing(
+            "C123", metadata={"thread_id": "123.456", "planner_activity": True}
+        )
+        adapter._app.client.assistant_threads_setStatus.reset_mock()
+
+        result = await adapter.send(
+            "C123", "still working", metadata={"thread_id": "123.456"}
+        )
+
+        assert result.success
+        assert adapter._app.client.assistant_threads_setStatus.call_args_list == [
+            call(channel_id="C123", thread_ts="123.456", status=""),
+            call(
+                channel_id="C123",
+                thread_ts="123.456",
+                status="is thinking...",
+                loading_messages=list(LOADING_MESSAGES),
+            ),
+        ]
+        planner_activity.__init__()
+
+    @pytest.mark.asyncio
+    async def test_planner_wait_post_clears_without_rearm(self, adapter):
+        from gateway.planner_activity import ActivityState, planner_activity
+
+        planner_activity.__init__()
+        owner = planner_activity.acquire(
+            MessageEvent(
+                text="go",
+                source=MagicMock(
+                    platform=Platform.SLACK,
+                    chat_type="group",
+                    chat_id="C123",
+                    thread_id="123.456",
+                    user_id="U123",
+                    is_bot=False,
+                ),
+                auto_skill="rolly-bootstrap:rolly-planner",
+            ),
+            "S",
+        )
+        assert owner
+        planner_activity._states[owner] = ActivityState.WAITING
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter._active_status_threads[("C123", "123.456")] = "123.456"
+
+        result = await adapter.send(
+            "C123", "question", metadata={"thread_id": "123.456"}
+        )
+
+        assert result.success
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123", thread_ts="123.456", status=""
+        )
+        planner_activity.__init__()
+
 
 # ---------------------------------------------------------------------------
 # TestFormatMessage — Markdown → mrkdwn conversion

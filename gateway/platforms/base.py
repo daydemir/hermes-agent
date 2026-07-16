@@ -2797,6 +2797,39 @@ class BasePlatformAdapter(ABC):
                     pass
             self._typing_paused.discard(chat_id)
 
+    async def _stop_typing_refresh(
+        self,
+        chat_id: str,
+        typing_task: asyncio.Task | None = None,
+        *,
+        metadata=None,
+        timeout: float = 0.5,
+        stop_attempts: int = 2,
+    ) -> None:
+        """Stop the refresh task and platform typing state as one operation."""
+        self._typing_paused.add(chat_id)
+        try:
+            if typing_task is not None and not typing_task.done():
+                typing_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            if not hasattr(self, "stop_typing"):
+                return
+            for attempt in range(max(1, stop_attempts)):
+                try:
+                    if metadata is None:
+                        await self.stop_typing(chat_id)
+                    else:
+                        await self.stop_typing(chat_id, metadata=metadata)
+                except Exception:
+                    pass
+                if attempt < stop_attempts - 1:
+                    await asyncio.sleep(0)
+        finally:
+            self._typing_paused.discard(chat_id)
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -3711,29 +3744,43 @@ class BasePlatformAdapter(ABC):
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-        _keep_typing_kwargs = {"metadata": _thread_metadata}
-        try:
-            _keep_typing_sig = inspect.signature(self._keep_typing)
-        except (TypeError, ValueError):
-            _keep_typing_sig = None
-        if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
-            _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
-                event.source.chat_id,
-                **_keep_typing_kwargs,
+        from gateway.planner_activity import is_planner_event, planner_activity
+
+        _planner_scoped = is_planner_event(event, session_key)
+        _planner_owner = planner_activity.acquire(event, session_key)
+        if _planner_owner:
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["planner_activity"] = True
+        typing_task: Optional[asyncio.Task] = None
+        if (
+            getattr(self.config, "typing_indicator", True)
+            and not (_planner_scoped and _planner_owner is None)
+            and not (_planner_owner and planner_activity.has_runtime(_planner_owner))
+        ):
+            _keep_typing_kwargs = {"metadata": _thread_metadata}
+            try:
+                _keep_typing_sig = inspect.signature(self._keep_typing)
+            except (TypeError, ValueError):
+                _keep_typing_sig = None
+            if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
+                _keep_typing_kwargs["stop_event"] = interrupt_event
+            typing_task = asyncio.create_task(
+                self._keep_typing(event.source.chat_id, **_keep_typing_kwargs)
             )
-        )
+            if _planner_owner:
+                planner_activity.bind_runtime(
+                    _planner_owner, self, typing_task, _thread_metadata
+                )
 
         async def _stop_typing_task() -> None:
-            typing_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(typing_task), timeout=0.5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                # Cancellation cleanup must not block adapter shutdown.  The
-                # typing task is already cancelled; if the parent task is also
-                # cancelling, let this message-processing task unwind now.
-                pass
+            if _planner_owner:
+                from tools.process_registry import process_registry
+
+                if process_registry.has_planner_owner(_planner_owner):
+                    return
+                await planner_activity.release(_planner_owner)
+                return
+            await self._stop_typing_refresh(event.source.chat_id, typing_task)
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -4115,15 +4162,16 @@ class BasePlatformAdapter(ABC):
                         await _post_result
                 except Exception:
                     pass
-            # Stop typing indicator
             await _stop_typing_task()
-            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
-            # that may have been recreated by _keep_typing after the last stop_typing()
-            try:
-                if hasattr(self, "stop_typing"):
-                    await self.stop_typing(event.source.chat_id)
-            except Exception:
-                pass
+            from tools.process_registry import process_registry as _process_registry
+
+            if not (_planner_owner and _process_registry.has_planner_owner(_planner_owner)):
+                await self._stop_typing_refresh(
+                    event.source.chat_id,
+                    None,
+                    metadata=_thread_metadata if _planner_owner else None,
+                    stop_attempts=1,
+                )
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
             await self._flush_text_debounce_now(session_key)

@@ -113,6 +113,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    planner_generation: int = 0                  # Exact planner lease generation; 0 = none
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -1307,6 +1308,29 @@ class ProcessRegistry:
                 for s in self._running.values()
             )
 
+    def has_planner_watcher(self, owner) -> bool:
+        """Live completion watcher matching an exact planner owner."""
+        with self._lock:
+            sessions = list(self._running.values())
+        for session in sessions:
+            self._refresh_detached_session(session)
+        with self._lock:
+            return any(
+                s.notify_on_complete and not s.exited
+                and s.session_key == owner.session_key
+                and s.watcher_platform.lower() == "slack"
+                and s.watcher_chat_id == owner.channel_id
+                and s.watcher_thread_id == owner.thread_id
+                and s.planner_generation == owner.generation
+                for s in self._running.values()
+            )
+
+    def has_planner_owner(self, owner) -> bool:
+        """Exact six-condition planner background ownership predicate."""
+        from gateway.planner_activity import planner_activity
+
+        return planner_activity.is_active(owner) and self.has_planner_watcher(owner)
+
     def kill_all(self, task_id: str = None) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
@@ -1377,6 +1401,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "planner_generation": s.planner_generation,
                             "watch_patterns": s.watch_patterns,
                         })
             
@@ -1441,6 +1466,7 @@ class ProcessRegistry:
                     watcher_message_id=entry.get("watcher_message_id", ""),
                     watcher_interval=entry.get("watcher_interval", 0),
                     notify_on_complete=entry.get("notify_on_complete", False),
+                    planner_generation=int(entry.get("planner_generation", 0) or 0),
                     watch_patterns=entry.get("watch_patterns", []),
                 )
                 with self._lock:
@@ -1461,6 +1487,7 @@ class ProcessRegistry:
                         "thread_id": session.watcher_thread_id,
                         "message_id": session.watcher_message_id,
                         "notify_on_complete": session.notify_on_complete,
+                        "planner_generation": session.planner_generation,
                     })
 
         self._write_checkpoint()
