@@ -8139,7 +8139,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
-            def _kill_tool_subprocesses(phase: str) -> None:
+            async def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 
                 Called twice in the shutdown path: once eagerly after a
@@ -8152,6 +8152,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 All steps are best-effort; exceptions are swallowed so
                 one subsystem's failure doesn't block the rest.
                 """
+                try:
+                    from tools.process_registry import process_registry
+
+                    _resume_reason = (
+                        "restart_timeout"
+                        if self._restart_requested
+                        else "shutdown_timeout"
+                    )
+                    for _sk in process_registry.active_session_keys():
+                        await self.async_session_store.mark_resume_pending(
+                            _sk, _resume_reason
+                        )
+                except Exception as _e:
+                    logger.debug("mark background sessions resumable failed: %s", _e)
                 try:
                     from tools.process_registry import process_registry
                     _killed = process_registry.kill_all()
@@ -8337,7 +8351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
-                _kill_tool_subprocesses("post-interrupt")
+                await _kill_tool_subprocesses("post-interrupt")
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
                     _phase_elapsed(),
@@ -8422,7 +8436,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
-            _kill_tool_subprocesses("final-cleanup")
+            await _kill_tool_subprocesses("final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
                 _phase_elapsed(),

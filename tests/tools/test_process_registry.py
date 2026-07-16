@@ -152,6 +152,21 @@ def test_request_close_terminal_without_sink_is_desktop_only_error(registry):
     assert "desktop" in result["error"].lower()
 
 
+def test_active_session_keys_returns_only_live_owned_processes(registry):
+    live = _make_session(sid="live")
+    live.session_key = "session-a"
+    duplicate = _make_session(sid="duplicate")
+    duplicate.session_key = "session-a"
+    unowned = _make_session(sid="unowned")
+    exited = _make_session(sid="exited", exited=True)
+    exited.session_key = "session-b"
+    registry._running = {
+        session.id: session for session in (live, duplicate, unowned, exited)
+    }
+
+    assert registry.active_session_keys() == {"session-a"}
+
+
 def test_request_close_terminal_invokes_sink_without_killing(registry):
     """With a sink wired, close routes (session, process_id) to the UI and leaves
     the process running — close is a view drop, not a kill."""

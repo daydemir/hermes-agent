@@ -369,6 +369,28 @@ async def test_gateway_stop_kills_tool_subprocesses_on_graceful_path(monkeypatch
     assert kill_count == 1
 
 
+@pytest.mark.asyncio
+async def test_gateway_stop_resumes_sessions_whose_background_work_is_killed(monkeypatch):
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner.session_store.mark_resume_pending = MagicMock(return_value=True)
+
+    import tools.process_registry as _pr
+    import tools.terminal_tool as _tt
+    import tools.browser_tool as _bt
+    monkeypatch.setattr(_pr.process_registry, "active_session_keys", lambda: {"session-a"})
+    monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
+    monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+    monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        await runner.stop(restart=True)
+
+    runner.session_store.mark_resume_pending.assert_called_once_with(
+        "session-a", "restart_timeout"
+    )
+
+
 # ---------------------------------------------------------------------------
 # gateway_state persistence on shutdown (issue #42675)
 #

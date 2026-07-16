@@ -1789,6 +1789,21 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
+    def active_session_keys(self) -> set[str]:
+        """Gateway sessions that currently own a background process."""
+        with self._lock:
+            sessions = list(self._running.values())
+
+        for session in sessions:
+            self._refresh_detached_session(session)
+
+        with self._lock:
+            return {
+                session.session_key
+                for session in self._running.values()
+                if session.session_key and not session.exited
+            }
+
     def kill_all(self, task_id: str = None) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
