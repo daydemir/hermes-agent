@@ -946,6 +946,12 @@ class SlackAdapter(BasePlatformAdapter):
                 from gateway.planner_activity import LOADING_MESSAGES
                 kwargs["loading_messages"] = list(LOADING_MESSAGES)
             await self._get_client(chat_id).assistant_threads_setStatus(**kwargs)
+            if metadata and metadata.get("planner_activity"):
+                logger.info(
+                    "[Slack] planner status set channel=%s thread=%s",
+                    chat_id,
+                    thread_ts,
+                )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
@@ -972,6 +978,12 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts=thread_ts,
                 status="",
             )
+            if metadata and metadata.get("planner_activity"):
+                logger.info(
+                    "[Slack] planner status cleared channel=%s thread=%s",
+                    chat_id,
+                    thread_ts,
+                )
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 

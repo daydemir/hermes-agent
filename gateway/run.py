@@ -8994,14 +8994,15 @@ class GatewayRunner:
         _planner_owner = planner_activity.current(
             session_key, str(source.chat_id or ""), str(source.thread_id or "")
         )
-        _session_env_tokens.append(
-            (
-                _PLANNER_GENERATION,
-                _PLANNER_GENERATION.set(
-                    str(_planner_owner.generation if _planner_owner else 0)
-                ),
+        if _session_env_tokens is not None:
+            _session_env_tokens.append(
+                (
+                    _PLANNER_GENERATION,
+                    _PLANNER_GENERATION.set(
+                        str(_planner_owner.generation if _planner_owner else 0)
+                    ),
+                )
             )
-        )
 
         try:
             # Emit agent:start hook
