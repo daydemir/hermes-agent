@@ -15354,6 +15354,8 @@ class GatewayRunner:
                             break
                     if adapter and source.chat_id:
                         try:
+                            from gateway.planner_activity import PLANNER_SKILL
+
                             synth_event = MessageEvent(
                                 text=synth_text,
                                 message_type=MessageType.TEXT,
