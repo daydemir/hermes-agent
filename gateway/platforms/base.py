@@ -1340,6 +1340,10 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Event-level metadata for synthetic injections (e.g. planner_generation,
+    # gateway_session_id) — read via getattr(event, "metadata", None).
+    metadata: Optional[Dict[str, Any]] = None
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
