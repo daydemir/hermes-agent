@@ -27,6 +27,7 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _build_recent_history_snapshot,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -87,6 +88,78 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_recent_history_is_distinct_from_explicit_context(self):
+        prompt = _build_child_system_prompt(
+            "Create the event",
+            "Use the work calendar",
+            recent_history="USER: Monday at 1pm\n\nASSISTANT: Got it",
+        )
+        self.assertIn("RECENT PARENT CONVERSATION", prompt)
+        self.assertIn("USER: Monday at 1pm", prompt)
+        self.assertIn("CONTEXT:\nUse the work calendar", prompt)
+        self.assertLess(prompt.index("RECENT PARENT"), prompt.index("CONTEXT:"))
+
+
+class TestRecentHistorySnapshot(unittest.TestCase):
+    def test_keeps_only_visible_user_and_assistant_text(self):
+        messages = [
+            {"role": "system", "content": "secret system prompt"},
+            {"role": "user", "content": "Use my work calendar"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"function": {"name": "calendar"}}],
+            },
+            {"role": "tool", "content": "large private tool payload"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:..."}},
+                    {"type": "text", "text": "Which Monday?"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": "The coming Monday",
+                "_pre_verify_synthetic": True,
+            },
+        ]
+
+        snapshot = _build_recent_history_snapshot(messages, {})
+
+        self.assertEqual(
+            snapshot,
+            "USER: Use my work calendar\n\nASSISTANT: Which Monday?",
+        )
+        self.assertNotIn("tool payload", snapshot)
+        self.assertNotIn("data:", snapshot)
+        self.assertNotIn("secret system", snapshot)
+
+    def test_prefers_newest_messages_and_obeys_character_ceiling(self):
+        messages = [
+            {"role": "user", "content": f"message {i}"}
+            for i in range(10)
+        ]
+
+        snapshot = _build_recent_history_snapshot(
+            messages,
+            {
+                "recent_history_max_messages": 2,
+                "recent_history_max_chars": 30,
+            },
+        )
+
+        self.assertLessEqual(len(snapshot), 30)
+        self.assertIn("message 9", snapshot)
+        self.assertNotIn("message 7", snapshot)
+
+    def test_can_be_disabled(self):
+        snapshot = _build_recent_history_snapshot(
+            [{"role": "user", "content": "hello"}],
+            {"inherit_recent_history": False},
+        )
+        self.assertIsNone(snapshot)
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -205,6 +278,30 @@ class TestDelegateTask(unittest.TestCase):
         result = json.loads(delegate_task(goal="test"))
         self.assertIn("error", result)
         self.assertIn("parent agent", result["error"])
+
+    def test_child_prompt_inherits_recent_parent_text(self):
+        parent = _make_mock_parent(depth=0)
+        parent._session_messages = [
+            {"role": "user", "content": "Use my work calendar"},
+            {"role": "tool", "content": "do not copy this payload"},
+            {"role": "assistant", "content": "Monday at 1pm is available"},
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = child
+
+            delegate_task(goal="Create it", parent_agent=parent)
+
+        prompt = MockAgent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn("USER: Use my work calendar", prompt)
+        self.assertIn("ASSISTANT: Monday at 1pm is available", prompt)
+        self.assertNotIn("do not copy this payload", prompt)
 
     def test_depth_limit(self):
         parent = _make_mock_parent(depth=2)
@@ -1140,6 +1237,28 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_forwards_live_parent_messages_for_dispatch_snapshot(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        live_messages = [
+            {"role": "user", "content": "Use the details I just gave you"}
+        ]
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {"goal": "Continue"},
+                live_messages,
+            )
+
+        self.assertIs(captured["parent_messages"], live_messages)
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

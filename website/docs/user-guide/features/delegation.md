@@ -140,6 +140,19 @@ process disappears while it is still running is recorded as `unknown`, because
 Hermes cannot prove whether its external side effects happened. Pending and
 delivered records are bounded and profile-local.
 
+## Recent Conversation Context
+
+Delegated children start fresh, but by default their focused system prompt includes a bounded snapshot of the most recent user and assistant text from the parent conversation. This preserves nearby choices, corrections, names, and pronoun references without copying tool calls/results, system instructions, reasoning, images, or the full session.
+
+```yaml
+delegation:
+  inherit_recent_history: true       # Set false for strict goal/context-only isolation
+  recent_history_max_messages: 8     # Hard cap: 20
+  recent_history_max_chars: 6000     # Hard cap: 20000
+```
+
+The snapshot is captured when the child is dispatched, so later parent messages are not included. Explicit `context` remains authoritative and should carry any detail that must not be lost to the cap. If you route subagents to a different provider, the snapshot is sent to that provider with the delegated task.
+
 ## Model Override
 
 You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:

@@ -2205,7 +2205,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             agent,
             "_dispatch_delegate_task",
-            lambda args: '{"ok":true}',
+            lambda args, parent_messages=None: '{"ok":true}',
         )
         agent._memory_manager = None
 
@@ -5804,5 +5804,4 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
 

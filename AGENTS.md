@@ -1007,7 +1007,8 @@ Roles:
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
-`max_iterations`.
+`inherit_recent_history`, `recent_history_max_messages`,
+`recent_history_max_chars`, `max_iterations`.
 
 Durability rule: background `delegate_task` is detached from the current
 turn but still process-local. For work that must survive process restart, use

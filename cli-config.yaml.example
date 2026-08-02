@@ -1240,6 +1240,9 @@ code_execution:
 # The delegate_task tool spawns child agents with isolated context.
 # Supports single tasks and batch mode (default 3 parallel, configurable).
 delegation:
+  # inherit_recent_history: true             # Give children recent user/assistant text; never tool output (default: true).
+  # recent_history_max_messages: 8           # Recent text messages copied at dispatch (hard cap: 20).
+  # recent_history_max_chars: 6000           # Total snapshot characters (hard cap: 20000).
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
   # max_concurrent_children: 3                # Max parallel child agents per batch (default: 3, floor: 1, no ceiling).
                                               # WARNING: values above 10 multiply API cost linearly.

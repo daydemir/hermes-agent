@@ -8,7 +8,7 @@ modes. Top-level model calls run in the background; orchestrator children
 wait for their own workers so they can synthesize the results.
 
 Each child gets:
-  - A fresh conversation (no parent history)
+  - A fresh conversation initialized with a bounded recent-history snapshot
   - Its own task_id (own terminal session, file ops cache)
   - The parent's toolsets, with child-only blocked tools stripped
   - A focused system prompt built from the delegated goal + context
@@ -710,6 +710,15 @@ def _preserve_parent_mcp_toolsets(
 
 
 DEFAULT_MAX_ITERATIONS = 50
+# A child needs enough conversational continuity to understand pronouns,
+# corrections, and decisions made immediately before delegation.  Keep this
+# snapshot deliberately small and text-only: tool calls/results remain isolated
+# in the parent, and hard ceilings prevent a user config typo from flooding the
+# child's prompt.
+DEFAULT_RECENT_HISTORY_MESSAGES = 8
+DEFAULT_RECENT_HISTORY_CHARS = 6000
+_MAX_RECENT_HISTORY_MESSAGES = 20
+_MAX_RECENT_HISTORY_CHARS = 20000
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -784,10 +793,110 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _bounded_recent_history_limit(value: Any, default: int, ceiling: int) -> int:
+    """Parse a recent-history limit while preserving strict hard ceilings."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0, min(parsed, ceiling))
+
+
+def _message_text_content(content: Any) -> str:
+    """Extract human-visible text without copying images or tool payloads."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+
+    text_parts: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            if part.strip():
+                text_parts.append(part.strip())
+            continue
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "").lower()
+        if part_type not in {"text", "input_text", "output_text"}:
+            continue
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            text_parts.append(text.strip())
+    return "\n".join(text_parts)
+
+
+def _build_recent_history_snapshot(
+    messages: Any,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return bounded recent user/assistant text for a delegated child.
+
+    The snapshot is captured at dispatch time.  It intentionally excludes
+    system messages, tool calls/results, reasoning blocks, images, and
+    synthetic control turns.  Explicit ``context`` remains the authoritative
+    place for task-specific constraints.
+    """
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    if not is_truthy_value(cfg.get("inherit_recent_history"), default=True):
+        return None
+    if not isinstance(messages, (list, tuple)):
+        return None
+
+    max_messages = _bounded_recent_history_limit(
+        cfg.get("recent_history_max_messages"),
+        DEFAULT_RECENT_HISTORY_MESSAGES,
+        _MAX_RECENT_HISTORY_MESSAGES,
+    )
+    max_chars = _bounded_recent_history_limit(
+        cfg.get("recent_history_max_chars"),
+        DEFAULT_RECENT_HISTORY_CHARS,
+        _MAX_RECENT_HISTORY_CHARS,
+    )
+    if max_messages == 0 or max_chars == 0:
+        return None
+
+    candidates: List[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        if message.get("_thinking_prefill") or any(
+            str(key).startswith("_") and str(key).endswith("_synthetic")
+            for key, value in message.items()
+            if value
+        ):
+            continue
+        text = _message_text_content(message.get("content"))
+        if text:
+            candidates.append(f"{role.upper()}: {text}")
+
+    selected: List[str] = []
+    used = 0
+    for item in reversed(candidates[-max_messages:]):
+        separator = 2 if selected else 0
+        remaining = max_chars - used - separator
+        if remaining <= 0:
+            break
+        if len(item) > remaining:
+            if not selected and remaining > 1:
+                selected.append(item[: remaining - 1] + "…")
+            break
+        selected.append(item)
+        used += separator + len(item)
+
+    if not selected:
+        return None
+    return "\n\n".join(reversed(selected))
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
     *,
+    recent_history: Optional[str] = None,
     workspace_path: Optional[str] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
@@ -806,6 +915,13 @@ def _build_child_system_prompt(
         "",
         f"YOUR TASK:\n{goal}",
     ]
+    if recent_history and recent_history.strip():
+        parts.append(
+            "\nRECENT PARENT CONVERSATION (automatic snapshot; oldest to newest):\n"
+            f"{recent_history}\n\n"
+            "Use this only for conversational continuity. YOUR TASK and explicit "
+            "CONTEXT below are authoritative."
+        )
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -1212,6 +1328,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    recent_history: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1317,6 +1434,7 @@ def _build_child_agent(
     child_prompt = _build_child_system_prompt(
         goal,
         context,
+        recent_history=recent_history,
         workspace_path=workspace_hint,
         role=effective_role,
         max_spawn_depth=max_spawn,
@@ -2783,6 +2901,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    parent_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2837,6 +2956,12 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    history_source = (
+        parent_messages
+        if isinstance(parent_messages, list)
+        else getattr(parent_agent, "_session_messages", None)
+    )
+    recent_history = _build_recent_history_snapshot(history_source, cfg)
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2960,6 +3085,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            recent_history=recent_history,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3730,8 +3856,10 @@ def _build_top_level_description() -> str:
         "before a subagent finishes, that subagent's work is discarded, and "
         "/stop cancels every running background subagent.\n\n"
         "IMPORTANT:\n"
-        "- Subagents have NO memory of your conversation. Pass all relevant "
-        "info (file paths, error messages, constraints) via the 'context' field.\n"
+        "- Subagents receive a bounded, text-only snapshot of recent user/assistant "
+        "conversation by default. Tool calls/results and older history remain isolated. "
+        "Still pass essential file paths, error messages, and constraints via the "
+        "'context' field because the automatic snapshot is intentionally capped.\n"
         "- If the user is writing in a non-English language, or asked for "
         "output in a specific language / tone / style, say so in 'context' "
         "(e.g. \"respond in Chinese\", \"return output in Japanese\"). "

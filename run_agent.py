@@ -7028,7 +7028,9 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
-    def _dispatch_delegate_task(self, function_args: dict) -> str:
+    def _dispatch_delegate_task(
+        self, function_args: dict, parent_messages: Optional[list] = None
+    ) -> str:
         """Single call site for delegate_task dispatch.
 
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
@@ -7058,6 +7060,7 @@ class AIAgent:
             role=function_args.get("role"),
             background=(not _is_subagent),
             parent_agent=self,
+            parent_messages=parent_messages,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
