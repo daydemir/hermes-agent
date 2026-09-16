@@ -9,6 +9,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 """
 
 import asyncio
+import contextlib
 import contextvars
 import inspect
 import json
@@ -1043,6 +1044,12 @@ class SlackAdapter(BasePlatformAdapter):
         # Entries are popped when the status clears, but statuses abandoned
         # by an error path would accumulate — bound with oldest-thread-first
         # eviction (key[2] is the thread ts).
+        # One temporary channel progress message per accepted session/root.
+        # DMs keep Slack's native Assistant status surface instead.
+        self._channel_working_messages: Dict[Tuple[str, str, str], str] = {}
+        self._channel_working_message_ts: set = set()
+        self._channel_working_inflight: Dict[Tuple[str, str, str], asyncio.Event] = {}
+        self._channel_working_tasks: set[asyncio.Task] = set()
         self._active_status_threads: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._ACTIVE_STATUS_THREADS_MAX = 1000
         # Native progress streams share Slack's workspace/thread isolation.
@@ -4249,8 +4256,100 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _is_channel_event(event: MessageEvent) -> bool:
+        """True for Slack channels and MPIMs, but not one-to-one DMs."""
+        if getattr(event, "message_type", None) == MessageType.COMMAND:
+            return False
+        raw = getattr(event, "raw_message", None)
+        channel_type = raw.get("channel_type") if isinstance(raw, dict) else None
+        if channel_type:
+            return channel_type != "im"
+        return getattr(event.source, "chat_type", None) != "dm"
+
+    def _channel_working_key(self, event: MessageEvent) -> Tuple[str, str, str]:
+        source = event.source
+        return (
+            str(getattr(source, "scope_id", "") or ""),
+            str(getattr(source, "chat_id", "") or ""),
+            str(getattr(source, "thread_id", "") or ""),
+        )
+
+    async def _start_channel_working(self, event: MessageEvent) -> None:
+        raw_channels = self.config.extra.get("working_message_channels", [])
+        enabled_channels = (
+            {str(value) for value in raw_channels}
+            if isinstance(raw_channels, list)
+            else {part.strip() for part in str(raw_channels).split(",") if part.strip()}
+        )
+        if (
+            not self._app
+            or not getattr(self.config, "typing_indicator", True)
+            or not self._is_channel_event(event)
+            or str(getattr(event.source, "chat_id", "") or "") not in enabled_channels
+        ):
+            return
+        key = self._channel_working_key(event)
+        if key in self._channel_working_messages:
+            return
+        if key in self._channel_working_inflight:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(self._channel_working_inflight[key].wait()), timeout=5.0)
+            return
+        kwargs: Dict[str, Any] = {"channel": key[1], "text": "Working…"}
+        if key[2]:
+            kwargs["thread_ts"] = key[2]
+        completed = asyncio.Event()
+        self._channel_working_inflight[key] = completed
+
+        async def _post_and_record() -> None:
+            try:
+                result = await self._get_client(
+                    key[1], team_id=key[0] or None).chat_postMessage(**kwargs)
+                ts = result.get("ts") if hasattr(result, "get") else None
+                if ts:
+                    self._channel_working_messages[key] = str(ts)
+                    self._channel_working_message_ts.add(
+                        self._workspace_message_marker(key[0], str(ts)))
+            except Exception as exc:
+                logger.debug("[Slack] temporary Working message failed: %s", exc)
+            finally:
+                self._channel_working_inflight.pop(key, None)
+                completed.set()
+
+        task = asyncio.create_task(_post_and_record())
+        self._channel_working_tasks.add(task)
+        task.add_done_callback(self._channel_working_tasks.discard)
+        await asyncio.shield(task)
+
+    async def _stop_channel_working(self, event: MessageEvent) -> None:
+        if not self._is_channel_event(event):
+            return
+        key = self._channel_working_key(event)
+        inflight = self._channel_working_inflight.get(key)
+        if inflight is not None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(inflight.wait()), timeout=5.0)
+        ts = self._channel_working_messages.get(key)
+        if not ts or not self._app:
+            return
+        for attempt in range(3):
+            try:
+                await self._get_client(key[1], team_id=key[0] or None).chat_delete(
+                    channel=key[1], ts=ts)
+                self._channel_working_messages.pop(key, None)
+                self._channel_working_message_ts.discard(
+                    self._workspace_message_marker(key[0], ts))
+                return
+            except Exception as exc:
+                logger.debug("[Slack] temporary Working message cleanup failed: %s", exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        await self._start_channel_working(event)
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -4266,6 +4365,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        await self._stop_channel_working(event)
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -6144,7 +6244,6 @@ class SlackAdapter(BasePlatformAdapter):
         # "addressed to the bot" — they skip the mention requirement but NOT
         # the allowed_channels whitelist or user authorization above.
         force_process = bool(event.get("_hermes_force_process"))
-
         # Some Slack bot posts arrive as ordinary-looking message events with a
         # bot *user* id but without ``bot_id``/``subtype=bot_message``.  This is
         # the shape produced by peer Hermes agents in Socket Mode on some
@@ -6828,11 +6927,14 @@ class SlackAdapter(BasePlatformAdapter):
             },
         )
 
-        # Only react when bot is directly addressed (1:1 DM or @mention).
-        # MPIMs are shared surfaces: reacting to every group-DM message (even
-        # when unmentioned) is visible noise to the whole group, so they must
-        # be @mentioned to earn a reaction — same as any channel.
-        _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
+        # Every accepted channel message gets lifecycle feedback, including
+        # free-response messages. MPIMs stay mention-only to avoid group noise,
+        # and synthetic reaction-trigger turns never react to themselves.
+        _should_react = (
+            self._reactions_enabled()
+            and (channel_type != "mpim" or is_mentioned)
+            and not event.get("_hermes_reaction")
+        )
         if _should_react:
             self._reacting_message_ids.add(
                 self._workspace_message_marker(team_id, ts)
@@ -7886,6 +7988,8 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = msg.get("ts", "")
             # Exclude the current triggering message — it will be delivered
             # as the user message itself, so including it here would duplicate it.
+            if self._workspace_message_marker(team_id, msg_ts) in self._channel_working_message_ts:
+                continue
             if msg_ts == current_ts:
                 continue
 
