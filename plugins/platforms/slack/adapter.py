@@ -3755,7 +3755,7 @@ class SlackAdapter(BasePlatformAdapter):
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
+        """Swap the acknowledgement reaction for the active-work reaction."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -3765,12 +3765,13 @@ class SlackAdapter(BasePlatformAdapter):
             return
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes", team_id)
+            await self._remove_reaction(channel_id, ts, "eyes", team_id)
+            await self._add_reaction(channel_id, ts, "hourglass_flowing_sand", team_id)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Swap the active-work reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -3782,7 +3783,9 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
+        await self._remove_reaction(
+            channel_id, ts, "hourglass_flowing_sand", team_id
+        )
         if outcome == ProcessingOutcome.SUCCESS:
             await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
         elif outcome == ProcessingOutcome.FAILURE:
@@ -6328,6 +6331,9 @@ class SlackAdapter(BasePlatformAdapter):
             self._reacting_message_ids.add(
                 self._workspace_message_marker(team_id, ts)
             )
+            # Acknowledge as soon as the message is accepted. The processing
+            # lifecycle hook replaces this with the active-work reaction.
+            await self._add_reaction(channel_id, ts, "eyes", team_id)
             if len(self._reacting_message_ids) > self._REACTING_MESSAGE_IDS_MAX:
                 # Entries embed a Slack message ts (bare or workspace-scoped
                 # tuple) — evict oldest first by the embedded ts.

@@ -126,7 +126,9 @@ class TestSlackFullManifest:
 
         assert "assistant_view" in manifest["features"]
         assert "agent_view" not in manifest["features"]
-        assert "assistant:write" in manifest["oauth_config"]["scopes"]["bot"]
+        bot_scopes = manifest["oauth_config"]["scopes"]["bot"]
+        assert "assistant:write" in bot_scopes
+        assert "reactions:write" in bot_scopes
         bot_events = manifest["settings"]["event_subscriptions"]["bot_events"]
         assert "assistant_thread_started" in bot_events
 
