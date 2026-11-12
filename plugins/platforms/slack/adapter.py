@@ -3755,7 +3755,7 @@ class SlackAdapter(BasePlatformAdapter):
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
+        """Swap the acknowledgement reaction for the active-work reaction."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -3765,12 +3765,13 @@ class SlackAdapter(BasePlatformAdapter):
             return
         channel_id = getattr(event.source, "chat_id", None)
         if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes", team_id)
+            await self._remove_reaction(channel_id, ts, "eyes", team_id)
+            await self._add_reaction(channel_id, ts, "hourglass_flowing_sand", team_id)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Swap the active-work reaction for a final success/failure reaction."""
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -3782,7 +3783,9 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
+        await self._remove_reaction(
+            channel_id, ts, "hourglass_flowing_sand", team_id
+        )
         if outcome == ProcessingOutcome.SUCCESS:
             await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
         elif outcome == ProcessingOutcome.FAILURE:
@@ -5345,22 +5348,33 @@ class SlackAdapter(BasePlatformAdapter):
                 team_id=str(event.get("team") or event.get("team_id") or ""),
             )
         if sender_is_bot:
+            # Multi-workspace installs have a DIFFERENT bot user id per team
+            # (Slack user ids are workspace-local). Resolve identity for THIS
+            # event's workspace instead of the global/primary
+            # ``self._bot_user_id`` (fixed once, to whichever workspace
+            # authenticated first — see "Bot identity per workspace" above) —
+            # otherwise a legitimate mention of this bot's secondary-workspace
+            # identity never matches here and every bot-authored message in
+            # that workspace is silently dropped by allow_bots=mentions below
+            # (and the self-echo guard right after it never recognizes the
+            # bot's own secondary-workspace messages either).
+            _self_bot_uid = self._team_bot_user_ids.get(dedup_team_id, self._bot_user_id)
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                if _self_bot_uid and f"<@{_self_bot_uid}>" not in text_check:
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
                         "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                        _self_bot_uid,
                     )
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            if msg_user and _self_bot_uid and msg_user == _self_bot_uid:
                 return
 
         # Ignore message deletions. Edits are normalized above so an @mention
@@ -6328,6 +6342,9 @@ class SlackAdapter(BasePlatformAdapter):
             self._reacting_message_ids.add(
                 self._workspace_message_marker(team_id, ts)
             )
+            # Acknowledge as soon as the message is accepted. The processing
+            # lifecycle hook replaces this with the active-work reaction.
+            await self._add_reaction(channel_id, ts, "eyes", team_id)
             if len(self._reacting_message_ids) > self._REACTING_MESSAGE_IDS_MAX:
                 # Entries embed a Slack message ts (bare or workspace-scoped
                 # tuple) — evict oldest first by the embedded ts.

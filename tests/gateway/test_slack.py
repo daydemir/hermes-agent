@@ -2583,8 +2583,11 @@ class TestReactions:
         }
         await adapter._handle_slack_message(event)
 
-        # _handle_slack_message should register the message for reactions
+        # Acceptance immediately acknowledges the message with eyes.
         assert "1234567890.000001" in adapter._reacting_message_ids
+        add_calls = adapter._app.client.reactions_add.call_args_list
+        assert len(add_calls) == 1
+        assert add_calls[0].kwargs["name"] == "eyes"
 
         # Simulate the base class calling on_processing_start
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource
@@ -2605,8 +2608,11 @@ class TestReactions:
         await adapter.on_processing_start(msg_event)
 
         add_calls = adapter._app.client.reactions_add.call_args_list
-        assert len(add_calls) == 1
-        assert add_calls[0].kwargs["name"] == "eyes"
+        remove_calls = adapter._app.client.reactions_remove.call_args_list
+        assert len(add_calls) == 2
+        assert add_calls[1].kwargs["name"] == "hourglass_flowing_sand"
+        assert len(remove_calls) == 1
+        assert remove_calls[0].kwargs["name"] == "eyes"
 
         # Simulate the base class calling on_processing_complete
         from gateway.platforms.base import ProcessingOutcome
@@ -2615,10 +2621,10 @@ class TestReactions:
 
         add_calls = adapter._app.client.reactions_add.call_args_list
         remove_calls = adapter._app.client.reactions_remove.call_args_list
-        assert len(add_calls) == 2
-        assert add_calls[1].kwargs["name"] == "white_check_mark"
-        assert len(remove_calls) == 1
-        assert remove_calls[0].kwargs["name"] == "eyes"
+        assert len(add_calls) == 3
+        assert add_calls[2].kwargs["name"] == "white_check_mark"
+        assert len(remove_calls) == 2
+        assert remove_calls[1].kwargs["name"] == "hourglass_flowing_sand"
 
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
@@ -4558,4 +4564,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-
