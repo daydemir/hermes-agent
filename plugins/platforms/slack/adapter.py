@@ -5345,22 +5345,33 @@ class SlackAdapter(BasePlatformAdapter):
                 team_id=str(event.get("team") or event.get("team_id") or ""),
             )
         if sender_is_bot:
+            # Multi-workspace installs have a DIFFERENT bot user id per team
+            # (Slack user ids are workspace-local). Resolve identity for THIS
+            # event's workspace instead of the global/primary
+            # ``self._bot_user_id`` (fixed once, to whichever workspace
+            # authenticated first — see "Bot identity per workspace" above) —
+            # otherwise a legitimate mention of this bot's secondary-workspace
+            # identity never matches here and every bot-authored message in
+            # that workspace is silently dropped by allow_bots=mentions below
+            # (and the self-echo guard right after it never recognizes the
+            # bot's own secondary-workspace messages either).
+            _self_bot_uid = self._team_bot_user_ids.get(dedup_team_id, self._bot_user_id)
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                if _self_bot_uid and f"<@{_self_bot_uid}>" not in text_check:
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
                         "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                        _self_bot_uid,
                     )
                     return
             # "all" falls through to process the message
             # Always ignore our own messages to prevent echo loops
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            if msg_user and _self_bot_uid and msg_user == _self_bot_uid:
                 return
 
         # Ignore message deletions. Edits are normalized above so an @mention
